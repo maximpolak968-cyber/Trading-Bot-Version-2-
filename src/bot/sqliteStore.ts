@@ -11,7 +11,12 @@ const { DatabaseSync } = require('node:sqlite') as {
 
 function resolveSqliteDbPath(): string {
   const customEnvPath = (process.env.SQLITE_DB_PATH || '').trim();
-  if (customEnvPath) {
+  if (
+    customEnvPath &&
+    (customEnvPath.endsWith('.sqlite') ||
+      customEnvPath.endsWith('.sqlite3') ||
+      customEnvPath.endsWith('.db'))
+  ) {
     const resolvedCustom = path.resolve(customEnvPath);
     const customDir = path.dirname(resolvedCustom);
     if (fs.existsSync(customDir)) {

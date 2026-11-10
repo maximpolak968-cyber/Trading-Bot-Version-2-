@@ -25,6 +25,10 @@ import { SqliteBotDatabase } from './src/bot/sqliteStore.ts';
 import {
   testExchangeConnection,
   calculateClientProportionalOrder,
+  executeExchangeFuturesOrder,
+  isSimulatedTestApiKey,
+  ExchangeOrderParams,
+  PlacedOrderResult,
 } from './src/bot/exchangeConnector.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1415,6 +1419,98 @@ async function initializeBotTrades() {
   );
 }
 
+let lastExchangeBalanceSyncTs = 0;
+
+function resolveExchangeAccountRecord(
+  accOrId: ExchangeAccountRecord | string | undefined
+): ExchangeAccountRecord | undefined {
+  if (!accOrId) return undefined;
+  if (typeof accOrId !== 'string') return accOrId;
+  if (accOrId === 'master') {
+    const active = exchangeAccountsStore.filter((a) => a.enabled);
+    return active.find((a) => a.is_owner) || active[0];
+  }
+  return exchangeAccountsStore.find((a) => a.id === accOrId);
+}
+
+function getAccountCredentialsFromStore(
+  accOrId: ExchangeAccountRecord | string | undefined
+) {
+  const acc = resolveExchangeAccountRecord(accOrId);
+  if (!acc) return null;
+  let key = acc.api_key_raw;
+  let secret = acc.api_secret_raw;
+  let pass = acc.passphrase_raw;
+  if (!key || !secret) {
+    const dbAccs = sqliteDb.loadExchangeAccounts();
+    const found = dbAccs.find((a) => a.id === acc.id);
+    if (found) {
+      key = found.api_key_raw;
+      secret = found.api_secret_raw;
+      pass = found.passphrase_raw;
+      acc.api_key_raw = key;
+      acc.api_secret_raw = secret;
+      acc.passphrase_raw = pass;
+    }
+  }
+  if (!key || !secret) return null;
+  return {
+    exchange: acc.exchange,
+    apiKey: String(key).trim(),
+    apiSecret: String(secret).trim(),
+    passphrase: pass ? String(pass).trim() : undefined,
+  };
+}
+
+async function dispatchOrderToExchangeAccount(
+  accOrId: ExchangeAccountRecord | string | undefined,
+  params: ExchangeOrderParams
+): Promise<PlacedOrderResult | null> {
+  const acc = resolveExchangeAccountRecord(accOrId);
+  const creds = getAccountCredentialsFromStore(acc);
+  if (!acc || !creds) return null;
+
+  const orderRes = await executeExchangeFuturesOrder(creds, params);
+  if (!orderRes.is_simulated_test) {
+    if (orderRes.success) {
+      appendLog(
+        `freqtrade.exchange.${acc.exchange}`,
+        'INFO',
+        `✅ [${acc.exchange.toUpperCase()} LIVE ORDER] Исполнен ордер на бирже (${acc.name}): ${params.action} [${params.pair}] ${orderRes.side} ${orderRes.qty} @ ${orderRes.price}$ | OrderID: ${orderRes.order_id}`
+      );
+    } else {
+      appendLog(
+        `freqtrade.exchange.${acc.exchange}`,
+        'ERROR',
+        `❌ [${acc.exchange.toUpperCase()} ORDER REJECTED] Биржа отклонила ордер (${acc.name}) при ${params.action} [${params.pair}]: ${orderRes.error || 'Неизвестная ошибка биржи'}`
+      );
+    }
+  }
+  return orderRes;
+}
+
+async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
+  if (!force && Date.now() - lastExchangeBalanceSyncTs < 45_000) return;
+  lastExchangeBalanceSyncTs = Date.now();
+  const enabledAccs = exchangeAccountsStore.filter((a) => a.enabled);
+  for (const acc of enabledAccs) {
+    const creds = getAccountCredentialsFromStore(acc);
+    if (!creds || isSimulatedTestApiKey(creds.apiKey)) continue;
+    try {
+      const check = await testExchangeConnection(creds);
+      if (check.success && typeof check.balance_usdt === 'number' && check.balance_usdt >= 0) {
+        if (check.balance_usdt > 0 && Math.abs(acc.balance_usdt - check.balance_usdt) >= 0.01) {
+          acc.balance_usdt = Number(check.balance_usdt.toFixed(2));
+          acc.last_sync = new Date().toISOString().replace('T', ' ').slice(0, 19);
+          sqliteDb.upsertExchangeAccount(acc);
+        }
+      }
+    } catch {
+      // ignore transient network error
+    }
+  }
+}
+
 function closeClientCopiesForMasterTrade(
   masterTrade: FreqtradeTrade,
   closeRate: number,
@@ -1448,6 +1544,18 @@ function closeClientCopiesForMasterTrade(
       continue;
     }
 
+    const clientAcc = exchangeAccountsStore.find((a) => a.id === ct.account_id);
+    if (clientAcc) {
+      dispatchOrderToExchangeAccount(clientAcc, {
+        pair: ct.pair,
+        action: 'CLOSE',
+        isShort: ct.is_short,
+        quantity: ct.amount,
+        referencePrice: closeRate,
+        leverage: ct.leverage || 25,
+      }).catch(() => {});
+    }
+
     ct.is_open = false;
     ct.close_rate = closeRate;
     ct.close_date = nowStr;
@@ -1471,7 +1579,6 @@ function closeClientCopiesForMasterTrade(
       notes: `Copy exit on master closure: ${exitReason} @ ${closeRate}`,
     });
 
-    const clientAcc = exchangeAccountsStore.find((a) => a.id === ct.account_id);
     if (clientAcc) {
       const netProfit = ct.net_profit || ct.profit_abs;
       const { compoundedBalance } = getCompoundedAccountBalance(clientAcc.id);
@@ -1509,6 +1616,12 @@ async function runScalpBotCycle(waitForActive = false) {
       botConfig.state = 'stopped';
       return;
     }
+
+    await syncRealExchangeBalancesIfNeeded(false);
+
+    const activeAccounts = exchangeAccountsStore.filter((a) => a.enabled);
+    const ownerAcc = activeAccounts.find((a) => a.is_owner) || activeAccounts[0];
+
     // Always refresh live prices on any open client trades first
     for (const ct of tradesStore) {
       if (ct.is_open && ct.account_id && ct.account_id !== 'master') {
@@ -1546,6 +1659,18 @@ async function runScalpBotCycle(waitForActive = false) {
           ? currentPrice <= trade.take_profit_abs
           : currentPrice >= trade.take_profit_abs;
         if (isTpHit && (trade.net_profit ?? trade.profit_abs) > 0) {
+          const closeOrderRes = await dispatchOrderToExchangeAccount(ownerAcc, {
+            pair: trade.pair,
+            action: 'CLOSE',
+            isShort: trade.is_short,
+            quantity: trade.amount,
+            referencePrice: currentPrice,
+            leverage: trade.leverage || 25,
+          });
+          if (ownerAcc && !isSimulatedTestApiKey(ownerAcc.api_key_raw) && !closeOrderRes?.success) {
+            continue;
+          }
+
           const now = Date.now();
           const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
           sqliteDb.runInTransaction(() => {
@@ -1618,6 +1743,18 @@ async function runScalpBotCycle(waitForActive = false) {
             ? currentPrice <= trade.min_profitable_tp
             : currentPrice >= trade.min_profitable_tp;
           if (reachedMinProfit) {
+            const closeOrderRes = await dispatchOrderToExchangeAccount(ownerAcc, {
+              pair: trade.pair,
+              action: 'CLOSE',
+              isShort: trade.is_short,
+              quantity: trade.amount,
+              referencePrice: currentPrice,
+              leverage: trade.leverage || 25,
+            });
+            if (ownerAcc && !isSimulatedTestApiKey(ownerAcc.api_key_raw) && !closeOrderRes?.success) {
+              continue;
+            }
+
             const now = Date.now();
             const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
             sqliteDb.runInTransaction(() => {
@@ -1722,10 +1859,26 @@ async function runScalpBotCycle(waitForActive = false) {
                 maxPairMarginPct: scalpBotConfig.max_pair_margin_pct || 20.0,
               });
 
-              const addAmount = dynamicDca.addAmount;
+              let addAmount = dynamicDca.addAmount;
               const addStake = dynamicDca.addStake;
               const prevMasterStake = trade.stake_amount || 25;
               const dcaMultiplierRatio = addStake / Math.max(1, prevMasterStake);
+
+              // Исполняем реальный рыночный ордер усреднения (DCA) на бирже владельца
+              const dcaOrderRes = await dispatchOrderToExchangeAccount(ownerAcc, {
+                pair: trade.pair,
+                action: 'DCA',
+                isShort: trade.is_short,
+                quantity: addAmount,
+                referencePrice: currentPrice,
+                leverage: trade.leverage || botConfig.leverage || 25,
+              });
+              if (ownerAcc && !isSimulatedTestApiKey(ownerAcc.api_key_raw) && !dcaOrderRes?.success) {
+                continue;
+              }
+              if (dcaOrderRes?.success && !dcaOrderRes.is_simulated_test && dcaOrderRes.qty > 0) {
+                addAmount = dcaOrderRes.qty;
+              }
 
               const prevOpenRate = trade.open_rate;
               const newTotalAmount = Number((trade.amount + addAmount).toFixed(4));
@@ -1757,6 +1910,15 @@ async function runScalpBotCycle(waitForActive = false) {
                       s.trade_id !== trade.trade_id
                   );
                   if (sibling && (sibling.net_profit ?? sibling.profit_abs) > 0) {
+                    dispatchOrderToExchangeAccount(ownerAcc, {
+                      pair: sibling.pair,
+                      action: 'CLOSE',
+                      isShort: sibling.is_short,
+                      quantity: sibling.amount,
+                      referencePrice: currentPrice,
+                      leverage: sibling.leverage || 25,
+                    }).catch(() => {});
+
                     sibling.is_open = false;
                     sibling.close_rate = currentPrice;
                     sibling.close_date = nowStr;
@@ -1845,9 +2007,20 @@ async function runScalpBotCycle(waitForActive = false) {
                       (ct.pair === trade.pair && ct.is_short === trade.is_short))
                 );
                 for (const ct of clientCopies) {
+                  const clientAcc = exchangeAccountsStore.find((a) => a.id === ct.account_id);
                   const clientAddStake = Number((ct.stake_amount * dcaMultiplierRatio).toFixed(2));
                   const clientAddNotional = clientAddStake * (ct.leverage || 25);
                   const clientAddAmount = Number((clientAddNotional / Math.max(1e-8, currentPrice)).toFixed(4));
+                  if (clientAcc) {
+                    dispatchOrderToExchangeAccount(clientAcc, {
+                      pair: ct.pair,
+                      action: 'DCA',
+                      isShort: ct.is_short,
+                      quantity: clientAddAmount,
+                      referencePrice: currentPrice,
+                      leverage: ct.leverage || 25,
+                    }).catch(() => {});
+                  }
                   const clientPrevRate = ct.open_rate;
                   const clientNewTotalAmount = Number((ct.amount + clientAddAmount).toFixed(4));
                   const clientNewAvgRate = roundPrice(
@@ -1919,6 +2092,20 @@ async function runScalpBotCycle(waitForActive = false) {
         ? livePrice <= ct.take_profit_abs
         : livePrice >= ct.take_profit_abs;
       if (isTpHit && (ct.net_profit ?? ct.profit_abs) > 0) {
+        const clientAcc = exchangeAccountsStore.find((a) => a.id === ct.account_id);
+        if (clientAcc) {
+          const clientCloseRes = await dispatchOrderToExchangeAccount(clientAcc, {
+            pair: ct.pair,
+            action: 'CLOSE',
+            isShort: ct.is_short,
+            quantity: ct.amount,
+            referencePrice: livePrice,
+            leverage: ct.leverage || 25,
+          });
+          if (!isSimulatedTestApiKey(clientAcc.api_key_raw) && !clientCloseRes?.success) {
+            continue;
+          }
+        }
         const now = Date.now();
         const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
         sqliteDb.runInTransaction(() => {
@@ -1944,7 +2131,6 @@ async function runScalpBotCycle(waitForActive = false) {
             action_type: 'CLIENT_TAKE_PROFIT',
             notes: `Client Target TP hit at ${livePrice}, Net PnL: +${ct.profit_abs}`,
           });
-          const clientAcc = exchangeAccountsStore.find((a) => a.id === ct.account_id);
           if (clientAcc) {
             const netProfit = ct.net_profit || ct.profit_abs;
             const { compoundedBalance } = getCompoundedAccountBalance(clientAcc.id);
@@ -1959,7 +2145,6 @@ async function runScalpBotCycle(waitForActive = false) {
     }
 
     // 2. Scan for new entries ONLY if bot state === 'running' AND at least 1 API account is enabled
-    const activeAccounts = exchangeAccountsStore.filter((a) => a.enabled);
     if (botConfig.state !== 'running' || activeAccounts.length === 0) {
       return;
     }
@@ -2044,24 +2229,32 @@ async function runScalpBotCycle(waitForActive = false) {
         const masterMarginOk = totalDeposit > 0 && (usedMargin / totalDeposit) * 100 < 40.0;
 
         if (masterMarginOk) {
-          if (sig.enter_long && btcGuard.isSafe && mtf.allow_long) {
-            await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag);
-            openedInThisCycle++;
-            if (openedInThisCycle >= 3) break;
-            continue;
-          } else if (sig.enter_short && mtf.allow_short) {
-            await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag);
-            openedInThisCycle++;
-            if (openedInThisCycle >= 3) break;
-            continue;
-          } else if (
-            currentMasterOpen.length + 1 < botConfig.max_open_trades &&
-            isHedgeEntryCandidate(struct4h, 35, 65, 3.0)
-          ) {
-            await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d);
-            openedInThisCycle += 2;
-            if (openedInThisCycle >= 3) break;
-            continue;
+          try {
+            if (sig.enter_long && btcGuard.isSafe && mtf.allow_long) {
+              await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag);
+              openedInThisCycle++;
+              if (openedInThisCycle >= 3) break;
+              continue;
+            } else if (sig.enter_short && mtf.allow_short) {
+              await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag);
+              openedInThisCycle++;
+              if (openedInThisCycle >= 3) break;
+              continue;
+            } else if (
+              currentMasterOpen.length + 1 < botConfig.max_open_trades &&
+              isHedgeEntryCandidate(struct4h, 35, 65, 3.0)
+            ) {
+              await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d);
+              openedInThisCycle += 2;
+              if (openedInThisCycle >= 3) break;
+              continue;
+            }
+          } catch (entryErr: any) {
+            appendLog(
+              'freqtrade.bot.entry',
+              'WARNING',
+              `⚠️ Не удалось открыть сделку [${pair}] на бирже: ${entryErr?.message || 'Ошибка биржи'}`
+            );
           }
         }
       }
@@ -2095,23 +2288,27 @@ async function runScalpBotCycle(waitForActive = false) {
                 stakePercent: 0.005,
                 minStakeUsdt: 5,
               });
-              await createScalpBotPosition(
-                pair,
-                entrySide,
-                livePrice,
-                mtf,
-                c4h,
-                c1d,
-                `${sig.enter_tag} (Analyzed Client Entry)`,
-                {
-                  accountId: clientAcc.id,
-                  accountName: clientAcc.name,
-                  stake: clientStakeUsdt,
-                  leverage: clientAcc.max_leverage || botConfig.leverage || 25,
-                  isCopyChild: true,
-                  parentTradeId: masterTradeOnPair?.trade_id,
-                }
-              );
+              try {
+                await createScalpBotPosition(
+                  pair,
+                  entrySide,
+                  livePrice,
+                  mtf,
+                  c4h,
+                  c1d,
+                  `${sig.enter_tag} (Analyzed Client Entry)`,
+                  {
+                    accountId: clientAcc.id,
+                    accountName: clientAcc.name,
+                    stake: clientStakeUsdt,
+                    leverage: clientAcc.max_leverage || botConfig.leverage || 25,
+                    isCopyChild: true,
+                    parentTradeId: masterTradeOnPair?.trade_id,
+                  }
+                );
+              } catch {
+                // logged by dispatchOrderToExchangeAccount
+              }
             }
           }
         }
@@ -2191,7 +2388,7 @@ async function createScalpBotPosition(
 
   const cleanPair = pair.toUpperCase();
   const isShort = side === 'short';
-  const entryRate = roundPrice(entryPrice);
+  let entryRate = roundPrice(entryPrice);
   const targetAccId = customOpts?.accountId || 'master';
 
   // Защита от дублирования: не открывать вторую сделку в ту же сторону на одной и той же монете для одного аккаунта
@@ -2207,6 +2404,11 @@ async function createScalpBotPosition(
   }
 
   const ownerAcc = activeAccounts.find((a) => a.is_owner) || activeAccounts[0];
+  const targetExchangeAcc =
+    targetAccId === 'master'
+      ? ownerAcc
+      : activeAccounts.find((a) => a.id === targetAccId) || ownerAcc;
+
   const { compoundedBalance: totalDeposit } = getCompoundedAccountBalance('master');
   // Dynamic compounded stake: strictly 0.5% of current compounded account equity ($25 on $5000, growing automatically with closed net profit)
   const dynamicStake = Math.max(
@@ -2222,7 +2424,34 @@ async function createScalpBotPosition(
       : (botConfig.leverage || 25);
 
   const notional = stake * leverage;
-  const amount = Number((notional / Math.max(1e-8, entryRate)).toFixed(4));
+  let amount = Number((notional / Math.max(1e-8, entryRate)).toFixed(4));
+
+  // Отправляем реальный рыночный ордер (OPEN) на подключенную биржу (Binance Futures / Bybit / BingX и др.)
+  const primaryOrderRes = await dispatchOrderToExchangeAccount(targetExchangeAcc, {
+    pair: cleanPair,
+    action: 'OPEN',
+    isShort,
+    quantity: amount,
+    referencePrice: entryRate,
+    leverage,
+  });
+
+  if (
+    targetExchangeAcc &&
+    !isSimulatedTestApiKey(targetExchangeAcc.api_key_raw) &&
+    !primaryOrderRes?.success
+  ) {
+    throw new Error(
+      primaryOrderRes?.error ||
+        `Биржа ${targetExchangeAcc.exchange.toUpperCase()} отклонила ордер на открытие сделки [${cleanPair}]`
+    );
+  }
+
+  if (primaryOrderRes?.success && !primaryOrderRes.is_simulated_test) {
+    if (primaryOrderRes.qty > 0) amount = primaryOrderRes.qty;
+    if (primaryOrderRes.price > 0) entryRate = roundPrice(primaryOrderRes.price);
+  }
+
   const [base, quote] = cleanPair.split(':')[0].split('/');
   const id = nextTradeId++;
   const now = Date.now();
@@ -2242,9 +2471,6 @@ async function createScalpBotPosition(
   const effectiveSup = manualSupLvl ? manualSupLvl.price : roundPrice(mtf.key_4h_support);
   const effectiveRes = manualResLvl ? manualResLvl.price : roundPrice(mtf.key_4h_resistance);
 
-  // Вычисление и строгая валидация Take Profit относительно цены входа (entryRate):
-  // Быстрый скальп-TP 0.8%–1.5% цены (+1.2% по умолчанию = +30% валового / ~+27% чистого ROI на 25x),
-  // либо по ручному уровню RES/SUP, если пользователь передвинул его на графике, и всегда >= min_profitable_tp
   let rawTp = hasCustomTp
     ? Number(customOpts!.customTp)
     : isShort
@@ -2300,7 +2526,7 @@ async function createScalpBotPosition(
     quote_currency: quote || 'USDT',
     is_open: true,
     is_short: isShort,
-    exchange: ownerAcc?.exchange || activeAccounts[0]?.exchange || 'binance',
+    exchange: targetExchangeAcc?.exchange || ownerAcc?.exchange || activeAccounts[0]?.exchange || 'binance',
     amount,
     initial_amount: amount,
     stake_amount: stake,
@@ -2444,6 +2670,15 @@ async function createScalpBotPosition(
             stakePercent: 0.005, // Строго 0.5% от текущего реинвест-депозита клиента
             minStakeUsdt: 5,
           });
+
+          dispatchOrderToExchangeAccount(acc, {
+            pair: cleanPair,
+            action: 'OPEN',
+            isShort,
+            quantity: coinAmount,
+            referencePrice: entryRate,
+            leverage: clientLev,
+          }).catch(() => {});
 
           const clientTradeId = nextTradeId++;
           const clientTrade: FreqtradeTrade = {
@@ -3341,22 +3576,30 @@ async function startServer() {
     const mtf = analyzeMultiTimeframe(cleanPair, c1h, c4h, c1d);
     const isShort = side === 'short';
 
-    const newTrade = await createScalpBotPosition(
-      cleanPair,
-      isShort ? 'short' : 'long',
-      entryRate,
-      mtf,
-      c4h,
-      c1d,
-      isShort ? 'Short (MTF)' : 'Long (MTF)',
-      {
-        stake: stakeamount && Number(stakeamount) > 0 ? Number(stakeamount) : undefined,
-        leverage: customLeverage && Number(customLeverage) >= 1 ? Number(customLeverage) : undefined,
-        customTp: customTp && Number(customTp) > 0 ? Number(customTp) : undefined,
-        customSl: customSl && Number(customSl) > 0 ? Number(customSl) : undefined,
-        skipClientSync: Boolean(skipClientSync),
-      }
-    );
+    let newTrade: FreqtradeTrade;
+    try {
+      newTrade = await createScalpBotPosition(
+        cleanPair,
+        isShort ? 'short' : 'long',
+        entryRate,
+        mtf,
+        c4h,
+        c1d,
+        isShort ? 'Short (MTF)' : 'Long (MTF)',
+        {
+          stake: stakeamount && Number(stakeamount) > 0 ? Number(stakeamount) : undefined,
+          leverage: customLeverage && Number(customLeverage) >= 1 ? Number(customLeverage) : undefined,
+          customTp: customTp && Number(customTp) > 0 ? Number(customTp) : undefined,
+          customSl: customSl && Number(customSl) > 0 ? Number(customSl) : undefined,
+          skipClientSync: Boolean(skipClientSync),
+        }
+      );
+    } catch (err: any) {
+      res.status(400).json({
+        error: err?.message || 'Ошибка при открытии сделки на бирже.',
+      });
+      return;
+    }
 
     // Sync MTF levels into bot_levels table for this pair
     await getOrComputeMtfBotLevels(cleanPair);
@@ -3407,7 +3650,37 @@ async function startServer() {
     const addStake =
       stakeamount && Number(stakeamount) > 0 ? Number(stakeamount) : defaultDcaStake;
     const leverage = trade.leverage || botConfig.leverage;
-    const addAmount = Number(((addStake * leverage) / Math.max(1e-8, fillPrice)).toFixed(4));
+    const rawAddAmount = Number(((addStake * leverage) / Math.max(1e-8, fillPrice)).toFixed(4));
+
+    // Отправка реального DCA-ордера на биржу
+    const targetAccId = trade.account_id || 'master';
+    const dcaOrderRes = await dispatchOrderToExchangeAccount(targetAccId, {
+      pair: trade.pair,
+      isShort: trade.is_short,
+      action: 'DCA',
+      quantity: rawAddAmount,
+      leverage,
+      referencePrice: fillPrice,
+    });
+    const targetCreds = getAccountCredentialsFromStore(targetAccId);
+    if (
+      targetCreds &&
+      !isSimulatedTestApiKey(targetCreds.apiKey) &&
+      (!dcaOrderRes || !dcaOrderRes.success)
+    ) {
+      res.status(400).json({
+        error:
+          dcaOrderRes?.error ||
+          `Биржа отклонила ордер усреднения (DCA) по паре ${trade.pair}.`,
+      });
+      return;
+    }
+
+    const addAmount =
+      dcaOrderRes?.success && dcaOrderRes.qty > 0 ? dcaOrderRes.qty : rawAddAmount;
+    if (dcaOrderRes?.success && dcaOrderRes.price > 0 && !customDcaPrice && !plannedLevel1) {
+      fillPrice = roundPrice(dcaOrderRes.price);
+    }
 
     const prevOpenRate = trade.open_rate;
     const prevAmount = trade.amount;
@@ -3424,6 +3697,35 @@ async function startServer() {
     const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
     const nextStrongDca = findStrongestDcaLevel(c4h, c1d, fillPrice, trade.is_short, 2.0);
 
+    // Pre-dispatch client DCA orders if master trade is averaged
+    const clientDcaDispatches = new Map<number, PlacedOrderResult | null>();
+    if (!trade.account_id || trade.account_id === 'master') {
+      const clientCopies = tradesStore.filter(
+        (ct) =>
+          ct.is_open &&
+          ct.account_id &&
+          ct.account_id !== 'master' &&
+          (ct.parent_trade_id === trade.trade_id ||
+            (ct.pair === trade.pair && ct.is_short === trade.is_short))
+      );
+      for (const ct of clientCopies) {
+        const clientAddStake = Number((ct.stake_amount * dcaMultiplierRatio).toFixed(2));
+        const clientLev = ct.leverage || 25;
+        const clientRawAddAmount = Number(
+          ((clientAddStake * clientLev) / Math.max(1e-8, fillPrice)).toFixed(4)
+        );
+        const cRes = await dispatchOrderToExchangeAccount(ct.account_id!, {
+          pair: ct.pair,
+          isShort: ct.is_short,
+          action: 'DCA',
+          quantity: clientRawAddAmount,
+          leverage: clientLev,
+          referencePrice: fillPrice,
+        });
+        clientDcaDispatches.set(ct.trade_id, cRes);
+      }
+    }
+
     sqliteDb.runInTransaction(() => {
       trade.open_rate = newAvgOpenRate;
       trade.amount = newTotalAmount;
@@ -3436,7 +3738,7 @@ async function startServer() {
       trade.next_dca_price = roundPrice(nextStrongDca.price);
 
       trade.orders.push({
-        id: `ord-${trade.trade_id}-${nextStep}`,
+        id: dcaOrderRes?.order_id || `ord-${trade.trade_id}-${nextStep}`,
         step: nextStep,
         label: `Усреднение #${nextStep} (${nextStrongDca.source})`,
         side: trade.is_short ? 'short' : 'long',
@@ -3460,7 +3762,7 @@ async function startServer() {
         fee: Number((fillPrice * addAmount * TAKER_FEE_RATE).toFixed(4)),
         realized_pnl: 0,
         action_type: `DCA_${nextStep}`,
-        notes: `DCA #${nextStep} @ ${fillPrice} | Avg: ${prevOpenRate} -> ${newAvgOpenRate} | Breakeven: ${trade.breakeven_price} | Next DCA: ${trade.next_dca_price}`,
+        notes: `DCA #${nextStep} @ ${fillPrice} | Avg: ${prevOpenRate} -> ${newAvgOpenRate} | Breakeven: ${trade.breakeven_price} | Next DCA: ${trade.next_dca_price}${dcaOrderRes?.order_id ? ` | ExOrderId: ${dcaOrderRes.order_id}` : ''}`,
       });
 
       // Synchronously average all linked client trades in the same SQLite transaction
@@ -3474,11 +3776,18 @@ async function startServer() {
               (ct.pair === trade.pair && ct.is_short === trade.is_short))
         );
         for (const ct of clientCopies) {
+          const cRes = clientDcaDispatches.get(ct.trade_id);
+          const cCreds = getAccountCredentialsFromStore(ct.account_id!);
+          if (cCreds && !isSimulatedTestApiKey(cCreds.apiKey) && (!cRes || !cRes.success)) {
+            continue;
+          }
           const clientAddStake = Number((ct.stake_amount * dcaMultiplierRatio).toFixed(2));
           const clientLev = ct.leverage || 25;
-          const clientAddAmount = Number(
+          const rawClientAddAmount = Number(
             ((clientAddStake * clientLev) / Math.max(1e-8, fillPrice)).toFixed(4)
           );
+          const clientAddAmount =
+            cRes?.success && cRes.qty > 0 ? cRes.qty : rawClientAddAmount;
           const clientPrevRate = ct.open_rate;
           const clientNewTotalAmount = Number((ct.amount + clientAddAmount).toFixed(4));
           const clientNewAvgRate = roundPrice(
@@ -3494,7 +3803,7 @@ async function startServer() {
           ct.enter_tag = trade.enter_tag;
           ct.next_dca_price = trade.next_dca_price;
           ct.orders.push({
-            id: `ord-${ct.trade_id}-${nextStep}`,
+            id: cRes?.order_id || `ord-${ct.trade_id}-${nextStep}`,
             step: nextStep,
             label: `Усреднение #${nextStep} (${nextStrongDca.source})`,
             side: ct.is_short ? 'short' : 'long',
@@ -4462,41 +4771,59 @@ async function startServer() {
       const targetTrades = filterTradesForScope(scope.accountId);
       let closedCount = 0;
       let skippedNegativeCount = 0;
-      sqliteDb.runInTransaction(() => {
-        for (const t of targetTrades) {
-          if (t.is_open) {
-            recalculateTradeMetrics(t, false);
-            if ((t.net_profit ?? t.profit_abs) <= 0) {
-              skippedNegativeCount++;
-              sqliteDb.upsertTrade(t);
-              continue;
-            }
-            t.is_open = false;
-            t.close_date = nowStr;
-            t.close_timestamp = now;
-            t.close_rate = t.current_rate;
-            t.exit_reason = 'force_exit';
-            t.planned_dca_levels = [];
-            recalculateTradeMetrics(t, false);
+      const tradesToClose: FreqtradeTrade[] = [];
+      for (const t of targetTrades) {
+        if (t.is_open) {
+          recalculateTradeMetrics(t, false);
+          if ((t.net_profit ?? t.profit_abs) <= 0) {
+            skippedNegativeCount++;
             sqliteDb.upsertTrade(t);
-            sqliteDb.recordOrder({
-              trade_id: t.trade_id,
-              pair: t.pair,
-              order_type: 'market',
-              side: t.is_short ? 'buy' : 'sell',
-              price: t.current_rate,
-              amount: t.amount,
-              cost: Number((t.current_rate * t.amount).toFixed(4)),
-              fee: t.fee_close || 0,
-              realized_pnl: t.net_profit || t.profit_abs,
-              action_type: 'FORCE_EXIT',
-              notes: 'Force exit all profitable trades',
-            });
-            if (!t.account_id || t.account_id === 'master') {
-              closeClientCopiesForMasterTrade(t, t.current_rate, now, nowStr, 'force_exit');
-            }
-            closedCount++;
+            continue;
           }
+          const tAccId = t.account_id || 'master';
+          const closeRes = await dispatchOrderToExchangeAccount(tAccId, {
+            pair: t.pair,
+            isShort: t.is_short,
+            action: 'CLOSE',
+            quantity: t.amount,
+            leverage: t.leverage || 25,
+            referencePrice: t.current_rate,
+          });
+          const tCreds = getAccountCredentialsFromStore(tAccId);
+          if (tCreds && !isSimulatedTestApiKey(tCreds.apiKey) && (!closeRes || !closeRes.success)) {
+            continue;
+          }
+          tradesToClose.push(t);
+        }
+      }
+
+      sqliteDb.runInTransaction(() => {
+        for (const t of tradesToClose) {
+          t.is_open = false;
+          t.close_date = nowStr;
+          t.close_timestamp = now;
+          t.close_rate = t.current_rate;
+          t.exit_reason = 'force_exit';
+          t.planned_dca_levels = [];
+          recalculateTradeMetrics(t, false);
+          sqliteDb.upsertTrade(t);
+          sqliteDb.recordOrder({
+            trade_id: t.trade_id,
+            pair: t.pair,
+            order_type: 'market',
+            side: t.is_short ? 'buy' : 'sell',
+            price: t.current_rate,
+            amount: t.amount,
+            cost: Number((t.current_rate * t.amount).toFixed(4)),
+            fee: t.fee_close || 0,
+            realized_pnl: t.net_profit || t.profit_abs,
+            action_type: 'FORCE_EXIT',
+            notes: 'Force exit all profitable trades',
+          });
+          if (!t.account_id || t.account_id === 'master') {
+            closeClientCopiesForMasterTrade(t, t.current_rate, now, nowStr, 'force_exit');
+          }
+          closedCount++;
         }
       });
       if (closedCount === 0 && skippedNegativeCount > 0) {
@@ -4540,13 +4867,40 @@ async function startServer() {
       return;
     }
 
+    // Отправка реального ордера закрытия на биржу
+    const targetAccId = trade.account_id || 'master';
+    const closeOrderRes = await dispatchOrderToExchangeAccount(targetAccId, {
+      pair: trade.pair,
+      isShort: trade.is_short,
+      action: 'CLOSE',
+      quantity: trade.amount,
+      leverage: trade.leverage || 25,
+      referencePrice: trade.current_rate,
+    });
+    const targetCreds = getAccountCredentialsFromStore(targetAccId);
+    if (
+      targetCreds &&
+      !isSimulatedTestApiKey(targetCreds.apiKey) &&
+      (!closeOrderRes || !closeOrderRes.success)
+    ) {
+      res.status(400).json({
+        error:
+          closeOrderRes?.error ||
+          `Биржа отклонила закрытие сделки #${id} (${trade.pair}).`,
+      });
+      return;
+    }
+
     const now = Date.now();
     const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
     sqliteDb.runInTransaction(() => {
       trade.is_open = false;
       trade.close_date = nowStr;
       trade.close_timestamp = now;
-      trade.close_rate = trade.current_rate;
+      trade.close_rate =
+        closeOrderRes?.success && closeOrderRes.price > 0
+          ? roundPrice(closeOrderRes.price)
+          : trade.current_rate;
       trade.exit_reason = 'force_exit';
       trade.planned_dca_levels = [];
       recalculateTradeMetrics(trade, false);
@@ -4556,16 +4910,16 @@ async function startServer() {
         pair: trade.pair,
         order_type: 'market',
         side: trade.is_short ? 'buy' : 'sell',
-        price: trade.current_rate,
+        price: trade.close_rate,
         amount: trade.amount,
-        cost: Number((trade.current_rate * trade.amount).toFixed(4)),
+        cost: Number((trade.close_rate * trade.amount).toFixed(4)),
         fee: trade.fee_close || 0,
         realized_pnl: trade.net_profit || trade.profit_abs,
         action_type: 'FORCE_EXIT',
-        notes: `Manual force exit in net profit (+${trade.profit_abs} USDT after ${trade.fee_total} USDT fees)`,
+        notes: `Manual force exit in net profit (+${trade.profit_abs} USDT after ${trade.fee_total} USDT fees)${closeOrderRes?.order_id ? ` | ExOrderId: ${closeOrderRes.order_id}` : ''}`,
       });
       if (!trade.account_id || trade.account_id === 'master') {
-        closeClientCopiesForMasterTrade(trade, trade.current_rate, now, nowStr, 'force_exit');
+        closeClientCopiesForMasterTrade(trade, trade.close_rate, now, nowStr, 'force_exit');
       }
     });
     appendLog(
