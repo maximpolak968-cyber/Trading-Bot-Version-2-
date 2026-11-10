@@ -57,23 +57,7 @@ interface SiteLoginScreenProps {
 export const SiteLoginScreen: React.FC<SiteLoginScreenProps> = ({
   onLoginSuccess,
 }) => {
-  const [showOwnerBox, setShowOwnerBox] = useState<boolean>(() => {
-    if (typeof window === 'undefined') return false;
-    const params = new URLSearchParams(window.location.search);
-    const inIframe = (() => {
-      try {
-        return window.self !== window.top;
-      } catch {
-        return true;
-      }
-    })();
-    return (
-      inIframe ||
-      params.has('owner') ||
-      params.has('login') ||
-      window.location.hash.includes('owner')
-    );
-  });
+  const [showOwnerBox, setShowOwnerBox] = useState<boolean>(true);
 
   const [login, setLogin] = useState('');
   const [password, setPassword] = useState('');
