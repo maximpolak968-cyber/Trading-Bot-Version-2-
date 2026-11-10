@@ -16,7 +16,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages || t
 
 # Установка зависимостей Node.js (включая devDependencies для сборки Vite + TypeScript)
 COPY package*.json ./
-RUN npm ci --include=dev || npm install --include=dev
+RUN npm install --include=dev --legacy-peer-deps
 
 # Копирование исходного кода приложения
 COPY . .
@@ -24,12 +24,12 @@ COPY . .
 # Сборка фронтенда (Vite + PWA Service Worker)
 RUN npm run build
 
-# Права на исполнение скрипта запуска
-RUN chmod +x ./start.sh
+# Очистка CRLF (если проект загружен с Windows) и права на исполнение скрипта запуска
+RUN sed -i 's/\r$//' ./start.sh && chmod +x ./start.sh
 
 ENV PORT=3000
 ENV NODE_ENV=production
 
 EXPOSE 3000
 
-CMD ["./start.sh"]
+CMD ["bash", "./start.sh"]
