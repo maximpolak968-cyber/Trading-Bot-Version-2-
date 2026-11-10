@@ -1,0 +1,6 @@
+{
+  "name": "FreqUI — Freqtrade Web Interface & Live Market Terminal",
+  "description": "Full recreation of Freqtrade's FreqUI web interface with live exchange OHLCV candlestick charts, indicator overlays, trade management, backtesting, pairlist inspector, and REST API data pipeline.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

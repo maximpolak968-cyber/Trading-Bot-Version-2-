@@ -1,0 +1,2 @@
+class HyperOptStrategy:
+    pass

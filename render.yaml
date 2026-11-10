@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: frequi-scalpbot-terminal
+    runtime: docker
+    region: frankfurt
+    plan: starter
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: OWNER_LOGIN
+        value: admin
+      - key: OWNER_PASSWORD
+        sync: false
+      - key: DRY_RUN
+        value: "false"
+    disk:
+      name: trading-data
+      mountPath: /data
+      sizeGB: 1
