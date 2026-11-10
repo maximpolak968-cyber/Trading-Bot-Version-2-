@@ -1,21 +1,20 @@
-# Инструкция по переносу торгового бота на Render.com
+# Инструкция по развертыванию FreqUI ScalpBot на Render.com
 
-Этот проект полностью подготовлен для развертывания на облачной платформе **Render.com** через Docker-контейнер (одновременно работают Node.js веб-панель и Python торговый движок).
+Проект полностью подготовлен для деплоя на **Render.com** (включая сохранение всех сделок, истории усреднений DCA, ручных уровней графика и подключенных API-аккаунтов на постоянном диске `/data/trades.sqlite`).
 
 ---
 
-## Шаг 1. Отправка кода в ваш GitHub-репозиторий
+## Шаг 1. Загрузка проекта в GitHub
 
-Если репозиторий еще не создан:
-1. Создайте новый репозиторий на [GitHub](https://github.com/new) (например, `binance-futures-bot`). Репозиторий рекомендуется сделать **Private** (приватным).
-2. Выполните команды в папке с проектом:
+1. Создайте **Private** (приватный) репозиторий на [GitHub](https://github.com/new), например `frequi-scalpbot-terminal`.
+2. Выполните в папке проекта:
 
 ```bash
 git init
 git add .
-git commit -m "Подготовка бота для развертывания на Render"
+git commit -m "Ready for Render deployment"
 git branch -M main
-git remote add origin https://github.com/ВАШ_АККАУНТ/binance-futures-bot.git
+git remote add origin https://github.com/ВАШ_АККАУНТ/frequi-scalpbot-terminal.git
 git push -u origin main
 ```
 
@@ -23,57 +22,41 @@ git push -u origin main
 
 ## Шаг 2. Развертывание на Render.com
 
-### Вариант А. Через Blueprint (самый быстрый, в 1 клик):
-1. Зайдите в [Render Dashboard](https://dashboard.render.com/).
-2. Нажмите **New +** в правом верхнем углу и выберите **Blueprint**.
-3. Подключите ваш GitHub-аккаунт и выберите репозиторий `binance-futures-bot`.
-4. Render автоматически прочитает файл `render.yaml`.
-5. В открывшемся окне введите значения для переменных:
-   - `BINANCE_API_KEY` — ваш API-ключ от Binance (Testnet или Real).
-   - `BINANCE_API_SECRET` — секретный ключ от Binance.
-   - `BINANCE_TESTNET` — `true` (для демо-торговли) или `false` (для реальной).
-   - `DRY_RUN` — `false` (торговать через ордера) или `true` (эмуляция).
-6. Нажмите **Apply**.
+### Вариант А (Рекомендуемый) — В 1 клик через Blueprint (`render.yaml`)
+1. Откройте [Render Dashboard](https://dashboard.render.com/).
+2. Нажмите **New +** ➔ **Blueprint**.
+3. Выберите ваш репозиторий `frequi-scalpbot-terminal`.
+4. Render автоматически прочитает файл `render.yaml` и настроит:
+   - Docker-окружение (`Dockerfile` + `start.sh`)
+   - Проверку здоровья сервиса (`Health Check Path: /api/v1/ping`)
+   - Постоянный диск `trading-data` объемом `1 GB`, примонтированный в `/data` (`SQLITE_DB_PATH=/data/trades.sqlite`)
+5. Задайте значение секретной переменной `OWNER_PASSWORD` (ваш пароль владельца для входа в терминал) и нажмите **Apply**.
 
 ---
 
-### Вариант Б. Ручное создание Web Service:
-1. В [Render Dashboard](https://dashboard.render.com/) нажмите **New +** -> **Web Service**.
-2. Выберите ваш репозиторий.
-3. Заполните параметры:
-   - **Name**: `binance-futures-bot`
-   - **Region**: Frankfurt (или Oregon)
-   - **Language / Runtime**: **Docker** (обязательно выберите Docker!)
-   - **Plan**: Free (для теста) или Starter (если нужен постоянный диск)
-4. Разверните секцию **Environment Variables** (переменные окружения) и добавьте:
-   - `NODE_ENV`: `production`
-   - `BINANCE_API_KEY`: ваш ключ
-   - `BINANCE_API_SECRET`: ваш секрет
-   - `BINANCE_TESTNET`: `true` или `false`
-   - `DRY_RUN`: `false`
-5. (Опционально, для Starter) Вкладка **Disks**:
-   - Name: `trading-data`
-   - Mount Path: `/data`
-   - Size: 1 GB
-6. Нажмите **Create Web Service**.
+### Вариант Б — Ручное создание Web Service (Docker или Node)
+1. В [Render Dashboard](https://dashboard.render.com/) нажмите **New +** ➔ **Web Service** и выберите репозиторий.
+2. Укажите настройки:
+   - **Runtime**: `Docker` (или `Node`, если без Docker: Build Command `npm install --include=dev && npm run build`, Start Command `npm start`)
+   - **Region**: `Frankfurt (EU Central)`
+   - **Plan**: `Starter` (рекомендуется для 24/7 работы без засыпания и подключения постоянного диска `/data`)
+   - **Health Check Path**: `/api/v1/ping`
+3. В разделе **Environment Variables** добавьте:
+   - `NODE_ENV` = `production`
+   - `OWNER_LOGIN` = `admin` (или ваш логин владельца)
+   - `OWNER_PASSWORD` = ваш надежный пароль владельца
+   - `SQLITE_DB_PATH` = `/data/trades.sqlite` (если подключен диск `/data`)
+4. В разделе **Disks** (на тарифе Starter и выше) добавьте диск:
+   - **Name**: `trading-data`
+   - **Mount Path**: `/data`
+   - **Size**: `1 GB`
+5. Нажмите **Create Web Service**.
 
 ---
 
-## Шаг 3. Проверка работы
+## Шаг 3. Подключение биржи и запуск торговли после деплоя
 
-1. Во вкладке **Logs** сервиса в Render вы увидите:
-   ```text
-   === Запуск торгового бота и веб-панели ===
-   Запуск торгового ядра Python...
-   Торговый бот запущен (PID: ...)
-   Запуск Express веб-панели на порту 10000...
-   Server running on http://0.0.0.0:10000
-   ```
-2. Render выдаст вам уникальную ссылку (например, `https://binance-futures-bot.onrender.com`).
-3. Откройте эту ссылку в браузере — откроется веб-панель мониторинга и управления ботом.
-
----
-
-## Важные примечания:
-- **Бесплатный тариф Render (Free Tier)**: засыпает при отсутствии входящих HTTP-запросов более 15 минут. Для непрерывной круглосуточной работы бота рекомендуется тариф **Starter** ($7/мес), либо настройка периодического пинга главной страницы веб-панели через любой бесплатный сервис мониторинга (UptimeRobot, CronJob и т.д.).
-- **Сохранение базы данных**: на тарифе Starter диск `/data` гарантирует, что история сделок и статистика не обнулятся при обновлении кода или перезагрузке контейнера.
+1. Откройте выданный Render URL (например, `https://frequi-scalpbot-terminal.onrender.com`).
+2. Войдите под логином и паролем владельца (`OWNER_LOGIN` / `OWNER_PASSWORD`).
+3. Перейдите во вкладку **«Аккаунты» (API / Клиенты)** и добавьте ваш API-ключ биржи (`Bybit`, `Binance`, `OKX`, `Bitget` или `BingX`).
+4. Нажмите **«Запустить бота»** — бот начнет автоматическое сканирование рынка (Приоритет №1 — 1H Скальпинг, Приоритет №2 — 2-Way 4H Хедж) с защитой от закрытия в минус (`Zero-Loss Guard`) и авто-реинвестом чистой прибыли.

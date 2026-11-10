@@ -1,5 +1,6 @@
 import { createRequire } from 'module';
 import path from 'path';
+import fs from 'fs';
 import crypto from 'crypto';
 
 const require = createRequire(import.meta.url);
@@ -8,7 +9,35 @@ const { DatabaseSync } = require('node:sqlite') as {
   DatabaseSync: new (filename: string) => any;
 };
 
-const DB_PATH = path.resolve(process.cwd(), 'trades.sqlite');
+function resolveSqliteDbPath(): string {
+  const customEnvPath = (process.env.SQLITE_DB_PATH || '').trim();
+  if (customEnvPath) {
+    const resolvedCustom = path.resolve(customEnvPath);
+    const customDir = path.dirname(resolvedCustom);
+    if (fs.existsSync(customDir)) {
+      return resolvedCustom;
+    }
+  }
+  const localDbPath = path.resolve(process.cwd(), 'trades.sqlite');
+  try {
+    if (fs.existsSync('/data') && fs.statSync('/data').isDirectory()) {
+      const renderDiskDbPath = '/data/trades.sqlite';
+      if (!fs.existsSync(renderDiskDbPath) && fs.existsSync(localDbPath)) {
+        try {
+          fs.copyFileSync(localDbPath, renderDiskDbPath);
+        } catch {
+          // ignore copy error
+        }
+      }
+      return renderDiskDbPath;
+    }
+  } catch {
+    // fallback to localDbPath
+  }
+  return localDbPath;
+}
+
+const DB_PATH = resolveSqliteDbPath();
 
 export interface SqliteBotLevelRow {
   id: string;
@@ -35,6 +64,11 @@ export class SqliteBotDatabase {
   }
 
   private initSchema() {
+    try {
+      this.db.exec(`PRAGMA busy_timeout = 5000;`);
+    } catch {
+      // ignore pragma error
+    }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

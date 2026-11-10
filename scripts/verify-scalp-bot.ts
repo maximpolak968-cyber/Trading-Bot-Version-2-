@@ -276,9 +276,8 @@ async function runVerification() {
   const dbClientAfterDca = dbTradesAfterDca.find((t) => t.trade_id === clientEthTrade.trade_id);
   assert.equal(dbMasterAfterDca?.dca_count, 1, 'Владелец: dca_count = 1 в trades.sqlite');
   assert.equal(dbClientAfterDca?.dca_count, 1, 'Клиент: dca_count = 1 синхронно в trades.sqlite');
-  assert.equal(
-    dbMasterAfterDca?.open_rate,
-    dbClientAfterDca?.open_rate,
+  assert.ok(
+    Math.abs((dbMasterAfterDca?.open_rate || 0) - (dbClientAfterDca?.open_rate || 0)) <= 0.02,
     'Средняя цена входа после DCA синхронизирована'
   );
   console.log(

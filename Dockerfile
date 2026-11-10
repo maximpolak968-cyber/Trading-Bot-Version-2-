@@ -14,9 +14,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages || true
 
-# Установка зависимостей Node.js
+# Установка зависимостей Node.js (включая devDependencies для сборки Vite + TypeScript)
 COPY package*.json ./
-RUN npm ci || npm install
+RUN npm ci --include=dev || npm install --include=dev
 
 # Копирование исходного кода приложения
 COPY . .
