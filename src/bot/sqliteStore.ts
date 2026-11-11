@@ -276,6 +276,7 @@ export class SqliteBotDatabase {
       ['api_secret_raw', 'TEXT'],
       ['passphrase_raw', 'TEXT'],
       ['connected_at', 'INTEGER DEFAULT 0'],
+      ['is_testnet', 'INTEGER DEFAULT 0'],
     ];
     for (const [col, def] of extraAccCols) {
       try {
@@ -1034,8 +1035,9 @@ export class SqliteBotDatabase {
         balance_usdt: Number(r.balance_usdt || 1000),
         unrealized_pnl: 0,
         open_trades_count: 0,
-        status: r.status === 'paused' ? 'paused' : 'connected',
+        status: r.status === 'paused' ? 'paused' : r.status === 'error' ? 'error' : 'connected',
         last_sync: String(r.last_sync),
+        is_testnet: Boolean(r.is_testnet),
       }));
     } catch {
       return [];
@@ -1049,8 +1051,8 @@ export class SqliteBotDatabase {
           id, name, owner_label, exchange, market_type, api_key_masked,
           has_passphrase, is_owner, client_access_code, enabled,
           copy_trading, copy_multiplier, max_leverage, balance_usdt,
-          status, last_sync, api_key_raw, api_secret_raw, passphrase_raw, connected_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          status, last_sync, api_key_raw, api_secret_raw, passphrase_raw, connected_at, is_testnet
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           name = excluded.name,
           owner_label = excluded.owner_label,
@@ -1062,6 +1064,7 @@ export class SqliteBotDatabase {
           client_access_code = excluded.client_access_code,
           status = excluded.status,
           last_sync = excluded.last_sync,
+          is_testnet = excluded.is_testnet,
           api_key_raw = COALESCE(excluded.api_key_raw, exchange_accounts.api_key_raw),
           api_secret_raw = COALESCE(excluded.api_secret_raw, exchange_accounts.api_secret_raw),
           passphrase_raw = COALESCE(excluded.passphrase_raw, exchange_accounts.passphrase_raw),
@@ -1081,13 +1084,14 @@ export class SqliteBotDatabase {
         acc.copy_trading ? 1 : 0,
         acc.copy_multiplier || 1.0,
         acc.max_leverage || 25,
-        acc.balance_usdt || 1000,
+        Number.isFinite(Number(acc.balance_usdt)) && Number(acc.balance_usdt) > 0 ? Number(acc.balance_usdt) : 1000,
         acc.status || 'connected',
         acc.last_sync,
         acc.api_key_raw ?? null,
         acc.api_secret_raw ?? null,
         acc.passphrase_raw ?? null,
-        acc.connected_at || Date.now()
+        acc.connected_at || Date.now(),
+        acc.is_testnet ? 1 : 0
       );
     } catch (e) {
       console.error('upsertExchangeAccount error:', e);

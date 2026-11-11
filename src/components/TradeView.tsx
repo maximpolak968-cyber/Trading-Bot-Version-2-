@@ -20,6 +20,7 @@ import {
   FolderOpen,
   History,
   Sliders,
+  Zap,
 } from 'lucide-react';
 import {
   ParsedCandle,
@@ -38,7 +39,7 @@ import {
 import { CandleChart, TradeLevelUpdatePayload, QuickOrderFromChartPayload } from './CandleChart';
 import { ProfitPill } from './ProfitPill';
 
-export type RightPanelSection = 'open' | 'averaged' | 'closed' | 'bot';
+export type RightPanelSection = 'open' | 'scalp' | 'averaged' | 'closed' | 'bot';
 
 interface TradeViewProps {
   selectedPair: string;
@@ -159,14 +160,23 @@ export const TradeView: React.FC<TradeViewProps> = ({
   const [pairFilter, setPairFilter] = useState('');
   const [isMultiPaneCoinsOpen, setIsMultiPaneCoinsOpen] = useState(false);
 
-  // Automatic classification into the 3 trade sections:
+  // Automatic classification into the trade sections:
   // 1) "Открытые": active trades without DCA averaging (dca_count === 0)
   const newOpenTrades = useMemo(
     () => openTrades.filter((t) => (t.dca_count || 0) === 0),
     [openTrades]
   );
 
-  // 2) "Усреднённые": active trades where the bot has executed 1+ DCA averaging steps (dca_count > 0)
+  // 2) "Скальпинг": active trades opened by the 1H Scalping engine (not 2-Way Hedge campaigns)
+  const scalpTrades = useMemo(
+    () =>
+      openTrades.filter(
+        (t) => !t.campaign_id && !String(t.enter_tag || '').toLowerCase().includes('hedge')
+      ),
+    [openTrades]
+  );
+
+  // 3) "Усреднённые": active trades where the bot has executed 1+ DCA averaging steps (dca_count > 0)
   const averagedTrades = useMemo(
     () => openTrades.filter((t) => (t.dca_count || 0) > 0),
     [openTrades]
@@ -336,21 +346,38 @@ export const TradeView: React.FC<TradeViewProps> = ({
               </div>
             </div>
 
-            {/* Вкладки разделов: Открытые | Усреднённые | Закрытые | Бот */}
-            <div className="grid grid-cols-4 bg-[#131722] border-b border-[#2a2e39] p-1 gap-1">
+            {/* Вкладки разделов: Открытые | Скальпинг | Усреднённые | Закрытые | Бот */}
+            <div className="grid grid-cols-5 bg-[#131722] border-b border-[#2a2e39] p-1 gap-1">
               <button
                 type="button"
                 onClick={() => setRightTab('open')}
                 title="Открытые сделки (без усреднения)"
-                className={`py-1.5 px-1.5 rounded-[3px] text-[11.5px] font-medium flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
+                className={`py-1.5 px-1 rounded-[3px] text-[11px] font-medium flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
                   activeRightTab === 'open'
                     ? 'bg-[#2962ff] text-white font-semibold'
                     : 'bg-[#1e222d] text-[#9ca3af] hover:text-white hover:bg-[#2a2e39]'
                 }`}
               >
                 <span>Открытые</span>
-                <span className="px-1 py-0.2 rounded bg-black/30 font-mono text-[10.5px]">
+                <span className="px-1 py-0.2 rounded bg-black/30 font-mono text-[10px]">
                   {newOpenTrades.length}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setRightTab('scalp')}
+                title="Монеты, которые бот скальпит (1H Скальпинг от уровней 4H)"
+                className={`py-1.5 px-1 rounded-[3px] text-[11px] font-medium flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
+                  activeRightTab === 'scalp'
+                    ? 'bg-[#089981] text-white font-semibold'
+                    : 'bg-[#1e222d] text-[#10b981] hover:text-white hover:bg-[#2a2e39]'
+                }`}
+              >
+                <Zap className="w-3 h-3 shrink-0" />
+                <span>Скальпинг</span>
+                <span className="px-1 py-0.2 rounded bg-black/30 font-mono text-[10px]">
+                  {scalpTrades.length}
                 </span>
               </button>
 
@@ -358,14 +385,14 @@ export const TradeView: React.FC<TradeViewProps> = ({
                 type="button"
                 onClick={() => setRightTab('averaged')}
                 title="Усреднённые сделки (DCA)"
-                className={`py-1.5 px-1.5 rounded-[3px] text-[11.5px] font-medium flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
+                className={`py-1.5 px-1 rounded-[3px] text-[11px] font-medium flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
                   activeRightTab === 'averaged'
                     ? 'bg-[#b45309] text-white font-semibold'
                     : 'bg-[#1e222d] text-[#9ca3af] hover:text-white hover:bg-[#2a2e39]'
                 }`}
               >
-                <span>Усреднённые</span>
-                <span className="px-1 py-0.2 rounded bg-black/30 font-mono text-[10.5px]">
+                <span>Усредн.</span>
+                <span className="px-1 py-0.2 rounded bg-black/30 font-mono text-[10px]">
                   {averagedTrades.length}
                 </span>
               </button>
@@ -374,14 +401,14 @@ export const TradeView: React.FC<TradeViewProps> = ({
                 type="button"
                 onClick={() => setRightTab('closed')}
                 title="Закрытые сделки"
-                className={`py-1.5 px-1.5 rounded-[3px] text-[11.5px] font-medium flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
+                className={`py-1.5 px-1 rounded-[3px] text-[11px] font-medium flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
                   activeRightTab === 'closed'
                     ? 'bg-[#334155] text-white font-semibold'
                     : 'bg-[#1e222d] text-[#9ca3af] hover:text-white hover:bg-[#2a2e39]'
                 }`}
               >
                 <span>Закрытые</span>
-                <span className="px-1 py-0.2 rounded bg-black/30 font-mono text-[10.5px]">
+                <span className="px-1 py-0.2 rounded bg-black/30 font-mono text-[10px]">
                   {closedTrades.length}
                 </span>
               </button>
@@ -390,7 +417,7 @@ export const TradeView: React.FC<TradeViewProps> = ({
                 type="button"
                 onClick={() => setRightTab('bot')}
                 title="Бот и список монет"
-                className={`py-1.5 px-1.5 rounded-[3px] text-[11.5px] font-medium flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
+                className={`py-1.5 px-1 rounded-[3px] text-[11px] font-medium flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
                   activeRightTab === 'bot'
                     ? 'bg-[#2962ff] text-white font-semibold'
                     : 'bg-[#1e222d] text-[#9ca3af] hover:text-white hover:bg-[#2a2e39]'
@@ -527,6 +554,147 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                     type="button"
                                     onClick={(e) => handleTriggerClose(trade, e)}
                                     title="Закрыть сделку (перейдёт в Закрытые)"
+                                    className="px-1.5 py-0.5 rounded-[3px] bg-[#3b1219] hover:bg-[#ef4444] border border-[#ef4444]/70 text-[#fca5a5] hover:text-white text-[10px] font-semibold transition-colors"
+                                  >
+                                    Close
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* ===============================================================
+                ВКЛАДКА 1.5: СКАЛЬПИНГ (МОНЕТЫ, КОТОРЫЕ БОТ ОТКРЫЛ ПО СКАЛЬП-СИГНАЛУ 1H)
+            =============================================================== */}
+            {activeRightTab === 'scalp' && (
+              <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+                <div className="px-2.5 py-2 bg-[#111921] border-b border-[#243242] flex items-center justify-between gap-2 text-[11px]">
+                  <div className="flex items-center gap-1.5 text-[#10b981] font-semibold">
+                    <Zap className="w-3.5 h-3.5 shrink-0" />
+                    <span>Авто-Скальпинг 1H (отбой от уровней 4H + импульс RSI/BB)</span>
+                  </div>
+                  <span className="font-mono text-[#7dd3fc] text-[10.5px]">
+                    Активно: {scalpTrades.length}
+                  </span>
+                </div>
+
+                <div className="flex-1 overflow-auto">
+                  <table className="w-full text-left border-collapse text-[11px]">
+                    <thead className="sticky top-0 bg-[#16181c] z-10 shadow-sm">
+                      <tr className="border-b border-[#2b3036] text-[#9ca3af] font-mono font-semibold">
+                        <th className="py-1.5 px-1.5 whitespace-nowrap">Side / Сигнал</th>
+                        <th className="py-1.5 px-1.5 whitespace-nowrap">Монета</th>
+                        <th className="py-1.5 px-1.5 whitespace-nowrap">Маржа $</th>
+                        <th className="py-1.5 px-1.5 whitespace-nowrap">Вход ➔ Цель TP</th>
+                        <th className="py-1.5 px-1.5 whitespace-nowrap">Чистый PnL</th>
+                        <th className="py-1.5 px-1.5 text-right whitespace-nowrap">Действие</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#242930] text-[#d1d5db]">
+                      {scalpTrades.length === 0 ? (
+                        <tr>
+                          <td colSpan={6} className="py-8 px-4 text-center text-[#8b949e]">
+                            Сейчас нет открытых скальп-позиций. Когда авто-сканер находит монету с 1H скальп-сигналом у 4H уровня, сделка автоматически добавляется сюда.
+                          </td>
+                        </tr>
+                      ) : (
+                        scalpTrades.map((trade) => {
+                          const isShort = trade.is_short;
+                          const isSelected = trade.pair === selectedPair;
+                          const netPnl = trade.net_profit ?? trade.profit_abs ?? 0;
+                          const isProfit = netPnl >= 0;
+                          const sign = netPnl > 0 ? '+' : '';
+                          return (
+                            <tr
+                              key={trade.trade_id}
+                              onClick={() => onSelectPair(trade.pair)}
+                              className={`cursor-pointer transition-colors ${
+                                isSelected
+                                  ? 'bg-[#089981]/20 hover:bg-[#089981]/30'
+                                  : 'hover:bg-[#1e2228]'
+                              }`}
+                            >
+                              <td className="py-1.5 px-1.5 whitespace-nowrap">
+                                <div className="flex items-center gap-1">
+                                  <span
+                                    className={`inline-flex items-center px-1.5 py-0.5 rounded-[3px] text-[10px] font-mono font-bold ${
+                                      isShort
+                                        ? 'bg-[#3b1219] text-[#ef4444] border border-[#ef4444]/60'
+                                        : 'bg-[#063928] text-[#10b981] border border-[#10b981]/60'
+                                    }`}
+                                  >
+                                    {isShort ? 'SHORT' : 'LONG'}
+                                  </span>
+                                  {(trade.dca_count || 0) > 0 && (
+                                    <span className="px-1 py-0.2 rounded bg-[#3b2506] text-[#fbbf24] font-mono text-[9.5px]">
+                                      ×{trade.dca_count}
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-[9.5px] font-mono text-[#9ca3af] truncate max-w-[105px]">
+                                  {trade.enter_tag || '1H_Scalp'}
+                                </div>
+                              </td>
+
+                              <td className="py-1.5 px-1.5 whitespace-nowrap">
+                                <div className="font-semibold text-white">
+                                  {shortPairName(trade.pair)}
+                                </div>
+                                <div className="text-[9.5px] font-mono text-[#38bdf8]">
+                                  {trade.leverage || 25}x · {trade.exchange.toUpperCase()}
+                                </div>
+                              </td>
+
+                              <td className="py-1.5 px-1.5 whitespace-nowrap font-mono tabular-nums">
+                                <div className="text-white">{fmtComma(trade.stake_amount, 1)}$</div>
+                                <div className="text-[9.5px] text-[#9ca3af]">
+                                  {formatSmartNumber(trade.amount)}
+                                </div>
+                              </td>
+
+                              <td className="py-1.5 px-1.5 whitespace-nowrap font-mono tabular-nums">
+                                <div className="text-white font-semibold">
+                                  {formatSmartNumber(trade.open_rate)}$
+                                </div>
+                                <div className="text-[9.5px] text-[#10b981]">
+                                  TP: {trade.take_profit_abs ? `${formatSmartNumber(trade.take_profit_abs)}$` : 'Авто'}
+                                </div>
+                              </td>
+
+                              <td className="py-1.5 px-1.5 whitespace-nowrap font-mono tabular-nums">
+                                <span
+                                  className={`inline-flex items-center px-1.5 py-0.5 rounded-[3px] text-[10px] font-semibold border ${
+                                    isProfit
+                                      ? 'bg-[#063928] text-[#10b981] border-[#10b981]/60'
+                                      : 'bg-[#3b1219] text-[#ef4444] border-[#ef4444]/60'
+                                  }`}
+                                >
+                                  {sign}
+                                  {fmtComma(netPnl, 2)}$ ({fmtComma(trade.profit_pct, 2)}%)
+                                </span>
+                              </td>
+
+                              <td className="py-1.5 px-1.5 text-right whitespace-nowrap">
+                                <div className="inline-flex items-center gap-1 font-mono">
+                                  <button
+                                    type="button"
+                                    onClick={(e) => handleTriggerDca(trade, e)}
+                                    title="Усреднить скальп-сделку (+DCA)"
+                                    className="px-1.5 py-0.5 rounded-[3px] bg-[#2e210b] hover:bg-[#d97706] border border-[#f59e0b]/70 text-[#fde68a] hover:text-white text-[10px] font-semibold transition-colors"
+                                  >
+                                    +DCA
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => handleTriggerClose(trade, e)}
+                                    title="Закрыть скальп-сделку в плюс"
                                     className="px-1.5 py-0.5 rounded-[3px] bg-[#3b1219] hover:bg-[#ef4444] border border-[#ef4444]/70 text-[#fca5a5] hover:text-white text-[10px] font-semibold transition-colors"
                                   >
                                     Close
@@ -1069,6 +1237,23 @@ export const TradeView: React.FC<TradeViewProps> = ({
           >
             <FolderOpen className="w-4 h-4" />
             <span className="text-[10px] font-mono font-semibold">{newOpenTrades.length}</span>
+          </button>
+
+          {/* Иконка 1.5: Скальпинг сделки */}
+          <button
+            type="button"
+            onClick={() => setRightTab('scalp')}
+            title={`Скальпинг сделки (${scalpTrades.length})`}
+            className={`w-9 py-2 rounded-[4px] flex flex-col items-center gap-1 transition-colors ${
+              isRightPanelOpen && activeRightTab === 'scalp'
+                ? 'bg-[#064e3b] text-[#10b981] border border-[#10b981]/50'
+                : 'text-[#10b981] hover:bg-[#22262e] hover:text-white'
+            }`}
+          >
+            <Zap className="w-4 h-4 text-[#10b981]" />
+            <span className="text-[10px] font-mono font-semibold text-[#10b981]">
+              {scalpTrades.length}
+            </span>
           </button>
 
           {/* Иконка 2: Усреднённые сделки */}

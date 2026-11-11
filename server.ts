@@ -1158,6 +1158,8 @@ interface ExchangeAccountRecord {
   api_key_raw?: string;
   api_secret_raw?: string;
   passphrase_raw?: string;
+  is_testnet?: boolean;
+  network_label?: string;
 }
 
 function hasConnectedExchangeAccount(): boolean {
@@ -1417,6 +1419,10 @@ async function initializeBotTrades() {
     'INFO',
     `🔄 Восстановлено состояние из trades.sqlite после старта/перезапуска: открытых сделок владельца=${openMasterCount} (из них усреднённых=${averagedMasterCount}, шагов DCA=${totalDcaStepsRestored}), всего сделок в памяти=${tradesStore.length}, аккаунтов=${exchangeAccountsStore.length}`
   );
+
+  if (hasActiveExchange) {
+    syncRealExchangeBalancesIfNeeded(true).catch(() => {});
+  }
 }
 
 let lastExchangeBalanceSyncTs = 0;
@@ -1459,6 +1465,7 @@ function getAccountCredentialsFromStore(
     apiKey: String(key).trim(),
     apiSecret: String(secret).trim(),
     passphrase: pass ? String(pass).trim() : undefined,
+    isTestnet: Boolean(acc.is_testnet),
   };
 }
 
@@ -1472,17 +1479,18 @@ async function dispatchOrderToExchangeAccount(
 
   const orderRes = await executeExchangeFuturesOrder(creds, params);
   if (!orderRes.is_simulated_test) {
+    const netTag = orderRes.network_label || (acc.is_testnet ? `${acc.exchange.toUpperCase()} TESTNET` : acc.exchange.toUpperCase());
     if (orderRes.success) {
       appendLog(
         `freqtrade.exchange.${acc.exchange}`,
         'INFO',
-        `✅ [${acc.exchange.toUpperCase()} LIVE ORDER] Исполнен ордер на бирже (${acc.name}): ${params.action} [${params.pair}] ${orderRes.side} ${orderRes.qty} @ ${orderRes.price}$ | OrderID: ${orderRes.order_id}`
+        `✅ [${netTag} LIVE ORDER] Исполнен ордер на бирже (${acc.name}): ${params.action} [${params.pair}] ${orderRes.side} ${orderRes.qty} @ ${orderRes.price}$ | OrderID: ${orderRes.order_id}`
       );
     } else {
       appendLog(
         `freqtrade.exchange.${acc.exchange}`,
         'ERROR',
-        `❌ [${acc.exchange.toUpperCase()} ORDER REJECTED] Биржа отклонила ордер (${acc.name}) при ${params.action} [${params.pair}]: ${orderRes.error || 'Неизвестная ошибка биржи'}`
+        `❌ [${netTag} ORDER REJECTED] Биржа отклонила ордер (${acc.name}) при ${params.action} [${params.pair}]: ${orderRes.error || 'Неизвестная ошибка биржи'}`
       );
     }
   }
@@ -1490,7 +1498,7 @@ async function dispatchOrderToExchangeAccount(
 }
 
 async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
-  if (!force && Date.now() - lastExchangeBalanceSyncTs < 45_000) return;
+  if (!force && Date.now() - lastExchangeBalanceSyncTs < 30_000) return;
   lastExchangeBalanceSyncTs = Date.now();
   const enabledAccs = exchangeAccountsStore.filter((a) => a.enabled);
   for (const acc of enabledAccs) {
@@ -1498,12 +1506,38 @@ async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
     if (!creds || isSimulatedTestApiKey(creds.apiKey)) continue;
     try {
       const check = await testExchangeConnection(creds);
-      if (check.success && typeof check.balance_usdt === 'number' && check.balance_usdt >= 0) {
-        if (check.balance_usdt > 0 && Math.abs(acc.balance_usdt - check.balance_usdt) >= 0.01) {
-          acc.balance_usdt = Number(check.balance_usdt.toFixed(2));
-          acc.last_sync = new Date().toISOString().replace('T', ' ').slice(0, 19);
-          sqliteDb.upsertExchangeAccount(acc);
+      if (check.success) {
+        let changed = false;
+        if (typeof check.is_testnet === 'boolean' && acc.is_testnet !== check.is_testnet) {
+          acc.is_testnet = check.is_testnet;
+          changed = true;
         }
+        if (check.network_label && acc.network_label !== check.network_label) {
+          acc.network_label = check.network_label;
+          changed = true;
+        }
+        if (typeof check.balance_usdt === 'number' && check.balance_usdt > 0) {
+          if (Math.abs(acc.balance_usdt - check.balance_usdt) >= 0.01) {
+            acc.balance_usdt = Number(check.balance_usdt.toFixed(2));
+            changed = true;
+          }
+        }
+        acc.status = 'connected';
+        acc.last_sync = new Date().toISOString().replace('T', ' ').slice(0, 19);
+        if (changed || force) {
+          sqliteDb.upsertExchangeAccount(acc);
+          appendLog(
+            'freqtrade.exchange.sync',
+            'INFO',
+            `🔄 Синхронизирован баланс биржи ${check.network_label || acc.exchange.toUpperCase()} (${acc.name}): ${acc.balance_usdt.toFixed(2)} USDT | Пинг: ${check.latency_ms} мс`
+          );
+        }
+      } else {
+        appendLog(
+          'freqtrade.exchange.sync',
+          'WARNING',
+          `⚠️ Проверка связи с биржей ${acc.exchange.toUpperCase()} (${acc.name}): ${check.message}`
+        );
       }
     } catch {
       // ignore transient network error
@@ -2313,6 +2347,27 @@ async function runScalpBotCycle(waitForActive = false) {
           }
         }
       }
+    }
+
+    if (scannedCount > 0) {
+      const openMasterAfter = tradesStore.filter(
+        (t) => t.is_open && (!t.account_id || t.account_id === 'master')
+      );
+      const scalpCount = openMasterAfter.filter(
+        (t) => !t.campaign_id && !String(t.enter_tag || '').toLowerCase().includes('hedge')
+      ).length;
+      const hedgeCount = openMasterAfter.length - scalpCount;
+      const accSummary = activeAccounts
+        .map(
+          (a) =>
+            `${a.name} [${a.network_label || (a.is_testnet ? `${a.exchange.toUpperCase()} TESTNET` : a.exchange.toUpperCase())}]: ${a.balance_usdt.toFixed(2)} USDT`
+        )
+        .join(', ');
+      appendLog(
+        'freqtrade.scanner',
+        'INFO',
+        `🔍 Цикл авто-анализа завершён: проверено ${scannedCount} пар | Открыто за цикл: ${openedInThisCycle} | Активно: ${openMasterAfter.length} (Скальпинг: ${scalpCount}, Хедж: ${hedgeCount}) | Биржи: ${accSummary}`
+      );
     }
   } catch (err) {
     console.error('Error in runScalpBotCycle:', err);
@@ -3352,6 +3407,7 @@ async function startServer() {
 
   app.get('/api/v1/balance', async (req, res) => {
     await initializeBotTrades();
+    await syncRealExchangeBalancesIfNeeded(false);
     const scope = resolveRequestAccountScope(req);
     const scopedTrades = filterTradesForScope(scope.accountId);
     const usedStake = Number(
@@ -4381,6 +4437,7 @@ async function startServer() {
   // ============================================================================
   app.get('/api/v1/accounts', async (_req, res) => {
     await initializeBotTrades();
+    await syncRealExchangeBalancesIfNeeded(false);
     const masterOpen = tradesStore.filter(
       (t) => t.is_open && (!t.account_id || t.account_id === 'master')
     );
@@ -4430,6 +4487,7 @@ async function startServer() {
       max_leverage = 25,
       balance_usdt,
       client_access_code,
+      is_testnet = false,
     } = req.body || {};
 
     const validExchanges: SupportedExchange[] = ['binance', 'bybit', 'okx', 'bitget', 'bingx'];
@@ -4442,25 +4500,49 @@ async function startServer() {
       return;
     }
 
-    // Если депозит не передан явно — пробуем получить реальный USDT баланс напрямую с биржи по API ключам
     let resolvedBalanceUsdt = Number(balance_usdt);
-    if (!Number.isFinite(resolvedBalanceUsdt) || resolvedBalanceUsdt <= 0) {
+    let resolvedIsTestnet = Boolean(is_testnet);
+    let resolvedNetworkLabel: string | undefined;
+    let liveCheckResult: any = null;
+
+    // Для реальных API-ключей всегда проверяем подключение к бирже (с авто-определением Mainnet / Testnet / Demo и запросом реального баланса USDT)
+    if (!isSimulatedTestApiKey(String(api_key))) {
       try {
         const liveCheck = await testExchangeConnection({
           exchange: cleanExchange,
           apiKey: String(api_key).trim(),
           apiSecret: String(api_secret).trim(),
           passphrase: passphrase ? String(passphrase).trim() : undefined,
+          isTestnet: resolvedIsTestnet,
         });
-        if (liveCheck.success && typeof liveCheck.balance_usdt === 'number' && liveCheck.balance_usdt > 0) {
-          resolvedBalanceUsdt = liveCheck.balance_usdt;
+        liveCheckResult = liveCheck;
+        if (typeof liveCheck.is_testnet === 'boolean') {
+          resolvedIsTestnet = liveCheck.is_testnet;
         }
+        if (liveCheck.network_label) {
+          resolvedNetworkLabel = liveCheck.network_label;
+        }
+        if (
+          liveCheck.success &&
+          typeof liveCheck.balance_usdt === 'number' &&
+          liveCheck.balance_usdt > 0
+        ) {
+          resolvedBalanceUsdt = Number(liveCheck.balance_usdt.toFixed(2));
+        }
+        appendLog(
+          'freqtrade.exchange.connect',
+          liveCheck.success ? 'INFO' : 'WARNING',
+          liveCheck.success
+            ? `🔗 Успешное подключение к ${resolvedNetworkLabel || cleanExchange.toUpperCase()} (${String(name).trim()}): реальный баланс = ${resolvedBalanceUsdt > 0 ? resolvedBalanceUsdt.toFixed(2) : '0.00'} USDT | Пинг: ${liveCheck.latency_ms} мс`
+            : `⚠️ Подключение API ${cleanExchange.toUpperCase()} (${String(name).trim()}): ${liveCheck.message}`
+        );
       } catch {
         // ignore network timeout
       }
     }
-    if (!Number.isFinite(resolvedBalanceUsdt) || resolvedBalanceUsdt < 0) {
-      resolvedBalanceUsdt = 0;
+
+    if (!Number.isFinite(resolvedBalanceUsdt) || resolvedBalanceUsdt <= 0) {
+      resolvedBalanceUsdt = Number(balance_usdt) > 0 ? Number(balance_usdt) : 1000;
     }
 
     const cleanName = String(name).trim();
@@ -4501,13 +4583,23 @@ async function startServer() {
       if (resolvedBalanceUsdt > 0) {
         existingAcc.balance_usdt = resolvedBalanceUsdt;
       }
+      existingAcc.is_testnet = resolvedIsTestnet;
+      existingAcc.network_label = resolvedNetworkLabel;
       existingAcc.status = 'connected';
       existingAcc.last_sync = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
       sqliteDb.upsertExchangeAccount(existingAcc);
       botConfig.state = 'running';
 
-      res.json({ account: existingAcc, accounts: exchangeAccountsStore });
+      if (!isSimulatedTestApiKey(String(api_key))) {
+        runScalpBotCycle(false).catch(() => {});
+      }
+
+      res.json({
+        account: existingAcc,
+        accounts: exchangeAccountsStore,
+        connection_check: liveCheckResult,
+      });
       return;
     }
 
@@ -4535,6 +4627,8 @@ async function startServer() {
       status: 'connected',
       last_sync: new Date(nowTs).toISOString().replace('T', ' ').slice(0, 19),
       connected_at: nowTs,
+      is_testnet: resolvedIsTestnet,
+      network_label: resolvedNetworkLabel,
     };
 
     exchangeAccountsStore.push(newAcc);
@@ -4544,10 +4638,18 @@ async function startServer() {
     appendLog(
       'freqtrade.exchange.accounts',
       'INFO',
-      `Подключен новый API-аккаунт: ${newAcc.name} (${cleanExchange.toUpperCase()} ${newAcc.market_type.toUpperCase()}) | Ключ: ${newAcc.api_key_masked} | Старые сделки не копируются — бот выполняет свежий рыночный анализ для новых входов.`
+      `Подключен новый API-аккаунт: ${newAcc.name} (${resolvedNetworkLabel || `${cleanExchange.toUpperCase()} ${newAcc.market_type.toUpperCase()}`}) | Баланс: ${newAcc.balance_usdt.toFixed(2)} USDT | Ключ: ${newAcc.api_key_masked}`
     );
 
-    res.json({ account: newAcc, accounts: exchangeAccountsStore });
+    if (!isSimulatedTestApiKey(String(api_key))) {
+      runScalpBotCycle(false).catch(() => {});
+    }
+
+    res.json({
+      account: newAcc,
+      accounts: exchangeAccountsStore,
+      connection_check: liveCheckResult,
+    });
   });
 
   app.patch('/api/v1/accounts/:id', (req, res) => {
@@ -4646,11 +4748,12 @@ async function startServer() {
   });
 
   app.post('/api/v1/accounts/test-connection', async (req, res) => {
-    const { account_id, exchange, api_key, api_secret, passphrase } = req.body || {};
+    const { account_id, exchange, api_key, api_secret, passphrase, is_testnet } = req.body || {};
     let credsExchange = exchange;
     let credsKey = api_key;
     let credsSecret = api_secret;
     let credsPass = passphrase;
+    let credsIsTestnet = is_testnet !== undefined ? Boolean(is_testnet) : undefined;
     let targetAcc: ExchangeAccountRecord | undefined;
 
     if (account_id) {
@@ -4662,6 +4765,9 @@ async function startServer() {
         credsKey = acc.api_key_raw;
         credsSecret = acc.api_secret_raw;
         credsPass = acc.passphrase_raw;
+        if (credsIsTestnet === undefined) {
+          credsIsTestnet = Boolean(acc.is_testnet);
+        }
       }
     }
 
@@ -4682,18 +4788,29 @@ async function startServer() {
       apiKey: String(credsKey),
       apiSecret: String(credsSecret),
       passphrase: credsPass ? String(credsPass) : undefined,
+      isTestnet: credsIsTestnet,
     });
 
-    if (targetAcc && testRes.success && typeof testRes.balance_usdt === 'number' && testRes.balance_usdt >= 0) {
-      targetAcc.balance_usdt = testRes.balance_usdt;
+    if (targetAcc && testRes.success) {
+      if (typeof testRes.is_testnet === 'boolean') {
+        targetAcc.is_testnet = testRes.is_testnet;
+      }
+      if (testRes.network_label) {
+        targetAcc.network_label = testRes.network_label;
+      }
+      if (typeof testRes.balance_usdt === 'number' && testRes.balance_usdt > 0) {
+        targetAcc.balance_usdt = Number(testRes.balance_usdt.toFixed(2));
+      }
+      targetAcc.status = 'connected';
       targetAcc.last_sync = new Date().toISOString().replace('T', ' ').slice(0, 19);
       sqliteDb.upsertExchangeAccount(targetAcc);
+      runScalpBotCycle(false).catch(() => {});
     }
 
     appendLog(
       'freqtrade.exchange.test',
       testRes.success ? 'INFO' : 'WARNING',
-      `Тестирование API ${String(credsExchange).toUpperCase()}: ${testRes.message}`
+      `Тестирование API ${String(credsExchange).toUpperCase()}${targetAcc ? ` (${targetAcc.name})` : ''}: ${testRes.message}`
     );
 
     res.json(testRes);

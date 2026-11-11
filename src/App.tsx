@@ -32,7 +32,6 @@ import { TradeView, RightPanelSection } from './components/TradeView';
 import { DashboardView } from './components/DashboardView';
 import { CandleChart, TradeLevelUpdatePayload, QuickOrderFromChartPayload } from './components/CandleChart';
 import { PairlistLogsView } from './components/PairlistLogsView';
-import { DataPipelineView } from './components/DataPipelineView';
 import { ExchangeAccountsView } from './components/ExchangeAccountsView';
 import { OfflineIndicator } from './components/PWAInstallButton';
 import { SiteLoginScreen, SiteSettingsModal, AuthSessionState } from './components/SiteAuthGate';
@@ -730,7 +729,9 @@ export default function App() {
       const data = await res.json();
       if (data.accounts) setAccounts(data.accounts);
       await fetchBotState();
+      return data;
     }
+    return undefined;
   };
 
   const handleToggleAccount = async (id: string, enabled: boolean) => {
@@ -815,36 +816,6 @@ export default function App() {
     } finally {
       setSubmittingForce(false);
     }
-  };
-
-  const handleAddBlacklist = async (pair: string) => {
-    await fetch('/api/v1/blacklist', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ blacklist: [pair] }),
-    });
-    await fetchBotState();
-  };
-
-  const handleRemoveBlacklist = async (pair: string) => {
-    await fetch(`/api/v1/blacklist?pairs_to_delete=${encodeURIComponent(pair)}`, {
-      method: 'DELETE',
-    });
-    await fetchBotState();
-  };
-
-  const handleAddLock = async (pair: string, reason: string) => {
-    await fetch('/api/v1/locks', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pair, reason }),
-    });
-    await fetchBotState();
-  };
-
-  const handleRemoveLock = async (id: number) => {
-    await fetch(`/api/v1/locks/${id}`, { method: 'DELETE' });
-    await fetchBotState();
   };
 
   if (authState.loading) {
@@ -1201,27 +1172,25 @@ export default function App() {
             onToggleAccount={handleToggleAccount}
             onDeleteAccount={handleDeleteAccount}
             onClearAllAccounts={handleClearAllAccounts}
+            onRefreshAccounts={async () => {
+              await fetchAccounts();
+              await fetchBotState();
+            }}
           />
         )}
 
-        {/* ВКЛАДКА 4: Журнал и инспектор API */}
+        {/* ВКЛАДКА 5: Журнал работы бота и подключений к биржам */}
         {activeRoute === 'logs' && (
-          <div className="p-4 space-y-6 bg-[#141619]">
+          <div className="p-4 space-y-4 bg-[#141619]">
             <PairlistLogsView
-              whitelist={whitelist}
-              blacklist={blacklist}
-              locks={locks}
               logs={logs}
-              onAddBlacklist={handleAddBlacklist}
-              onRemoveBlacklist={handleRemoveBlacklist}
-              onAddLock={handleAddLock}
-              onRemoveLock={handleRemoveLock}
-              onRefreshLogs={fetchBotState}
-            />
-            <DataPipelineView
-              selectedPair={selectedPair}
-              timeframe={timeframe}
-              strategy={strategy}
+              accounts={accounts}
+              botConfig={botConfig}
+              openTradesCount={openTrades.length}
+              onRefreshLogs={() => {
+                fetchBotState();
+                fetchAccounts();
+              }}
             />
           </div>
         )}

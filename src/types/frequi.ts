@@ -89,6 +89,8 @@ export interface ExchangeAccount {
   open_trades_count: number;
   status: 'connected' | 'paused' | 'error';
   last_sync: string;
+  is_testnet?: boolean;
+  network_label?: string;
 }
 
 export type DrawingToolType =
@@ -171,6 +173,8 @@ export interface FreqtradeTrade {
   orders: TradeOrderEntry[];
   planned_dca_levels?: PlannedDcaLevel[];
   synced_accounts?: string[];
+  campaign_id?: string;
+  campaign_banked_profit?: number;
 }
 
 export interface ProfitSummary {

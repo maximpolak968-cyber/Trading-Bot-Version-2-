@@ -66,13 +66,56 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const openStakeSum = openTrades.reduce((acc, t) => acc + (t.stake_amount || 0), 0);
   const openProfitPct = openStakeSum > 0 ? (openProfitAbs / openStakeSum) * 100 : 0;
 
-  // 3. Closed Trades Metrics
-  const closedProfitAbs = closedTrades.reduce((acc, t) => acc + (t.profit_abs || 0), 0);
+  // 3. Closed Trades Metrics (strictly real net profit after 0.06% exchange fees)
+  const closedTradesChronological = useMemo(
+    () =>
+      [...closedTrades].sort(
+        (a, b) =>
+          (a.close_timestamp || a.open_timestamp || 0) -
+          (b.close_timestamp || b.open_timestamp || 0)
+      ),
+    [closedTrades]
+  );
+
+  const closedProfitAbs = closedTrades.reduce(
+    (acc, t) => acc + (t.net_profit ?? t.profit_abs ?? 0),
+    0
+  );
+  const totalFeesPaid = closedTrades.reduce((acc, t) => acc + (t.fee_total ?? 0), 0);
   const closedProfitPct =
     startingBalance > 0 ? (closedProfitAbs / startingBalance) * 100 : 0;
 
-  const winningTradesCount = closedTrades.filter((t) => (t.profit_abs || 0) > 0).length;
-  const losingTradesCount = closedTrades.filter((t) => (t.profit_abs || 0) <= 0).length;
+  const isScalpTrade = (t: FreqtradeTrade) =>
+    !t.campaign_id && !String(t.enter_tag || '').toLowerCase().includes('hedge');
+
+  const openScalpTrades = useMemo(() => openTrades.filter(isScalpTrade), [openTrades]);
+  const openHedgeTrades = useMemo(
+    () => openTrades.filter((t) => !isScalpTrade(t)),
+    [openTrades]
+  );
+  const closedScalpTrades = useMemo(() => closedTrades.filter(isScalpTrade), [closedTrades]);
+  const closedHedgeTrades = useMemo(
+    () => closedTrades.filter((t) => !isScalpTrade(t)),
+    [closedTrades]
+  );
+
+  const scalpOpenPnl = openScalpTrades.reduce((s, t) => s + (t.profit_abs || 0), 0);
+  const scalpClosedPnl = closedScalpTrades.reduce(
+    (s, t) => s + (t.net_profit ?? t.profit_abs ?? 0),
+    0
+  );
+  const hedgeOpenPnl = openHedgeTrades.reduce((s, t) => s + (t.profit_abs || 0), 0);
+  const hedgeClosedPnl = closedHedgeTrades.reduce(
+    (s, t) => s + (t.net_profit ?? t.profit_abs ?? 0),
+    0
+  );
+
+  const winningTradesCount = closedTrades.filter(
+    (t) => (t.net_profit ?? t.profit_abs ?? 0) > 0
+  ).length;
+  const losingTradesCount = closedTrades.filter(
+    (t) => (t.net_profit ?? t.profit_abs ?? 0) <= 0
+  ).length;
   const winRatePct =
     closedTrades.length > 0
       ? (winningTradesCount / closedTrades.length) * 100
@@ -85,17 +128,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const freeMargin = Math.max(0, currentEquity - openStakeSum);
   const marginUsagePct = currentEquity > 0 ? (openStakeSum / currentEquity) * 100 : 0;
 
-  // 5. Dynamic Time-based Profit aggregation (Days / Weeks / Months)
+  // 5. Dynamic Time-based Profit aggregation (Days / Weeks / Months) from real chronological trades
   const timeBasedData = useMemo(() => {
     const map = new Map<string, { label: string; pnlAbs: number; pnlPct: number; count: number }>();
 
-    for (const t of closedTrades) {
+    for (const t of closedTradesChronological) {
       const dateStr = (t.close_date || t.open_date || '').slice(0, 10);
       if (!dateStr) continue;
 
       let key = dateStr;
       if (timePeriod === 'Недели') {
-        // Group by week (start date)
         const d = new Date(dateStr);
         const day = d.getDay();
         const diff = d.getDate() - day + (day === 0 ? -6 : 1);
@@ -106,8 +148,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       }
 
       const curr = map.get(key) || { label: key, pnlAbs: 0, pnlPct: 0, count: 0 };
-      curr.pnlAbs += t.profit_abs || 0;
-      curr.pnlPct += t.profit_pct || 0;
+      const net = t.net_profit ?? t.profit_abs ?? 0;
+      curr.pnlAbs += net;
+      curr.pnlPct += startingBalance > 0 ? (net / startingBalance) * 100 : t.profit_pct || 0;
       curr.count += 1;
       map.set(key, curr);
     }
@@ -117,34 +160,36 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       const todayStr = new Date().toISOString().slice(0, 10);
       const curr = map.get(todayStr) || { label: todayStr, pnlAbs: 0, pnlPct: 0, count: 0 };
       curr.pnlAbs += openProfitAbs;
-      curr.pnlPct += openProfitPct;
+      curr.pnlPct +=
+        startingBalance > 0 ? (openProfitAbs / startingBalance) * 100 : openProfitPct;
       curr.count += openTrades.length;
       map.set(todayStr, curr);
     }
 
     const items = Array.from(map.values()).sort((a, b) => a.label.localeCompare(b.label));
 
-    // Fallback if brand new system with no historical trades yet
     if (items.length === 0) {
       const today = new Date().toISOString().slice(0, 10);
       items.push({
         label: today,
-        pnlAbs: openProfitAbs,
-        pnlPct: openProfitPct,
-        count: openTrades.length,
+        pnlAbs: 0,
+        pnlPct: 0,
+        count: 0,
       });
     }
 
     return items;
-  }, [closedTrades, openTrades, openProfitAbs, openProfitPct, timePeriod]);
+  }, [closedTradesChronological, openTrades, openProfitAbs, openProfitPct, startingBalance, timePeriod]);
 
-  // 6. Cumulative Profit Points (0 -> trade 1 -> trade 2 ... -> current)
+  // 6. Cumulative Profit Points (chronological: 0 -> trade 1 -> trade 2 ... -> current)
   const cumulativePoints = useMemo(() => {
     let cum = 0;
-    const pts: { label: string; val: number; date: string }[] = [{ label: 'Старт', val: 0, date: 'База' }];
+    const pts: { label: string; val: number; date: string }[] = [
+      { label: 'Старт', val: 0, date: 'База' },
+    ];
 
-    closedTrades.forEach((t, i) => {
-      cum += t.profit_abs || 0;
+    closedTradesChronological.forEach((t, i) => {
+      cum += t.net_profit ?? t.profit_abs ?? 0;
       pts.push({
         label: `#${t.trade_id || i + 1}`,
         val: Number(cum.toFixed(2)),
@@ -162,21 +207,21 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     }
 
     return pts;
-  }, [closedTrades, openTrades, openProfitAbs]);
+  }, [closedTradesChronological, openTrades, openProfitAbs]);
 
-  // 7. Balance History Series (5000 -> 5000 + pnl)
+  // 7. Balance History Series (chronological startingBalance -> startingBalance + pnl)
   const balancePoints = useMemo(() => {
     let runningBalance = startingBalance;
     const pts: { label: string; balance: number; date: string }[] = [
-      { label: 'Старт', balance: startingBalance, date: '00:00' },
+      { label: 'Старт', balance: startingBalance, date: 'Старт' },
     ];
 
-    closedTrades.forEach((t, i) => {
-      runningBalance += t.profit_abs || 0;
+    closedTradesChronological.forEach((t, i) => {
+      runningBalance += t.net_profit ?? t.profit_abs ?? 0;
       pts.push({
         label: `#${t.trade_id || i + 1}`,
         balance: Number(runningBalance.toFixed(2)),
-        date: (t.close_date || t.open_date || '').slice(11, 16) || `${i + 1}`,
+        date: (t.close_date || t.open_date || '').slice(11, 16) || `#${t.trade_id || i + 1}`,
       });
     });
 
@@ -190,31 +235,31 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     }
 
     return pts;
-  }, [startingBalance, closedTrades, openTrades, openProfitAbs]);
+  }, [startingBalance, closedTradesChronological, openTrades, openProfitAbs]);
 
-  // 8. Individual Trade Bars for Log Chart
+  // 8. Individual Trade Bars for Log Chart (chronological)
   const tradeLogBars = useMemo(() => {
     const bars: { label: string; pair: string; val: number; isLive?: boolean }[] = [];
 
-    closedTrades.forEach((t) => {
+    closedTradesChronological.slice(-18).forEach((t) => {
       bars.push({
         label: `#${t.trade_id}`,
-        pair: t.pair.split(':')[0],
+        pair: t.pair.split(':')[0].split('/')[0],
         val: Number((t.profit_pct || 0).toFixed(2)),
       });
     });
 
-    openTrades.forEach((t) => {
+    openTrades.slice(0, 8).forEach((t) => {
       bars.push({
         label: `#${t.trade_id} (Откр)`,
-        pair: t.pair.split(':')[0],
+        pair: t.pair.split(':')[0].split('/')[0],
         val: Number((t.profit_pct || 0).toFixed(2)),
         isLive: true,
       });
     });
 
     return bars;
-  }, [closedTrades, openTrades]);
+  }, [closedTradesChronological, openTrades]);
 
   // 9. Profit Distribution Bins
   const profitBins = useMemo(() => {
@@ -396,26 +441,31 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             РЯД 1: Сравнение ботов (Слева) | Прибыль по времени (Справа)
         ===================================================================== */}
         <div className="grid grid-cols-1 lg:grid-cols-12">
-          {/* Слева: Сравнение ботов (7 колонок) */}
+          {/* Слева: Реальная доходность по стратегиям (7 колонок) */}
           <div className="lg:col-span-7 border-r border-[#242b35] bg-[#12151b] flex flex-col">
-            <div className="bg-[#181d24] border-b border-[#242b35] py-2 px-3 flex items-center justify-between text-[13px] font-medium text-[#e2e8f0]">
+            <div className="bg-[#181d24] border-b border-[#242b35] py-2 px-3 flex flex-wrap items-center justify-between gap-2 text-[13px] font-medium text-[#e2e8f0]">
               <div className="flex items-center gap-2">
-                <span>Мониторинг торгового движка</span>
+                <span>Реальная доходность стратегий ({botName})</span>
                 <span className="px-1.5 py-0.2 rounded bg-[#0284c7]/20 border border-[#0284c7]/40 text-[#38bdf8] text-[10px]">
-                  {strategyName}
+                  {ownerAccount
+                    ? ownerAccount.network_label ||
+                      `${ownerAccount.exchange.toUpperCase()}${ownerAccount.is_testnet ? ' TESTNET' : ''}`
+                    : strategyName}
                 </span>
               </div>
-              <span className="text-[11px] text-[#94a3b8]">Плечо: {botLeverage}x Cross</span>
+              <span className="text-[11px] font-mono text-[#94a3b8]">
+                Плечо: {botLeverage}x Cross | Комиссия учтена: ${fmtComma(totalFeesPaid, 2)}
+              </span>
             </div>
 
             <div className="p-2 overflow-x-auto">
               <table className="w-full text-left border-collapse text-[12px]">
                 <thead>
                   <tr className="border-b border-[#242b35] text-[#94a3b8] font-semibold text-[11px]">
-                    <th className="py-2 px-3">Имя бота</th>
-                    <th className="py-2 px-3">Сделки</th>
-                    <th className="py-2 px-3">Откр. прибыль</th>
-                    <th className="py-2 px-3">Закр. прибыль</th>
+                    <th className="py-2 px-3">Стратегия / Контур</th>
+                    <th className="py-2 px-3">Откр. / Закр.</th>
+                    <th className="py-2 px-3">Плавающий PnL</th>
+                    <th className="py-2 px-3">Чистый закр. PnL</th>
                     <th className="py-2 px-3">Текущий капитал</th>
                     <th className="py-2 px-3">Винрейт</th>
                   </tr>
@@ -424,42 +474,76 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <tr>
                     <td className="py-2.5 px-3 font-medium text-white flex items-center gap-1.5">
                       <span className="w-2 h-2 rounded-full bg-[#10b981]" />
-                      <span>{botName}</span>
+                      <span>1H Скальпинг (Отбой от 4H уровней)</span>
                     </td>
                     <td className="py-2.5 px-3 font-mono">
-                      <span className="text-white font-semibold">{openTrades.length}</span>
-                      <span className="text-[#64748b]"> / {maxOpenTrades}</span>
-                    </td>
-                    <td className="py-2.5 px-3">
-                      <ProfitPill profitPct={openProfitPct} profitAbs={openProfitAbs} />
-                    </td>
-                    <td className="py-2.5 px-3">
-                      <ProfitPill profitPct={closedProfitPct} profitAbs={closedProfitAbs} />
-                    </td>
-                    <td className="py-2.5 px-3 font-mono font-semibold text-white">
-                      {fmtComma(currentEquity, 2)} USDT
+                      <span className="text-[#10b981] font-semibold">{openScalpTrades.length}</span>
+                      <span className="text-[#64748b]"> откр. / </span>
+                      <span className="text-white">{closedScalpTrades.length} закр.</span>
                     </td>
                     <td className="py-2.5 px-3 font-mono">
-                      <span className="text-[#10b981]">{winningTradesCount}</span>
-                      <span className="text-[#64748b]"> / </span>
-                      <span className="text-[#ef4444]">{losingTradesCount}</span>
+                      <span className={scalpOpenPnl >= 0 ? 'text-[#10b981]' : 'text-[#ef4444]'}>
+                        {scalpOpenPnl >= 0 ? '+' : ''}
+                        {fmtComma(scalpOpenPnl, 2)} $
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 font-mono font-semibold">
+                      <span className={scalpClosedPnl >= 0 ? 'text-[#10b981]' : 'text-[#ef4444]'}>
+                        {scalpClosedPnl >= 0 ? '+' : ''}
+                        {fmtComma(scalpClosedPnl, 2)} $
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 font-mono text-[#94a3b8]">TP 0.8%–1.5%</td>
+                    <td className="py-2.5 px-3 font-mono text-[#10b981]">
+                      {closedScalpTrades.filter((t) => (t.net_profit ?? t.profit_abs ?? 0) > 0).length}В /{' '}
+                      {closedScalpTrades.filter((t) => (t.net_profit ?? t.profit_abs ?? 0) <= 0).length}П
                     </td>
                   </tr>
+
+                  <tr>
+                    <td className="py-2.5 px-3 font-medium text-white flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-[#38bdf8]" />
+                      <span>4H Вход в 2 стороны (LONG + SHORT Хедж)</span>
+                    </td>
+                    <td className="py-2.5 px-3 font-mono">
+                      <span className="text-[#38bdf8] font-semibold">{openHedgeTrades.length}</span>
+                      <span className="text-[#64748b]"> откр. / </span>
+                      <span className="text-white">{closedHedgeTrades.length} закр.</span>
+                    </td>
+                    <td className="py-2.5 px-3 font-mono">
+                      <span className={hedgeOpenPnl >= 0 ? 'text-[#10b981]' : 'text-[#ef4444]'}>
+                        {hedgeOpenPnl >= 0 ? '+' : ''}
+                        {fmtComma(hedgeOpenPnl, 2)} $
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 font-mono font-semibold">
+                      <span className={hedgeClosedPnl >= 0 ? 'text-[#10b981]' : 'text-[#ef4444]'}>
+                        {hedgeClosedPnl >= 0 ? '+' : ''}
+                        {fmtComma(hedgeClosedPnl, 2)} $
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 font-mono text-[#94a3b8]">Канал 4H + DCA</td>
+                    <td className="py-2.5 px-3 font-mono text-[#10b981]">
+                      {closedHedgeTrades.filter((t) => (t.net_profit ?? t.profit_abs ?? 0) > 0).length}В /{' '}
+                      {closedHedgeTrades.filter((t) => (t.net_profit ?? t.profit_abs ?? 0) <= 0).length}П
+                    </td>
+                  </tr>
+
                   <tr className="bg-[#151921] font-semibold">
-                    <td className="py-2.5 px-3 text-[#38bdf8]">ИТОГО ПО СИСТЕМЕ</td>
+                    <td className="py-2.5 px-3 text-[#38bdf8]">ИТОГО РЕАЛЬНЫЙ СЧЁТ</td>
                     <td className="py-2.5 px-3 font-mono text-[#94a3b8]">
-                      {openTrades.length + closedTrades.length} всего
+                      {openTrades.length} откр. / {closedTrades.length} закр.
                     </td>
                     <td className="py-2.5 px-3">
                       <ProfitPill
                         profitPct={openProfitPct}
-                        customText={`${fmtComma(openProfitAbs, 2)} USDT`}
+                        customText={`${openProfitAbs >= 0 ? '+' : ''}${fmtComma(openProfitAbs, 2)} USDT`}
                       />
                     </td>
                     <td className="py-2.5 px-3">
                       <ProfitPill
                         profitPct={closedProfitPct}
-                        customText={`${fmtComma(closedProfitAbs, 2)} USDT`}
+                        customText={`${closedProfitAbs >= 0 ? '+' : ''}${fmtComma(closedProfitAbs, 2)} USDT`}
                       />
                     </td>
                     <td className="py-2.5 px-3 font-mono text-[#38bdf8]">
@@ -819,48 +903,49 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             РЯД 3: Закрытые сделки (Слева) | История баланса (Справа)
         ===================================================================== */}
         <div className="grid grid-cols-1 lg:grid-cols-12">
-          {/* Слева: Закрытые сделки (7 колонок) */}
+          {/* Слева: Реальная история закрытых сделок и доходности (7 колонок) */}
           <div className="lg:col-span-7 border-r border-[#242b35] bg-[#12151b] flex flex-col">
-            <div className="bg-[#181d24] border-b border-[#242b35] py-2 px-3 flex items-center justify-between text-[13px] font-medium text-[#e2e8f0]">
+            <div className="bg-[#181d24] border-b border-[#242b35] py-2 px-3 flex flex-wrap items-center justify-between gap-2 text-[13px] font-medium text-[#e2e8f0]">
               <div className="flex items-center gap-2">
-                <span>Журнал закрытых сделок</span>
+                <span>Реальная история доходности (закрытые сделки из SQLite)</span>
                 <span className="px-1.5 py-0.5 rounded bg-[#334155] text-[#94a3b8] text-[10px]">
                   {closedTrades.length} сделок
                 </span>
               </div>
-              <span className="text-[11px] text-[#10b981]">
-                Чистый результат: {closedProfitAbs >= 0 ? '+' : ''}
-                {fmtComma(closedProfitAbs, 2)} $
+              <span className="text-[11px] text-[#10b981] font-mono">
+                Чистый профит: {closedProfitAbs >= 0 ? '+' : ''}
+                {fmtComma(closedProfitAbs, 2)} $ ({closedProfitPct >= 0 ? '+' : ''}
+                {closedProfitPct.toFixed(2)}%)
               </span>
             </div>
 
-            <div className="overflow-x-auto max-h-[260px] p-2">
+            <div className="overflow-x-auto max-h-[280px] p-2">
               {closedTrades.length === 0 ? (
                 <div className="flex flex-col items-center justify-center h-[200px] text-center text-[#94a3b8] text-[12px]">
                   <Info className="w-7 h-7 text-[#64748b] mb-2" />
                   <div className="text-white font-medium">Закрытых сделок пока нет</div>
                   <div className="text-[11px] text-[#64748b] mt-1 max-w-sm">
-                    Все завершённые позиции с чистым PnL и уплаченными комиссиями биржи будут
-                    сохраняться здесь и в базе данных SQLite.
+                    Как только бот закроет сделку по Тейк-Профиту или защитному тралу (строго в плюс после вычета комиссии 0.06%), она сразу отобразится в этой таблице и на графиках доходности.
                   </div>
                 </div>
               ) : (
-                <table className="w-full text-left border-collapse text-[12px]">
+                <table className="w-full text-left border-collapse text-[11.5px]">
                   <thead>
                     <tr className="border-b border-[#242b35] text-[#94a3b8] font-semibold text-[11px]">
-                      <th className="py-2 px-2">Сторона</th>
-                      <th className="py-2 px-2">Пара</th>
+                      <th className="py-2 px-2">Тип / Сторона</th>
+                      <th className="py-2 px-2">Пара / Биржа</th>
                       <th className="py-2 px-2">Маржа ($)</th>
-                      <th className="py-2 px-2">Вход</th>
-                      <th className="py-2 px-2">Выход</th>
-                      <th className="py-2 px-2">Плечо</th>
-                      <th className="py-2 px-2">Чистый PnL</th>
-                      <th className="py-2 px-2">Дата</th>
+                      <th className="py-2 px-2">Вход ➔ Выход</th>
+                      <th className="py-2 px-2">Комиссия</th>
+                      <th className="py-2 px-2">Чистый PnL ($ / %)</th>
+                      <th className="py-2 px-2">Дата закрытия</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#1e242d] text-[#d1d5db]">
                     {closedTrades.map((r) => {
-                      const isProfit = (r.profit_abs || 0) >= 0;
+                      const netPnl = r.net_profit ?? r.profit_abs ?? 0;
+                      const isProfit = netPnl >= 0;
+                      const isScalp = isScalpTrade(r);
                       return (
                         <tr
                           key={r.trade_id}
@@ -868,30 +953,47 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                           className="hover:bg-[#181d24] cursor-pointer transition-colors"
                         >
                           <td className="py-2 px-2 whitespace-nowrap">
-                            <span
-                              className={`inline-flex items-center px-2 py-0.5 rounded-[3px] text-[11px] font-semibold ${
-                                r.is_short
-                                  ? 'bg-[#3b181e] text-[#f87171] border border-[#ef4444]/40'
-                                  : 'bg-[#123524] text-[#4ade80] border border-[#10b981]/40'
-                              }`}
-                            >
-                              {r.is_short ? 'Шорт' : 'Лонг'}
-                            </span>
+                            <div className="flex items-center gap-1">
+                              <span
+                                className={`inline-flex items-center px-1.5 py-0.5 rounded-[3px] text-[10.5px] font-semibold ${
+                                  r.is_short
+                                    ? 'bg-[#3b181e] text-[#f87171] border border-[#ef4444]/40'
+                                    : 'bg-[#123524] text-[#4ade80] border border-[#10b981]/40'
+                                }`}
+                              >
+                                {r.is_short ? 'SHORT' : 'LONG'}
+                              </span>
+                              <span
+                                className={`px-1.5 py-0.5 rounded-[3px] text-[9.5px] font-mono ${
+                                  isScalp
+                                    ? 'bg-[#089981]/20 text-[#10b981] border border-[#10b981]/30'
+                                    : 'bg-[#0284c7]/20 text-[#38bdf8] border border-[#0284c7]/30'
+                                }`}
+                              >
+                                {isScalp ? 'SCALP' : 'HEDGE'}
+                              </span>
+                            </div>
                           </td>
-                          <td className="py-2 px-2 whitespace-nowrap font-medium text-white">
-                            {r.pair}
+                          <td className="py-2 px-2 whitespace-nowrap">
+                            <div className="font-medium text-white">{r.pair.split(':')[0]}</div>
+                            <div className="text-[10px] font-mono text-[#94a3b8]">
+                              {r.exchange.toUpperCase()} · {r.leverage || botLeverage}x
+                              {(r.dca_count || 0) > 0 ? ` · DCA ×${r.dca_count}` : ''}
+                            </div>
                           </td>
                           <td className="py-2 px-2 whitespace-nowrap font-mono">
                             {fmtComma(r.stake_amount, 2)} $
                           </td>
                           <td className="py-2 px-2 whitespace-nowrap font-mono text-[#cbd5e1]">
-                            {formatSmartNumber(r.open_rate)} $
+                            <div>
+                              {formatSmartNumber(r.open_rate)}$ ➔{' '}
+                              <span className="text-white font-semibold">
+                                {formatSmartNumber(r.close_rate || r.open_rate)}$
+                              </span>
+                            </div>
                           </td>
-                          <td className="py-2 px-2 whitespace-nowrap font-mono text-[#cbd5e1]">
-                            {formatSmartNumber(r.close_rate || r.open_rate)} $
-                          </td>
-                          <td className="py-2 px-2 whitespace-nowrap font-mono text-[#0284c7] font-semibold">
-                            {r.leverage || botLeverage}x
+                          <td className="py-2 px-2 whitespace-nowrap font-mono text-[#94a3b8]">
+                            -${fmtComma(r.fee_total ?? 0, 3)}
                           </td>
                           <td className="py-2 px-2 whitespace-nowrap">
                             <span
@@ -904,11 +1006,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                               <span>{isProfit ? '▲' : '▼'}</span>
                               <span>
                                 {isProfit ? '+' : ''}
-                                {fmtComma(r.profit_abs, 2)} $
+                                {fmtComma(netPnl, 2)} $ ({isProfit ? '+' : ''}
+                                {fmtComma(r.profit_pct, 2)}%)
                               </span>
                             </span>
                           </td>
-                          <td className="py-2 px-2 whitespace-nowrap text-[#64748b] text-[11px]">
+                          <td className="py-2 px-2 whitespace-nowrap font-mono text-[#64748b] text-[10.5px]">
                             {r.close_date || r.open_date}
                           </td>
                         </tr>
