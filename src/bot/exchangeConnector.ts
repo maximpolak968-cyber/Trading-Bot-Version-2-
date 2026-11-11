@@ -54,8 +54,12 @@ export interface ExchangeOrderParams {
 
 interface BinanceSymbolFilterMeta {
   symbol: string;
+  status: string;
+  contractType: string;
+  underlyingType: string;
   stepSize: number;
   minQty: number;
+  maxQty: number;
   tickSize: number;
   minNotional: number;
   quantityPrecision: number;
@@ -64,23 +68,29 @@ interface BinanceSymbolFilterMeta {
 
 interface BybitSymbolFilterMeta {
   symbol: string;
+  status: string;
   qtyStep: number;
   minOrderQty: number;
+  maxMktOrderQty: number;
   minNotional: number;
 }
 
 let binanceTimeOffsetMs = 0;
 let lastTimeSyncTs = 0;
-let binanceSymbolMetaCache = new Map<string, BinanceSymbolFilterMeta>();
-let lastExchangeInfoSyncTs = 0;
+const binanceSymbolMetaByHost = new Map<
+  string,
+  { syncTs: number; symbols: Map<string, BinanceSymbolFilterMeta> }
+>();
 const binanceDualSideCache = new Map<string, { dualSide: boolean; updatedAt: number }>();
 const binanceLeverageCache = new Map<string, number>();
 const binanceHostCache = new Map<string, string>();
 
 let bybitTimeOffsetMs = 0;
 let lastBybitTimeSyncTs = 0;
-let bybitSymbolMetaCache = new Map<string, BybitSymbolFilterMeta>();
-let lastBybitInstrumentsSyncTs = 0;
+const bybitSymbolMetaByHost = new Map<
+  string,
+  { syncTs: number; symbols: Map<string, BybitSymbolFilterMeta> }
+>();
 const bybitHostCache = new Map<string, string>();
 const bybitLeverageCache = new Map<string, number>();
 
@@ -251,14 +261,26 @@ async function getBybitTimestamp(
 }
 
 /**
- * Загружает и кэширует правила точности лотов (stepSize, minQty, minNotional) всех фьючерсных пар Binance.
+ * Загружает и кэширует правила точности лотов (stepSize, minQty, minNotional, quantityPrecision)
+ * отдельно для каждого хоста Binance Futures (Mainnet fapi.binance.com и Testnet testnet.binancefuture.com).
+ * На Testnet и Mainnet точность (quantityPrecision / stepSize) для ряда пар отличается!
  */
-async function ensureBinanceExchangeInfo(): Promise<void> {
-  if (binanceSymbolMetaCache.size > 50 && Date.now() - lastExchangeInfoSyncTs < 30 * 60_000) {
-    return;
+async function ensureBinanceExchangeInfo(
+  baseUrl = 'https://fapi.binance.com',
+  forceRefresh = false
+): Promise<Map<string, BinanceSymbolFilterMeta>> {
+  const cleanHost = baseUrl.replace(/\/+$/, '');
+  const existing = binanceSymbolMetaByHost.get(cleanHost);
+  if (
+    !forceRefresh &&
+    existing &&
+    existing.symbols.size > 50 &&
+    Date.now() - existing.syncTs < 30 * 60_000
+  ) {
+    return existing.symbols;
   }
   try {
-    const res = await makeHttpsRequest('https://fapi.binance.com/fapi/v1/exchangeInfo', {
+    const res = await makeHttpsRequest(`${cleanHost}/fapi/v1/exchangeInfo`, {
       method: 'GET',
       headers: { Accept: 'application/json' },
       timeoutMs: 7000,
@@ -271,50 +293,82 @@ async function ensureBinanceExchangeInfo(): Promise<void> {
           const sym = String(s.symbol || '');
           if (!sym) continue;
           const filters = Array.isArray(s.filters) ? s.filters : [];
-          const lotFilter =
-            filters.find((f: any) => f.filterType === 'MARKET_LOT_SIZE') ||
-            filters.find((f: any) => f.filterType === 'LOT_SIZE');
+          const lotSizeFilter = filters.find((f: any) => f.filterType === 'LOT_SIZE');
+          const marketLotFilter = filters.find((f: any) => f.filterType === 'MARKET_LOT_SIZE');
           const priceFilter = filters.find((f: any) => f.filterType === 'PRICE_FILTER');
           const notionalFilter = filters.find((f: any) => f.filterType === 'MIN_NOTIONAL');
 
-          const stepSize = Number(lotFilter?.stepSize || 0.001);
-          const minQty = Number(lotFilter?.minQty || stepSize || 0.001);
+          const rawLotStep = Number(lotSizeFilter?.stepSize || 0);
+          const rawMarketStep = Number(marketLotFilter?.stepSize || 0);
+          const resolvedStep = Math.max(rawLotStep, rawMarketStep);
+          const stepSize = resolvedStep > 0 ? resolvedStep : 0.001;
+
+          const rawLotMin = Number(lotSizeFilter?.minQty || 0);
+          const rawMarketMin = Number(marketLotFilter?.minQty || 0);
+          const resolvedMin = Math.max(rawLotMin, rawMarketMin, stepSize);
+          const minQty = resolvedMin > 0 ? resolvedMin : stepSize;
+
+          const rawLotMax = Number(lotSizeFilter?.maxQty || 0);
+          const rawMarketMax = Number(marketLotFilter?.maxQty || 0);
+          const validMaxes = [rawLotMax, rawMarketMax].filter((v) => v > 0);
+          const maxQty = validMaxes.length > 0 ? Math.min(...validMaxes) : 1_000_000;
+
           const tickSize = Number(priceFilter?.tickSize || 0.0001);
           const minNotional = Number(notionalFilter?.notional || 5);
 
           nextMap.set(sym, {
             symbol: sym,
-            stepSize: stepSize > 0 ? stepSize : 0.001,
-            minQty: minQty > 0 ? minQty : 0.001,
+            status: String(s.status || 'TRADING'),
+            contractType: String(s.contractType || 'PERPETUAL'),
+            underlyingType: String(s.underlyingType || 'COIN'),
+            stepSize,
+            minQty,
+            maxQty,
             tickSize: tickSize > 0 ? tickSize : 0.0001,
             minNotional: minNotional > 0 ? minNotional : 5,
             quantityPrecision:
-              typeof s.quantityPrecision === 'number' ? s.quantityPrecision : 3,
+              typeof s.quantityPrecision === 'number'
+                ? s.quantityPrecision
+                : countStepDecimals(stepSize),
             pricePrecision: typeof s.pricePrecision === 'number' ? s.pricePrecision : 4,
           });
         }
         if (nextMap.size > 0) {
-          binanceSymbolMetaCache = nextMap;
-          lastExchangeInfoSyncTs = Date.now();
+          binanceSymbolMetaByHost.set(cleanHost, {
+            syncTs: Date.now(),
+            symbols: nextMap,
+          });
+          return nextMap;
         }
       }
     }
   } catch {
     // ignore network failure, fallback heuristics will be used
   }
+  return existing?.symbols || new Map<string, BinanceSymbolFilterMeta>();
 }
 
 /**
- * Загружает и кэширует правила точности лотов Bybit V5 Linear (qtyStep, minOrderQty, minNotionalValue).
- * На Bybit ETHUSDT имеет qtyStep=0.01, SOLUSDT qtyStep=0.1 (в отличие от Binance, где ETHUSDT=0.001).
+ * Загружает и кэширует правила точности лотов Bybit V5 Linear (qtyStep, minOrderQty, minNotionalValue)
+ * отдельно для каждого хоста (Mainnet api.bybit.com, Testnet api-testnet.bybit.com, Demo api-demo.bybit.com).
  */
-async function ensureBybitInstrumentsInfo(baseUrl = 'https://api.bybit.com'): Promise<void> {
-  if (bybitSymbolMetaCache.size > 50 && Date.now() - lastBybitInstrumentsSyncTs < 30 * 60_000) {
-    return;
+async function ensureBybitInstrumentsInfo(
+  baseUrl = 'https://api.bybit.com',
+  forceRefresh = false
+): Promise<Map<string, BybitSymbolFilterMeta>> {
+  const cleanHost = baseUrl.replace(/\/+$/, '');
+  const existing = bybitSymbolMetaByHost.get(cleanHost);
+  if (
+    !forceRefresh &&
+    existing &&
+    existing.symbols.size > 50 &&
+    Date.now() - existing.syncTs < 30 * 60_000
+  ) {
+    return existing.symbols;
   }
   try {
     const res = await makeHttpsRequest(
-      `${baseUrl}/v5/market/instruments-info?category=linear&limit=1000`,
+      `${cleanHost}/v5/market/instruments-info?category=linear&limit=1000`,
       {
         method: 'GET',
         headers: { Accept: 'application/json' },
@@ -332,23 +386,30 @@ async function ensureBybitInstrumentsInfo(baseUrl = 'https://api.bybit.com'): Pr
           const lot = item.lotSizeFilter || {};
           const qtyStep = Number(lot.qtyStep || 0.01);
           const minOrderQty = Number(lot.minOrderQty || qtyStep || 0.01);
+          const maxMktOrderQty = Number(lot.maxMktOrderQty || lot.maxOrderQty || 1_000_000);
           const minNotional = Number(lot.minNotionalValue || 5);
           nextMap.set(sym, {
             symbol: sym,
+            status: String(item.status || 'Trading'),
             qtyStep: qtyStep > 0 ? qtyStep : 0.01,
             minOrderQty: minOrderQty > 0 ? minOrderQty : 0.01,
+            maxMktOrderQty: maxMktOrderQty > 0 ? maxMktOrderQty : 1_000_000,
             minNotional: minNotional > 0 ? minNotional : 5,
           });
         }
         if (nextMap.size > 0) {
-          bybitSymbolMetaCache = nextMap;
-          lastBybitInstrumentsSyncTs = Date.now();
+          bybitSymbolMetaByHost.set(cleanHost, {
+            syncTs: Date.now(),
+            symbols: nextMap,
+          });
+          return nextMap;
         }
       }
     }
   } catch {
     // ignore network error, fallback heuristics will be used
   }
+  return existing?.symbols || new Map<string, BybitSymbolFilterMeta>();
 }
 
 function countStepDecimals(step: number): number {
@@ -358,32 +419,84 @@ function countStepDecimals(step: number): number {
 }
 
 /**
- * Форматирует количество монет строго по правилам LOT_SIZE (stepSize, minQty, MIN_NOTIONAL) для Binance Futures.
+ * Проверяет, доступна ли пара для реальной торговли на выбранной бирже и сети (Mainnet vs Testnet),
+ * исключая отсутствующие на Testnet контракты, контракты в статусе SETTLING/PENDING_TRADING
+ * и не-криптовалютные TradFi-акции (TRADIFI_PERPETUAL, например SPCXUSDT / TSLAUSDT).
+ */
+export async function isPairTradableOnExchange(
+  pair: string,
+  exchange: SupportedExchange,
+  isTestnet?: boolean
+): Promise<boolean> {
+  const symbol = pairToCleanSymbol(pair);
+  if (!symbol) return false;
+
+  if (exchange === 'binance') {
+    const baseUrl = isTestnet ? 'https://testnet.binancefuture.com' : 'https://fapi.binance.com';
+    const hostMap = await ensureBinanceExchangeInfo(baseUrl);
+    if (hostMap.size > 50) {
+      const meta = hostMap.get(symbol);
+      if (!meta) return false;
+      if (meta.status !== 'TRADING') return false;
+      if (meta.contractType && meta.contractType !== 'PERPETUAL') return false;
+      if (
+        meta.underlyingType &&
+        meta.underlyingType !== 'COIN' &&
+        meta.underlyingType !== 'INDEX'
+      ) {
+        return false;
+      }
+      return true;
+    }
+    return true;
+  }
+
+  if (exchange === 'bybit') {
+    const baseUrl = isTestnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com';
+    const hostMap = await ensureBybitInstrumentsInfo(baseUrl);
+    if (hostMap.size > 50) {
+      const meta = hostMap.get(symbol);
+      if (!meta) return false;
+      if (meta.status && meta.status !== 'Trading') return false;
+      return true;
+    }
+    return true;
+  }
+
+  return true;
+}
+
+/**
+ * Форматирует количество монет строго по правилам LOT_SIZE, MARKET_LOT_SIZE и quantityPrecision
+ * для конкретного хоста Binance Futures (Mainnet fapi.binance.com или Testnet testnet.binancefuture.com).
  */
 export async function formatBinanceFuturesQuantity(
   symbol: string,
   rawQty: number,
   referencePrice: number,
-  isReduceOnly = false
+  isReduceOnly = false,
+  baseUrl = 'https://fapi.binance.com'
 ): Promise<string> {
-  await ensureBinanceExchangeInfo();
-  const meta = binanceSymbolMetaCache.get(symbol);
+  const hostMap = await ensureBinanceExchangeInfo(baseUrl);
+  let meta = hostMap.get(symbol);
+  if (!meta && baseUrl !== 'https://fapi.binance.com') {
+    const mainMap = await ensureBinanceExchangeInfo('https://fapi.binance.com');
+    meta = mainMap.get(symbol);
+  }
 
   let stepSize = meta?.stepSize || 0.001;
   let minQty = meta?.minQty || 0.001;
+  const maxQty = meta?.maxQty || 1_000_000;
   const minNotional = meta?.minNotional || 5;
 
   if (!meta) {
     if (referencePrice >= 10000) {
       stepSize = 0.001;
       minQty = 0.001;
-    } else if (referencePrice >= 100) {
-      stepSize = 0.001;
-      minQty = 0.001;
-    } else if (referencePrice >= 10) {
+    } else if (referencePrice >= 200) {
       stepSize = 0.01;
       minQty = 0.01;
-    } else if (referencePrice >= 0.5) {
+    } else if (referencePrice >= 10) {
       stepSize = 0.1;
       minQty = 0.1;
     } else {
@@ -405,17 +518,26 @@ export async function formatBinanceFuturesQuantity(
     }
   }
 
-  const decimals = countStepDecimals(stepSize);
-  const steps = isReduceOnly
-    ? Math.floor((qty + 1e-9) / stepSize)
-    : Math.ceil((qty - 1e-9) / stepSize);
-  const finalQty = Math.max(minQty, steps * stepSize);
+  const stepDecimals = countStepDecimals(stepSize);
+  const decimals =
+    typeof meta?.quantityPrecision === 'number' && meta.quantityPrecision >= 0
+      ? Math.min(stepDecimals, meta.quantityPrecision)
+      : stepDecimals;
+  const effectiveStep = decimals < stepDecimals ? Math.pow(10, -decimals) : stepSize;
+  const effectiveMinQty = Math.max(minQty, effectiveStep);
 
-  return finalQty.toFixed(decimals);
+  const steps = isReduceOnly
+    ? Math.floor((qty + 1e-9) / effectiveStep)
+    : Math.ceil((qty - 1e-9) / effectiveStep);
+  const finalQty = Math.min(maxQty, Math.max(effectiveMinQty, steps * effectiveStep));
+
+  const fixed = finalQty.toFixed(decimals);
+  return decimals > 0 ? fixed.replace(/(\.\d*?[1-9])0+$|\.0+$/, '$1') : fixed;
 }
 
 /**
- * Форматирует количество монет строго по правилам Bybit V5 Linear (qtyStep, minOrderQty, minNotionalValue).
+ * Форматирует количество монет строго по правилам Bybit V5 Linear (qtyStep, minOrderQty, minNotionalValue)
+ * для конкретного хоста (Mainnet / Testnet / Demo).
  */
 export async function formatBybitFuturesQuantity(
   symbol: string,
@@ -424,11 +546,16 @@ export async function formatBybitFuturesQuantity(
   isReduceOnly = false,
   baseUrl = 'https://api.bybit.com'
 ): Promise<string> {
-  await ensureBybitInstrumentsInfo(baseUrl);
-  const meta = bybitSymbolMetaCache.get(symbol);
+  const hostMap = await ensureBybitInstrumentsInfo(baseUrl);
+  let meta = hostMap.get(symbol);
+  if (!meta && baseUrl !== 'https://api.bybit.com') {
+    const mainMap = await ensureBybitInstrumentsInfo('https://api.bybit.com');
+    meta = mainMap.get(symbol);
+  }
 
   let qtyStep = meta?.qtyStep || 0;
   let minOrderQty = meta?.minOrderQty || 0;
+  const maxMktOrderQty = meta?.maxMktOrderQty || 1_000_000;
   const minNotional = meta?.minNotional || 5;
 
   if (!meta || qtyStep <= 0) {
@@ -465,9 +592,10 @@ export async function formatBybitFuturesQuantity(
   const steps = isReduceOnly
     ? Math.floor((qty + 1e-9) / qtyStep)
     : Math.ceil((qty - 1e-9) / qtyStep);
-  const finalQty = Math.max(minOrderQty, steps * qtyStep);
+  const finalQty = Math.min(maxMktOrderQty, Math.max(minOrderQty, steps * qtyStep));
 
-  return finalQty.toFixed(decimals);
+  const fixed = finalQty.toFixed(decimals);
+  return decimals > 0 ? fixed.replace(/(\.\d*?[1-9])0+$|\.0+$/, '$1') : fixed;
 }
 
 /**
@@ -498,6 +626,12 @@ function formatBinanceApiError(statusCode: number, rawData: string): {
       return {
         code,
         message: `Binance [-2019]: Недостаточно свободной маржи USDT на фьючерсном счете USDⓈ-M! (${msg})`,
+      };
+    }
+    if (code === -1111) {
+      return {
+        code,
+        message: `Binance [-1111]: Превышена допустимая точность лота для данного актива (${msg})`,
       };
     }
     if (code === -4164) {
@@ -776,21 +910,22 @@ export async function executeExchangeFuturesOrder(
     for (const baseUrl of candidateHosts) {
       try {
         await ensureBinanceSymbolLeverage(cleanKey, cleanSecret, symbol, targetLeverage, baseUrl);
-        const formattedQtyStr = await formatBinanceFuturesQuantity(
+        let formattedQtyStr = await formatBinanceFuturesQuantity(
           symbol,
           params.quantity,
           params.referencePrice,
-          isClose
+          isClose,
+          baseUrl
         );
-        const dualSide = await getBinanceDualSideMode(cleanKey, cleanSecret, false, baseUrl);
+        let activeDualSide = await getBinanceDualSideMode(cleanKey, cleanSecret, false, baseUrl);
 
-        const buildOrderQuery = async (useDualSide: boolean): Promise<string> => {
+        const buildOrderQuery = async (useDualSide: boolean, qtyStr = formattedQtyStr): Promise<string> => {
           const ts = await getBinanceTimestamp(false, baseUrl);
           const qp = new URLSearchParams();
           qp.set('symbol', symbol);
           qp.set('side', side);
           qp.set('type', 'MARKET');
-          qp.set('quantity', formattedQtyStr);
+          qp.set('quantity', qtyStr);
           qp.set('newOrderRespType', 'RESULT');
           if (useDualSide) {
             qp.set('positionSide', params.isShort ? 'SHORT' : 'LONG');
@@ -802,7 +937,7 @@ export async function executeExchangeFuturesOrder(
           return qp.toString();
         };
 
-        let query = await buildOrderQuery(dualSide);
+        let query = await buildOrderQuery(activeDualSide, formattedQtyStr);
         let signature = signBinanceFuturesQuery(query, cleanSecret);
         let res = await makeHttpsRequest(
           `${baseUrl}/fapi/v1/order?${query}&signature=${signature}`,
@@ -818,7 +953,7 @@ export async function executeExchangeFuturesOrder(
         // Если ошибка -1021 (рассинхрон времени) — принудительно синхронизируем часы и повторяем
         if (res.statusCode !== 200 && res.data.includes('-1021')) {
           await getBinanceTimestamp(true, baseUrl);
-          query = await buildOrderQuery(dualSide);
+          query = await buildOrderQuery(activeDualSide, formattedQtyStr);
           signature = signBinanceFuturesQuery(query, cleanSecret);
           res = await makeHttpsRequest(
             `${baseUrl}/fapi/v1/order?${query}&signature=${signature}`,
@@ -840,9 +975,9 @@ export async function executeExchangeFuturesOrder(
 
         // Если ошибка -4061 (Hedge Mode / One-Way Mode) — инвертируем dualSide и повторяем
         if (res.statusCode !== 200 && res.data.includes('-4061')) {
-          const flippedDual = !dualSide;
-          binanceDualSideCache.set(cleanKey, { dualSide: flippedDual, updatedAt: Date.now() });
-          query = await buildOrderQuery(flippedDual);
+          activeDualSide = !activeDualSide;
+          binanceDualSideCache.set(cleanKey, { dualSide: activeDualSide, updatedAt: Date.now() });
+          query = await buildOrderQuery(activeDualSide, formattedQtyStr);
           signature = signBinanceFuturesQuery(query, cleanSecret);
           res = await makeHttpsRequest(
             `${baseUrl}/fapi/v1/order?${query}&signature=${signature}`,
@@ -854,6 +989,62 @@ export async function executeExchangeFuturesOrder(
               },
             }
           );
+        }
+
+        // Если ошибка -1111 (Precision is over the maximum defined for this asset) —
+        // принудительно обновляем exchangeInfo для этого baseUrl и повторяем с точной/целочисленной точностью
+        if (res.statusCode !== 200 && res.data.includes('-1111')) {
+          await ensureBinanceExchangeInfo(baseUrl, true);
+          let refreshedQty = await formatBinanceFuturesQuantity(
+            symbol,
+            params.quantity,
+            params.referencePrice,
+            isClose,
+            baseUrl
+          );
+          if (refreshedQty === formattedQtyStr && refreshedQty.includes('.')) {
+            refreshedQty = String(
+              Math.max(
+                1,
+                isClose ? Math.floor(Number(formattedQtyStr)) : Math.ceil(Number(formattedQtyStr))
+              )
+            );
+          }
+          formattedQtyStr = refreshedQty;
+          query = await buildOrderQuery(activeDualSide, formattedQtyStr);
+          signature = signBinanceFuturesQuery(query, cleanSecret);
+          res = await makeHttpsRequest(
+            `${baseUrl}/fapi/v1/order?${query}&signature=${signature}`,
+            {
+              method: 'POST',
+              headers: {
+                'X-MBX-APIKEY': cleanKey,
+                'Content-Type': 'application/json',
+              },
+            }
+          );
+
+          // Если всё ещё -1111 и есть дробная часть — округляем до целого числа контрактов (0 знаков после запятой)
+          if (res.statusCode !== 200 && res.data.includes('-1111') && formattedQtyStr.includes('.')) {
+            formattedQtyStr = String(
+              Math.max(
+                1,
+                isClose ? Math.floor(Number(formattedQtyStr)) : Math.ceil(Number(formattedQtyStr))
+              )
+            );
+            query = await buildOrderQuery(activeDualSide, formattedQtyStr);
+            signature = signBinanceFuturesQuery(query, cleanSecret);
+            res = await makeHttpsRequest(
+              `${baseUrl}/fapi/v1/order?${query}&signature=${signature}`,
+              {
+                method: 'POST',
+                headers: {
+                  'X-MBX-APIKEY': cleanKey,
+                  'Content-Type': 'application/json',
+                },
+              }
+            );
+          }
         }
 
         // Если при закрытии (CLOSE) вернулась ошибка -2022 ReduceOnly Order is rejected
@@ -929,7 +1120,7 @@ export async function executeExchangeFuturesOrder(
     for (const baseUrl of candidateHosts) {
       try {
         await ensureBybitSymbolLeverage(cleanKey, cleanSecret, symbol, targetLeverage, baseUrl);
-        const formattedQtyStr = await formatBybitFuturesQuantity(
+        let formattedQtyStr = await formatBybitFuturesQuantity(
           symbol,
           params.quantity,
           params.referencePrice,
@@ -937,7 +1128,11 @@ export async function executeExchangeFuturesOrder(
           baseUrl
         );
 
-        const sendBybitOrder = async (positionIdx: 0 | 1 | 2, forceTimeSync = false) => {
+        const sendBybitOrder = async (
+          positionIdx: 0 | 1 | 2,
+          forceTimeSync = false,
+          qtyOverride = formattedQtyStr
+        ) => {
           const timestamp = await getBybitTimestamp(baseUrl, forceTimeSync);
           const recvWindow = '10000';
           const bodyObj: Record<string, any> = {
@@ -945,7 +1140,7 @@ export async function executeExchangeFuturesOrder(
             symbol,
             side: side === 'BUY' ? 'Buy' : 'Sell',
             orderType: 'Market',
-            qty: formattedQtyStr,
+            qty: qtyOverride,
             positionIdx,
           };
           if (isClose) {
@@ -967,14 +1162,15 @@ export async function executeExchangeFuturesOrder(
           });
         };
 
-        let res = await sendBybitOrder(0, false);
+        let activePosIdx: 0 | 1 | 2 = 0;
+        let res = await sendBybitOrder(activePosIdx, false);
 
         if (res.statusCode === 200) {
           let json = JSON.parse(res.data);
 
           // При рассинхроне времени (retCode 10002) синхронизируем часы и повторяем
           if (json.retCode === 10002) {
-            res = await sendBybitOrder(0, true);
+            res = await sendBybitOrder(activePosIdx, true);
             if (res.statusCode === 200) {
               json = JSON.parse(res.data);
             }
@@ -994,10 +1190,39 @@ export async function executeExchangeFuturesOrder(
               .toLowerCase()
               .includes('position idx')
           ) {
-            const hedgeIdx: 1 | 2 = params.isShort ? 2 : 1;
-            const retryRes = await sendBybitOrder(hedgeIdx, false);
+            activePosIdx = params.isShort ? 2 : 1;
+            const retryRes = await sendBybitOrder(activePosIdx, false);
             if (retryRes.statusCode === 200) {
               json = JSON.parse(retryRes.data);
+            }
+          }
+
+          // Если ошибка точности лота Bybit (10001 qty invalid / step) — обновляем instruments-info и повторяем
+          if (
+            json.retCode === 10001 &&
+            (String(json.retMsg || '').toLowerCase().includes('qty') ||
+              String(json.retMsg || '').toLowerCase().includes('precision'))
+          ) {
+            await ensureBybitInstrumentsInfo(baseUrl, true);
+            let retryBybitQty = await formatBybitFuturesQuantity(
+              symbol,
+              params.quantity,
+              params.referencePrice,
+              isClose,
+              baseUrl
+            );
+            if (retryBybitQty === formattedQtyStr && retryBybitQty.includes('.')) {
+              retryBybitQty = String(
+                Math.max(
+                  1,
+                  isClose ? Math.floor(Number(formattedQtyStr)) : Math.ceil(Number(formattedQtyStr))
+                )
+              );
+            }
+            formattedQtyStr = retryBybitQty;
+            const retryQtyRes = await sendBybitOrder(activePosIdx, false, formattedQtyStr);
+            if (retryQtyRes.statusCode === 200) {
+              json = JSON.parse(retryQtyRes.data);
             }
           }
 

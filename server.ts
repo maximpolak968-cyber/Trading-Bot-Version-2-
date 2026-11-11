@@ -30,6 +30,7 @@ import {
   getExchangeTakerFeeRate,
   fetchExchangeOpenPositions,
   fetchExchangeClosedPnl,
+  isPairTradableOnExchange,
   ExchangeOrderParams,
   PlacedOrderResult,
 } from './src/bot/exchangeConnector.ts';
@@ -86,6 +87,15 @@ const EXCLUDED_BASE_ASSETS = new Set([
   'RON',
   'UAH',
   'ZAR',
+  'SPCX',
+  'XAU',
+  'XAG',
+  'XPT',
+  'XPD',
+  'CL',
+  'BZ',
+  'NATGAS',
+  'COPPER',
   'SOXL',
   'KORU',
   'SKHYNIX',
@@ -96,11 +106,22 @@ const EXCLUDED_BASE_ASSETS = new Set([
   'MSFT',
   'AMZN',
   'GOOG',
+  'GOOGL',
   'META',
   'COIN',
   'MSTR',
   'SPY',
   'QQQ',
+  'INTC',
+  'HOOD',
+  'CRCL',
+  'PLTR',
+  'EWY',
+  'EWJ',
+  'PAYP',
+  'TSM',
+  'MU',
+  'AVGO',
 ]);
 
 let marketPairsCache: { timestamp: number; pairs: string[] } = {
@@ -2633,7 +2654,15 @@ async function runScalpBotCycle(waitForActive = false) {
     for (const pair of candidatePairs) {
       if (blacklist.includes(pair)) continue;
       const lastCd = cooldownPairs.get(pair) || 0;
-      if (Date.now() - lastCd < 3 * 60_000) continue; // 3-minute fast scalp re-entry cooldown after profitable TP
+      if (Date.now() - lastCd < 3 * 60_000) continue; // 3-minute fast scalp re-entry cooldown after profitable TP or rejected order
+
+      // Проверяем, что пара реально торгуется (status === TRADING и PERPETUAL) на бирже/сети подключенного аккаунта
+      if (
+        ownerAcc &&
+        !(await isPairTradableOnExchange(pair, ownerAcc.exchange, ownerAcc.is_testnet))
+      ) {
+        continue;
+      }
 
       const currentMasterOpen = tradesStore.filter(
         (t) => t.is_open && (!t.account_id || t.account_id === 'master')
@@ -2674,7 +2703,6 @@ async function runScalpBotCycle(waitForActive = false) {
         support: manualSupLvl?.manual_override ? manualSupLvl.price : undefined,
         resistance: manualResLvl?.manual_override ? manualResLvl.price : undefined,
       });
-      const struct4h = detectMarketStructure(c4h, c4h.length);
 
       const customSup = manualSupLvl?.price || mtf.key_4h_support;
       const customRes = manualResLvl?.price || mtf.key_4h_resistance;
@@ -2690,9 +2718,9 @@ async function runScalpBotCycle(waitForActive = false) {
         reason: `MTF Scan [${pair}]: 1D=${mtf.d1_trend} (RSI 1D=${mtf.rsi_1d}, 4H=${mtf.rsi_4h}, 1H=${mtf.rsi_1h}) | 4H Sup=${roundPrice(customSup)} Res=${roundPrice(customRes)} | Signal=${sig.enter_tag || 'WAIT_LEVEL'}`,
       });
 
-      // CASE A: Master does NOT have this pair open yet -> Automatic Dual-Strategy Engine:
-      // Priority 1: If a valid 1H Scalping signal exists on this coin -> Scalp it (1 direction).
-      // Priority 2: If NO Scalping signal exists, and the coin is in the middle of a wide 4H channel AND MTF RSI is not extreme -> Open 2-Way Hedge (LONG + SHORT).
+      // CASE A: Master does NOT have this pair open yet -> Strict MTF-filtered Scalping Entry:
+      // 1. Primary Scalping Signal (Mode A Level Bounce / Mode B Trend Pullback) strictly obeying MTF RSI (Long: 1D<=68, 4H<=60, 1H<=45; Short: 1D>=32, 4H>=40, 1H>=55)
+      // 2. Secondary MTF Level + RSI Oversold/Overbought Entry (single-direction only, so One-Way Mode exchange accounts never net out Long+Short)
       if (!masterHasPair && currentMasterOpen.length < botConfig.max_open_trades) {
         const { compoundedBalance: totalDeposit } = getCompoundedAccountBalance('master');
         const usedMargin = currentMasterOpen.reduce((acc, t) => acc + t.stake_amount, 0);
@@ -2711,20 +2739,47 @@ async function runScalpBotCycle(waitForActive = false) {
               if (openedInThisCycle >= 3) break;
               continue;
             } else if (
-              currentMasterOpen.length + 1 < botConfig.max_open_trades &&
               btcGuard.isSafe &&
+              mtf.allow_long &&
               mtf.rsi_1d <= 68 &&
-              mtf.rsi_1d >= 32 &&
               mtf.rsi_4h <= 60 &&
-              mtf.rsi_4h >= 40 &&
-              isHedgeEntryCandidate(struct4h, 35, 65, 3.0)
+              mtf.rsi_1h <= 45 &&
+              mtf.pos_4h_pct <= 45
             ) {
-              await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d);
-              openedInThisCycle += 2;
+              await createScalpBotPosition(
+                pair,
+                'long',
+                livePrice,
+                mtf,
+                c4h,
+                c1d,
+                'MTF_Oversold_Scalp_Long'
+              );
+              openedInThisCycle++;
+              if (openedInThisCycle >= 3) break;
+              continue;
+            } else if (
+              mtf.allow_short &&
+              mtf.rsi_1d >= 32 &&
+              mtf.rsi_4h >= 40 &&
+              mtf.rsi_1h >= 55 &&
+              mtf.pos_4h_pct >= 55
+            ) {
+              await createScalpBotPosition(
+                pair,
+                'short',
+                livePrice,
+                mtf,
+                c4h,
+                c1d,
+                'MTF_Overbought_Scalp_Short'
+              );
+              openedInThisCycle++;
               if (openedInThisCycle >= 3) break;
               continue;
             }
           } catch (entryErr: any) {
+            cooldownPairs.set(pair, Date.now());
             appendLog(
               'freqtrade.bot.entry',
               'WARNING',

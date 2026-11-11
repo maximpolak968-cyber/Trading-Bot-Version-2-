@@ -6,6 +6,9 @@ import {
   getExchangeTakerFeeRate,
   symbolToFreqtradePair,
   isSimulatedTestApiKey,
+  formatBinanceFuturesQuantity,
+  formatBybitFuturesQuantity,
+  isPairTradableOnExchange,
 } from '../src/bot/exchangeConnector';
 
 const sqliteDb = new SqliteBotDatabase();
@@ -1122,6 +1125,67 @@ async function runVerification() {
   assert.equal(symbolToFreqtradePair('ETHUSDT'), 'ETH/USDT:USDT');
   assert.equal(symbolToFreqtradePair('BTC-USDT-SWAP'), 'BTC/USDT:USDT');
   assert.equal(symbolToFreqtradePair('SOL-USDT'), 'SOL/USDT:USDT');
+
+  // Проверка точности лотов Binance Testnet vs Mainnet (защита от ошибки Binance [-1111]: Precision is over the maximum defined for this asset)
+  const spcxTestnetQty = await formatBinanceFuturesQuantity(
+    'SPCXUSDT',
+    4.4389,
+    140.8,
+    false,
+    'https://testnet.binancefuture.com'
+  );
+  const spcxMainnetQty = await formatBinanceFuturesQuantity(
+    'SPCXUSDT',
+    4.4389,
+    140.8,
+    false,
+    'https://fapi.binance.com'
+  );
+  assert.equal(
+    spcxTestnetQty.includes('.'),
+    false,
+    `На Binance Testnet у SPCXUSDT quantityPrecision=0 (stepSize=1), поэтому лот должен быть строго целым числом без дроби (получено: ${spcxTestnetQty})`
+  );
+  assert.equal(
+    spcxTestnetQty,
+    '5',
+    `На Binance Testnet лот SPCXUSDT для 4.4389 должен округляться вверх до 5 (получено: ${spcxTestnetQty})`
+  );
+  assert.equal(
+    spcxMainnetQty,
+    '4.44',
+    `На Binance Mainnet у SPCXUSDT stepSize=0.01 (quantityPrecision=2), лот должен быть 4.44 (получено: ${spcxMainnetQty})`
+  );
+
+  const arkTestnetQty = await formatBinanceFuturesQuantity(
+    'ARKUSDT',
+    10,
+    0.5,
+    false,
+    'https://testnet.binancefuture.com'
+  );
+  assert.equal(
+    Number(arkTestnetQty) % 3,
+    0,
+    `На Binance Testnet у ARKUSDT LOT_SIZE.stepSize=3, лот должен быть кратен 3 и без дроби (получено: ${arkTestnetQty})`
+  );
+
+  // Проверка фильтрации не-криптовалютных контрактов (TRADIFI_PERPETUAL SPCXUSDT / TSLAUSDT) и статуса TRADING
+  const spcxTradableTestnet = await isPairTradableOnExchange('SPCX/USDT:USDT', 'binance', true);
+  const ethTradableTestnet = await isPairTradableOnExchange('ETH/USDT:USDT', 'binance', true);
+  assert.equal(
+    spcxTradableTestnet,
+    false,
+    'Контракт SPCX/USDT:USDT (TRADIFI_PERPETUAL / PREMARKET) должен автоматически исключаться из авто-сканера Binance Futures'
+  );
+  assert.equal(
+    ethTradableTestnet,
+    true,
+    'Контракт ETH/USDT:USDT (PERPETUAL / COIN / TRADING) должен быть разрешён для торговли на Binance Testnet'
+  );
+  console.log(
+    `   🎯 Доказано: раздельный кэш точности Mainnet vs Testnet работает! SPCXUSDT Testnet qty="${spcxTestnetQty}" (0 знаков), Mainnet qty="${spcxMainnetQty}" (2 знака), ARKUSDT Testnet qty="${arkTestnetQty}" (шаг 3), фильтр TRADIFI_PERPETUAL активен.`
+  );
 
   // Проверяем прямое удаление открытой сделки через DELETE /api/v1/trades/:id (кнопка × в таблице сделок)
   const openBeforeDel = await api('/api/v1/status');
