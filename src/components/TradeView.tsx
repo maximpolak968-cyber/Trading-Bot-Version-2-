@@ -156,6 +156,7 @@ export const TradeView: React.FC<TradeViewProps> = ({
   onDeleteDrawing,
   onClearAllDrawings,
   onQuickOrderFromChart,
+  onDeleteTrade,
   onOpenForceEnterModal,
   onRefresh,
   loadingChart,
@@ -255,7 +256,11 @@ export const TradeView: React.FC<TradeViewProps> = ({
   const handleTriggerClose = async (trade: FreqtradeTrade, e: React.MouseEvent) => {
     e.stopPropagation();
     await onForceExit(trade.trade_id);
-    setRightTab('closed');
+  };
+
+  const handleTriggerDelete = async (trade: FreqtradeTrade, e: React.MouseEvent) => {
+    e.stopPropagation();
+    await onDeleteTrade(trade.trade_id);
   };
 
   return (
@@ -575,10 +580,19 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                   <button
                                     type="button"
                                     onClick={(e) => handleTriggerClose(trade, e)}
-                                    title="Закрыть сделку (перейдёт в Закрытые)"
+                                    title="Закрыть сделку в плюс (перейдёт в Закрытые)"
                                     className="px-1.5 py-0.5 rounded-[3px] bg-[#3b1219] hover:bg-[#ef4444] border border-[#ef4444]/70 text-[#fca5a5] hover:text-white text-[10px] font-semibold transition-colors"
                                   >
                                     Close
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    onClick={(e) => handleTriggerDelete(trade, e)}
+                                    title="Удалить сделку из базы"
+                                    className="px-1.5 py-0.5 rounded-[3px] bg-[#21252b] hover:bg-[#ef4444] border border-[#383e48] hover:border-[#ef4444] text-[#9ca3af] hover:text-white text-[10px] font-bold transition-colors"
+                                  >
+                                    ×
                                   </button>
                                 </div>
                               </td>
@@ -720,6 +734,14 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                     className="px-1.5 py-0.5 rounded-[3px] bg-[#3b1219] hover:bg-[#ef4444] border border-[#ef4444]/70 text-[#fca5a5] hover:text-white text-[10px] font-semibold transition-colors"
                                   >
                                     Close
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => handleTriggerDelete(trade, e)}
+                                    title="Удалить сделку из базы"
+                                    className="px-1.5 py-0.5 rounded-[3px] bg-[#21252b] hover:bg-[#ef4444] border border-[#383e48] hover:border-[#ef4444] text-[#9ca3af] hover:text-white text-[10px] font-bold transition-colors"
+                                  >
+                                    ×
                                   </button>
                                 </div>
                               </td>
@@ -870,10 +892,19 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                   <button
                                     type="button"
                                     onClick={(e) => handleTriggerClose(trade, e)}
-                                    title="Закрыть сделку (перейдёт в Закрытые)"
+                                    title="Закрыть сделку в плюс (перейдёт в Закрытые)"
                                     className="px-1.5 py-0.5 rounded-[3px] bg-[#3b1219] hover:bg-[#ef4444] border border-[#ef4444]/70 text-[#fca5a5] hover:text-white text-[10px] font-semibold transition-colors"
                                   >
                                     Close
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    onClick={(e) => handleTriggerDelete(trade, e)}
+                                    title="Удалить сделку из базы"
+                                    className="px-1.5 py-0.5 rounded-[3px] bg-[#21252b] hover:bg-[#ef4444] border border-[#383e48] hover:border-[#ef4444] text-[#9ca3af] hover:text-white text-[10px] font-bold transition-colors"
+                                  >
+                                    ×
                                   </button>
                                 </div>
                               </td>
@@ -989,12 +1020,24 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                 </span>
                               </td>
 
-                              {/* 8. Date */}
+                              {/* 8. Date + Delete */}
                               <td
                                 className="py-1.5 px-1.5 whitespace-nowrap font-mono text-[10px] text-[#9ca3af]"
                                 title={trade.close_date || trade.open_date}
                               >
-                                {shortDateStr(trade.close_date || trade.open_date, trade.close_timestamp || trade.open_timestamp)}
+                                <div className="flex items-center justify-between gap-1">
+                                  <span>
+                                    {shortDateStr(trade.close_date || trade.open_date, trade.close_timestamp || trade.open_timestamp)}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => handleTriggerDelete(trade, e)}
+                                    title="Удалить закрытую сделку из истории"
+                                    className="px-1 py-0.2 rounded-[3px] bg-[#21252b] hover:bg-[#ef4444] border border-[#383e48] hover:border-[#ef4444] text-[#9ca3af] hover:text-white text-[10px] font-bold transition-colors"
+                                  >
+                                    ×
+                                  </button>
+                                </div>
                               </td>
                             </tr>
                           );

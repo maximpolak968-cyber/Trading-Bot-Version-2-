@@ -1065,18 +1065,42 @@ async function runVerification() {
     `   ⏱️ [9C] Время закрытия сделки #${masterEthTrade.trade_id} неизменно: close_date="${closedEthAfter.close_date}", close_timestamp=${closedEthAfter.close_timestamp}`
   );
 
-  // 9D. Проверяем резервное авто-восстановление API-ключей при сбое/обнулении таблицы SQLite
-  const accsBeforeWipe = sqliteDb.loadExchangeAccounts();
-  assert.ok(accsBeforeWipe.length >= 1, 'До имитации сбоя аккаунты должны быть подключены');
-  // Имитируем потерю строк только в SQLite без удаления backup-файла (как при пересоздании контейнера с сохраненным backup)
+  // 9D. Проверяем резервное авто-восстановление реальных API-ключей при сбое/обнулении таблицы SQLite
+  const backupPath = path.resolve(process.cwd(), '.exchange_accounts.backup.json');
+  const existingBackupRaw = fs.existsSync(backupPath) ? fs.readFileSync(backupPath, 'utf-8') : null;
+  const realBackupSample = [
+    {
+      id: 'acc-bybit-real-backup-check',
+      name: 'Bybit Real Backup Check',
+      owner_label: 'Owner',
+      exchange: 'bybit',
+      market_type: 'futures',
+      api_key_masked: 'BYBT••••••••9900',
+      api_key_raw: 'BYBTREALBACKUPKEY99001122',
+      api_secret_raw: 'BYBTREALBACKUPSECRET99001122',
+      has_passphrase: 0,
+      is_owner: 1,
+      client_access_code: 'BYBTBCKP',
+      enabled: 1,
+      copy_trading: 1,
+      copy_multiplier: 1,
+      max_leverage: 25,
+      balance_usdt: 1500,
+      status: 'connected',
+      last_sync: '2026-11-11 20:00:00',
+      connected_at: Date.now(),
+      is_testnet: 1,
+    },
+  ];
+  fs.writeFileSync(backupPath, JSON.stringify(realBackupSample, null, 2), 'utf-8');
   (sqliteDb as any).db.prepare('DELETE FROM exchange_accounts').run();
   const restoredAccs = sqliteDb.loadExchangeAccounts();
   assert.ok(
-    restoredAccs.length >= 1 && restoredAccs[0].api_key_raw,
-    'При пустой таблице exchange_accounts ключи должны автоматически восстановиться из резервного хранилища .exchange_accounts.backup.json!'
+    restoredAccs.length === 1 && restoredAccs[0].api_key_raw === 'BYBTREALBACKUPKEY99001122',
+    'При пустой таблице exchange_accounts реальные ключи должны автоматически восстановиться из резервного хранилища .exchange_accounts.backup.json!'
   );
   console.log(
-    `   🔑 [9D] Авто-восстановление API-ключей после сбоя БД сработало: восстановлено аккаунтов=${restoredAccs.length} (${restoredAccs.map((a) => a.name).join(', ')})`
+    `   🔑 [9D] Авто-восстановление реальных API-ключей после сбоя БД сработало: восстановлен аккаунт "${restoredAccs[0].name}" (Testnet=${restoredAccs[0].is_testnet})`
   );
 
   // Если передан флаг --leave-for-restart, оставляем эти сделки в БД для проверки через реальный перезапуск процесса Node.js (restart_dev_server)
@@ -1086,9 +1110,9 @@ async function runVerification() {
   }
 
   // ---------------------------------------------------------------------------
-  // ОЧИСТКА ТЕСТОВЫХ ДАННЫХ (Чистое состояние после проверки)
+  // ТЕСТ 10: ПРОВЕРКА УДАЛЕНИЯ СДЕЛОК (DELETE /api/v1/trades/:id), КОМИССИЙ БИРЖ И ЧИСТОТЫ БАЗЫ
   // ---------------------------------------------------------------------------
-  console.log('\n🔟 Проверка комиссий бирж, нормализации символов и защиты резервной копии API-ключей...');
+  console.log('\n🔟 Проверка удаления сделок (включая минусовые), комиссий бирж и защиты резервной копии API-ключей...');
   assert.equal(getExchangeTakerFeeRate('bybit'), 0.00055, 'Комиссия Taker Bybit должна быть 0.055%');
   assert.equal(getExchangeTakerFeeRate('binance'), 0.0005, 'Комиссия Taker Binance должна быть 0.05%');
   assert.equal(getExchangeTakerFeeRate('okx'), 0.0005, 'Комиссия Taker OKX должна быть 0.05%');
@@ -1099,10 +1123,22 @@ async function runVerification() {
   assert.equal(symbolToFreqtradePair('BTC-USDT-SWAP'), 'BTC/USDT:USDT');
   assert.equal(symbolToFreqtradePair('SOL-USDT'), 'SOL/USDT:USDT');
 
+  // Проверяем прямое удаление открытой сделки через DELETE /api/v1/trades/:id (кнопка × в таблице сделок)
+  const openBeforeDel = await api('/api/v1/status');
+  if (openBeforeDel.data.length > 0) {
+    const targetDelId = openBeforeDel.data[0].trade_id;
+    const delRes = await api(`/api/v1/trades/${targetDelId}`, { method: 'DELETE' });
+    assert.equal(delRes.status, 200, 'DELETE /api/v1/trades/:id должен успешно удалять сделку');
+    const openAfterDel = await api('/api/v1/status');
+    assert.ok(
+      !openAfterDel.data.some((t: any) => t.trade_id === targetDelId),
+      `Удалённая сделка #${targetDelId} больше не должна присутствовать в списке открытых`
+    );
+    console.log(`   🗑️ Доказано: сделка #${targetDelId} (и её копии) мгновенно удалена через DELETE /api/v1/trades/${targetDelId}`);
+  }
+
   // Проверяем, что резервный файл .exchange_accounts.backup.json НЕ затирается пустым массивом при clearAllExchangeAccounts(false)
-  const backupPath = path.resolve(process.cwd(), '.exchange_accounts.backup.json');
   const dummyBackup = JSON.stringify([{ id: 'keep-test', name: 'Protected', api_key_raw: 'REALKEY1234567890' }]);
-  const existingBackup = fs.existsSync(backupPath) ? fs.readFileSync(backupPath, 'utf-8') : null;
   fs.writeFileSync(backupPath, dummyBackup, 'utf-8');
   sqliteDb.clearAllExchangeAccounts(false);
   const afterClearBackup = fs.readFileSync(backupPath, 'utf-8');
@@ -1111,22 +1147,26 @@ async function runVerification() {
     dummyBackup,
     'Резервная копия .exchange_accounts.backup.json НЕ должна затираться при фоновом/тестовом сбросе без явного подтверждения владельца!'
   );
-  if (existingBackup !== null) {
-    fs.writeFileSync(backupPath, existingBackup, 'utf-8');
+  if (existingBackupRaw !== null) {
+    fs.writeFileSync(backupPath, existingBackupRaw, 'utf-8');
   } else {
-    fs.unlinkSync(backupPath);
+    try {
+      fs.unlinkSync(backupPath);
+    } catch {
+      // ignore
+    }
   }
   console.log(
     '   ✅ Доказано: реальные комиссии всех 5 бирж (Bybit 0.055%, Binance/OKX/BingX 0.05%, Bitget 0.06%), маппинг позиций и защита .exchange_accounts.backup.json работают безотказно!'
   );
 
   console.log('\n🧹 Очистка тестовых аккаунтов и тестовых сделок...');
-  await api('/api/v1/accounts', { method: 'DELETE' });
+  await api('/api/v1/accounts?confirm=true', { method: 'DELETE' });
   const allRemainingTrades = sqliteDb.loadAllTrades();
   for (const t of allRemainingTrades) {
     sqliteDb.deleteTrade(t.trade_id);
   }
-  sqliteDb.clearAllExchangeAccounts(false);
+  sqliteDb.clearAllExchangeAccounts(true);
   sqliteDb.clearBotLevelsForPair('BTC/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('ETH/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('SOL/USDT:USDT');
@@ -1136,9 +1176,13 @@ async function runVerification() {
   sqliteDb.clearChartDrawingsForPair('LINK/USDT:USDT');
   const finalCfg = await api('/api/v1/show_config');
   const finalBal = await api('/api/v1/balance');
+  const finalAccs = await api('/api/v1/accounts');
+  const finalStatus = await api('/api/v1/status');
   assert.equal(finalBal.data.total, 0, 'После очистки всех аккаунтов баланс должен быть 0 USDT');
+  assert.equal(finalAccs.data.accounts.length, 0, 'После очистки тестовых данных не должно оставаться тестовых аккаунтов');
+  assert.equal(finalStatus.data.length, 0, 'После очистки тестовых данных не должно оставаться тестовых сделок');
   console.log(
-    `   ✅ База очищена. Финальный статус бота без подключенной биржи: state="${finalCfg.data.state}", exchange_connected=${finalCfg.data.exchange_connected}, баланс=${finalBal.data.total} USDT`
+    `   ✅ База очищена. Финальный статус бота без подключенной биржи: state="${finalCfg.data.state}", exchange_connected=${finalCfg.data.exchange_connected}, аккаунтов=${finalAccs.data.accounts.length}, сделок=${finalStatus.data.length}, баланс=${finalBal.data.total} USDT`
   );
 
   // Восстанавливаем реальные пользовательские аккаунты и сделки, если они были подключены до запуска теста

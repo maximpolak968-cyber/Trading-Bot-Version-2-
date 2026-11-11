@@ -173,6 +173,7 @@ export interface FreqtradeTrade {
   orders: TradeOrderEntry[];
   planned_dca_levels?: PlannedDcaLevel[];
   synced_accounts?: string[];
+  parent_trade_id?: number;
   campaign_id?: string;
   campaign_banked_profit?: number;
 }

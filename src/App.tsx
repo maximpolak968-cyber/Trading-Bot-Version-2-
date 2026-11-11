@@ -258,8 +258,21 @@ export default function App() {
         if (serverAccounts.length === 0 && !restoringVaultRef.current) {
           try {
             const rawVault = localStorage.getItem('scalpbot_saved_accounts_vault_v1');
-            const vaultItems = rawVault ? JSON.parse(rawVault) : [];
-            if (Array.isArray(vaultItems) && vaultItems.length > 0) {
+            const rawItems = rawVault ? JSON.parse(rawVault) : [];
+            const vaultItems = Array.isArray(rawItems)
+              ? rawItems.filter((item: any) => {
+                  const k = String(item?.api_key || '').trim().toLowerCase();
+                  return (
+                    k &&
+                    !k.startsWith('test_') &&
+                    !k.startsWith('mock_') &&
+                    !k.startsWith('sim_') &&
+                    !k.startsWith('ownr9988') &&
+                    !k.startsWith('clnt1122')
+                  );
+                })
+              : [];
+            if (vaultItems.length > 0) {
               restoringVaultRef.current = true;
               let latestAccounts: ExchangeAccount[] = [];
               for (const item of vaultItems) {
@@ -878,7 +891,10 @@ export default function App() {
   };
 
   const handleDeleteTrade = async (tradeId: number) => {
+    setOpenTrades((prev) => prev.filter((t) => t.trade_id !== tradeId && t.parent_trade_id !== tradeId));
+    setClosedTrades((prev) => prev.filter((t) => t.trade_id !== tradeId && t.parent_trade_id !== tradeId));
     await fetch(`/api/v1/trades/${tradeId}`, { method: 'DELETE' });
+    setStatusNotification(`🗑️ Сделка #${tradeId} удалена из базы`);
     await fetchBotState();
   };
 

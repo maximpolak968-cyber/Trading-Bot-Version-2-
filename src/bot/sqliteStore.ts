@@ -325,15 +325,24 @@ export class SqliteBotDatabase {
     return paths;
   }
 
+  private isRealUserAccountKey(rawKey: unknown): boolean {
+    const key = String(rawKey || '').trim().toLowerCase();
+    return Boolean(
+      key &&
+        !key.startsWith('test_') &&
+        !key.startsWith('mock_') &&
+        !key.startsWith('sim_') &&
+        !key.startsWith('ownr9988') &&
+        !key.startsWith('clnt1122')
+    );
+  }
+
   private syncAccountsBackupFile(allowEmptyOverwrite = false) {
     try {
       const rows = this.db.prepare(`SELECT * FROM exchange_accounts ORDER BY rowid ASC`).all();
-      const realAccounts = rows.filter((r: any) => {
-        const key = String(r.api_key_raw || '').trim().toLowerCase();
-        return key && !key.startsWith('test_') && !key.startsWith('mock_') && !key.startsWith('sim_');
-      });
+      const realAccounts = rows.filter((r: any) => this.isRealUserAccountKey(r.api_key_raw));
       // Защита от случайного затирания резервной копии API-ключей при тестах или пустой БД:
-      // перезаписываем пустым массивом ТОЛЬКО при явной очистке пользователем (allowEmptyOverwrite = true).
+      // перезаписываем пустым массивом ТОЛЬКО при явной очистке/удалении пользователем (allowEmptyOverwrite = true).
       if (realAccounts.length === 0 && !allowEmptyOverwrite) {
         return;
       }
@@ -363,10 +372,20 @@ export class SqliteBotDatabase {
             const raw = fs.readFileSync(p, 'utf-8');
             const parsed = JSON.parse(raw);
             if (Array.isArray(parsed) && parsed.length > 0) {
-              for (const acc of parsed) {
-                this.upsertExchangeAccountInternal(acc);
+              const validReal = parsed.filter((acc: any) => this.isRealUserAccountKey(acc?.api_key_raw));
+              if (validReal.length !== parsed.length) {
+                try {
+                  fs.writeFileSync(p, JSON.stringify(validReal, null, 2), 'utf-8');
+                } catch {
+                  // ignore cleanup write error
+                }
               }
-              return;
+              if (validReal.length > 0) {
+                for (const acc of validReal) {
+                  this.upsertExchangeAccountInternal(acc);
+                }
+                return;
+              }
             }
           }
         } catch {
@@ -1286,7 +1305,7 @@ export class SqliteBotDatabase {
   public deleteExchangeAccount(id: string) {
     try {
       this.db.prepare(`DELETE FROM exchange_accounts WHERE id = ?`).run(id);
-      this.syncAccountsBackupFile();
+      this.syncAccountsBackupFile(true);
     } catch {
       // ignore
     }

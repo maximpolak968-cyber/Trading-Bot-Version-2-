@@ -1563,6 +1563,8 @@ async function dispatchOrderToExchangeAccount(
   return orderRes;
 }
 
+const dismissedExchangeSyncKeys = new Set<string>();
+
 async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord): Promise<void> {
   const creds = getAccountCredentialsFromStore(acc);
   if (!creds || isSimulatedTestApiKey(creds.apiKey)) return;
@@ -1579,6 +1581,8 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
     // 1. Синхронизация всех открытых позиций, которые уже есть на биржевом аккаунте
     if (openPosRes.success) {
       for (const pos of openPosRes.positions) {
+        const syncKey = `open:${targetAccountId}:${pos.pair}:${pos.is_short ? 'S' : 'L'}:${pos.entry_price}`;
+        if (dismissedExchangeSyncKeys.has(syncKey)) continue;
         const existingOpen = tradesStore.find(
           (t) =>
             t.is_open &&
@@ -1779,6 +1783,8 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
     // 3. Импорт истории закрытых сделок с биржи (чтобы Дашборд и Закрытые сделки отражали реальную историю счета)
     if (closedPnlRes.success && closedPnlRes.closed.length > 0) {
       for (const c of closedPnlRes.closed.slice(0, 25)) {
+        const histKey = `closed:${targetAccountId}:${c.pair}:${c.order_id || c.updated_time}`;
+        if (dismissedExchangeSyncKeys.has(histKey)) continue;
         const alreadyRecorded = tradesStore.some(
           (t) =>
             !t.is_open &&
@@ -3248,7 +3254,12 @@ async function startServer() {
 
   initializeBotTrades().catch(console.error);
   setInterval(() => {
-    runScalpBotCycle().catch(() => {});
+    const hasRealActiveAccount = exchangeAccountsStore.some(
+      (a) => a.enabled && !isSimulatedTestApiKey(a.api_key_raw)
+    );
+    if (hasRealActiveAccount) {
+      runScalpBotCycle().catch(() => {});
+    }
   }, 10_000);
 
   app.get('/api/v1/ping', (_req, res) => {
@@ -5026,6 +5037,7 @@ async function startServer() {
       botConfig.state = 'running';
 
       if (!isSimulatedTestApiKey(String(api_key))) {
+        await syncPositionsAndHistoryFromExchanges(existingAcc);
         runScalpBotCycle(false).catch(() => {});
       }
 
@@ -5491,9 +5503,27 @@ async function startServer() {
 
   app.delete('/api/v1/trades/:id', (req, res) => {
     const id = Number(req.params.id);
-    tradesStore = tradesStore.filter((t) => t.trade_id !== id);
-    sqliteDb.deleteTrade(id);
-    res.json({ result_msg: `Deleted trade #${id}` });
+    const targetTrade = tradesStore.find((t) => t.trade_id === id);
+    if (targetTrade) {
+      const accId = targetTrade.account_id || 'master';
+      dismissedExchangeSyncKeys.add(
+        `open:${accId}:${targetTrade.pair}:${targetTrade.is_short ? 'S' : 'L'}:${targetTrade.open_rate}`
+      );
+      if (targetTrade.close_timestamp) {
+        dismissedExchangeSyncKeys.add(`closed:${accId}:${targetTrade.pair}:${targetTrade.close_timestamp}`);
+      }
+    }
+    const toRemoveIds = tradesStore
+      .filter((t) => t.trade_id === id || t.parent_trade_id === id)
+      .map((t) => t.trade_id);
+    if (!toRemoveIds.includes(id)) {
+      toRemoveIds.push(id);
+    }
+    tradesStore = tradesStore.filter((t) => !toRemoveIds.includes(t.trade_id));
+    for (const remId of toRemoveIds) {
+      sqliteDb.deleteTrade(remId);
+    }
+    res.json({ result_msg: `Deleted trade #${id}`, deleted_ids: toRemoveIds });
   });
 
   const httpServer = http.createServer(app);
