@@ -262,6 +262,8 @@ export class SqliteBotDatabase {
       ['parent_trade_id', 'INTEGER'],
       ['current_rate', 'REAL'],
       ['synced_accounts_json', "TEXT DEFAULT '[]'"],
+      ['open_timestamp', 'INTEGER'],
+      ['close_timestamp', 'INTEGER'],
     ];
     for (const [col, def] of extraTradeCols) {
       try {
@@ -284,6 +286,149 @@ export class SqliteBotDatabase {
       } catch {
         // column already exists
       }
+    }
+  }
+
+  private parseStoredUtcTimestamp(dateStr?: string | null, explicitTs?: number | null): number | null {
+    if (explicitTs && Number.isFinite(Number(explicitTs)) && Number(explicitTs) > 0) {
+      return Number(explicitTs);
+    }
+    if (!dateStr) return null;
+    const raw = String(dateStr).trim();
+    if (!raw) return null;
+    const isoCandidate = raw.includes('T')
+      ? raw.endsWith('Z') || /[+-]\d{2}:?\d{2}$/.test(raw)
+        ? raw
+        : `${raw}Z`
+      : `${raw.replace(' ', 'T')}Z`;
+    const parsedUtc = Date.parse(isoCandidate);
+    if (Number.isFinite(parsedUtc) && parsedUtc > 0) {
+      return parsedUtc;
+    }
+    const parsedFallback = Date.parse(raw);
+    if (Number.isFinite(parsedFallback) && parsedFallback > 0) {
+      return parsedFallback;
+    }
+    return null;
+  }
+
+  private getAccountsBackupPaths(): string[] {
+    const paths: string[] = [];
+    try {
+      if (fs.existsSync('/data') && fs.statSync('/data').isDirectory()) {
+        paths.push('/data/.exchange_accounts.backup.json');
+      }
+    } catch {
+      // ignore
+    }
+    paths.push(path.resolve(process.cwd(), '.exchange_accounts.backup.json'));
+    return paths;
+  }
+
+  private syncAccountsBackupFile() {
+    try {
+      const rows = this.db.prepare(`SELECT * FROM exchange_accounts ORDER BY rowid ASC`).all();
+      const realAccounts = rows.filter((r: any) => {
+        const key = String(r.api_key_raw || '').trim().toLowerCase();
+        return key && !key.startsWith('test_') && !key.startsWith('mock_') && !key.startsWith('sim_');
+      });
+      const jsonStr = JSON.stringify(realAccounts, null, 2);
+      for (const p of this.getAccountsBackupPaths()) {
+        try {
+          fs.writeFileSync(p, jsonStr, 'utf-8');
+        } catch {
+          // ignore write error
+        }
+      }
+    } catch {
+      // ignore backup error
+    }
+  }
+
+  private restoreAccountsFromBackupOrEnvIfEmpty() {
+    try {
+      const existingCount = Number(
+        (this.db.prepare(`SELECT COUNT(*) as cnt FROM exchange_accounts`).get() as any)?.cnt || 0
+      );
+      if (existingCount > 0) return;
+
+      for (const p of this.getAccountsBackupPaths()) {
+        try {
+          if (fs.existsSync(p)) {
+            const raw = fs.readFileSync(p, 'utf-8');
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              for (const acc of parsed) {
+                this.upsertExchangeAccountInternal(acc);
+              }
+              return;
+            }
+          }
+        } catch {
+          // try next backup path
+        }
+      }
+
+      // Fallback: check environment variables if configured in Render / .env
+      const bybitKey = (process.env.BYBIT_API_KEY || '').trim();
+      const bybitSecret = (process.env.BYBIT_API_SECRET || '').trim();
+      if (bybitKey && bybitSecret) {
+        const masked =
+          bybitKey.length > 8 ? `${bybitKey.slice(0, 4)}****${bybitKey.slice(-4)}` : '****';
+        this.upsertExchangeAccountInternal({
+          id: 'env-bybit-master',
+          name: 'Bybit Account',
+          owner_label: 'Owner',
+          exchange: 'bybit',
+          market_type: 'futures',
+          api_key_masked: masked,
+          api_key_raw: bybitKey,
+          api_secret_raw: bybitSecret,
+          has_passphrase: false,
+          is_owner: true,
+          client_access_code: 'BYBIT-ENV1',
+          enabled: true,
+          copy_trading: true,
+          copy_multiplier: 1.0,
+          max_leverage: 25,
+          balance_usdt: 1000,
+          status: 'connected',
+          last_sync: new Date().toISOString().replace('T', ' ').slice(0, 19),
+          connected_at: Date.now(),
+          is_testnet: String(process.env.BYBIT_TESTNET || '').toLowerCase() === 'true',
+        });
+      }
+
+      const binanceKey = (process.env.BINANCE_API_KEY || '').trim();
+      const binanceSecret = (process.env.BINANCE_API_SECRET || '').trim();
+      if (binanceKey && binanceSecret) {
+        const masked =
+          binanceKey.length > 8 ? `${binanceKey.slice(0, 4)}****${binanceKey.slice(-4)}` : '****';
+        this.upsertExchangeAccountInternal({
+          id: 'env-binance-master',
+          name: 'Binance Account',
+          owner_label: 'Owner',
+          exchange: 'binance',
+          market_type: 'futures',
+          api_key_masked: masked,
+          api_key_raw: binanceKey,
+          api_secret_raw: binanceSecret,
+          has_passphrase: false,
+          is_owner: true,
+          client_access_code: 'BINANCE-ENV1',
+          enabled: true,
+          copy_trading: true,
+          copy_multiplier: 1.0,
+          max_leverage: 25,
+          balance_usdt: 1000,
+          status: 'connected',
+          last_sync: new Date().toISOString().replace('T', ' ').slice(0, 19),
+          connected_at: Date.now(),
+          is_testnet: String(process.env.BINANCE_TESTNET || '').toLowerCase() === 'true',
+        });
+      }
+    } catch {
+      // ignore restore error
     }
   }
 
@@ -452,8 +597,8 @@ export class SqliteBotDatabase {
   public upsertTrade(trade: any) {
     try {
       const existing = this.db
-        .prepare(`SELECT id FROM trades WHERE id = ?`)
-        .get(trade.trade_id);
+        .prepare(`SELECT id, open_date, open_timestamp, close_date, close_timestamp FROM trades WHERE id = ?`)
+        .get(trade.trade_id) as any;
 
       const rawOrders = Array.isArray(trade.orders) ? trade.orders : [];
       const derivedDcaHistory =
@@ -477,6 +622,22 @@ export class SqliteBotDatabase {
       const syncedAccJson = JSON.stringify(trade.synced_accounts || []);
       const nextDca = trade.planned_dca_levels?.[0]?.price ?? trade.next_dca_price ?? null;
 
+      const openDateStr =
+        trade.open_date ||
+        existing?.open_date ||
+        new Date().toISOString().replace('T', ' ').slice(0, 19);
+      const openTs =
+        this.parseStoredUtcTimestamp(openDateStr, trade.open_timestamp ?? existing?.open_timestamp) ??
+        Date.now();
+
+      const closeDateStr = trade.close_date ?? existing?.close_date ?? null;
+      const closeTs = closeDateStr
+        ? this.parseStoredUtcTimestamp(
+            closeDateStr,
+            trade.close_timestamp ?? existing?.close_timestamp
+          )
+        : null;
+
       if (!existing) {
         const stmt = this.db.prepare(`
           INSERT INTO trades (
@@ -492,7 +653,7 @@ export class SqliteBotDatabase {
             tp_manual_override, sl_manual_override, dca_manual_override,
             planned_dca_json, orders_json, initial_open_rate,
             account_id, account_name, parent_trade_id,
-            current_rate, synced_accounts_json
+            current_rate, synced_accounts_json, open_timestamp, close_timestamp
           ) VALUES (
             ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
@@ -506,7 +667,7 @@ export class SqliteBotDatabase {
             ?, ?, ?,
             ?, ?, ?,
             ?, ?, ?,
-            ?, ?
+            ?, ?, ?, ?
           )
         `);
         stmt.run(
@@ -519,8 +680,8 @@ export class SqliteBotDatabase {
           trade.is_open ? 1 : 0,
           trade.is_short ? 1 : 0,
           trade.leverage || 25,
-          trade.open_date,
-          trade.close_date ?? null,
+          openDateStr,
+          closeDateStr,
           trade.profit_abs ?? 0,
           trade.profit_pct ?? 0,
           0.0006,
@@ -560,13 +721,15 @@ export class SqliteBotDatabase {
           trade.account_name || 'Master',
           trade.parent_trade_id ?? null,
           trade.current_rate ?? trade.open_rate,
-          syncedAccJson
+          syncedAccJson,
+          openTs,
+          closeTs
         );
       } else {
         const stmt = this.db.prepare(`
           UPDATE trades SET
             open_rate = ?, close_rate = ?, stake_amount = ?, amount = ?,
-            is_open = ?, is_short = ?, leverage = ?, close_date = ?,
+            is_open = ?, is_short = ?, leverage = ?, open_date = ?, close_date = ?,
             profit = ?, profit_percent = ?, buy_tag = ?, sell_reason = ?,
             dca_count = ?, last_dca_date = ?, target_tp_rate = ?, stoploss_rate = ?,
             support_level = ?, resistance_level = ?, plan_notes = ?,
@@ -576,7 +739,7 @@ export class SqliteBotDatabase {
             next_dca_price = ?, tp_manual_override = ?, sl_manual_override = ?,
             dca_manual_override = ?, planned_dca_json = ?, orders_json = ?,
             account_id = ?, account_name = ?, parent_trade_id = ?,
-            current_rate = ?, synced_accounts_json = ?
+            current_rate = ?, synced_accounts_json = ?, open_timestamp = ?, close_timestamp = ?
           WHERE id = ?
         `);
         stmt.run(
@@ -587,7 +750,8 @@ export class SqliteBotDatabase {
           trade.is_open ? 1 : 0,
           trade.is_short ? 1 : 0,
           trade.leverage || 25,
-          trade.close_date ?? null,
+          openDateStr,
+          closeDateStr,
           trade.profit_abs ?? 0,
           trade.profit_pct ?? 0,
           trade.enter_tag || '',
@@ -620,6 +784,8 @@ export class SqliteBotDatabase {
           trade.parent_trade_id ?? null,
           trade.current_rate ?? trade.open_rate,
           syncedAccJson,
+          openTs,
+          closeTs,
           trade.trade_id
         );
       }
@@ -668,10 +834,17 @@ export class SqliteBotDatabase {
           syncedAccounts = [];
         }
 
-        const openDateStr = String(r.open_date || new Date().toISOString().replace('T', ' ').slice(0, 19));
-        const openTs = Date.parse(openDateStr) || Date.now();
+        const openDateStr = String(
+          r.open_date || new Date().toISOString().replace('T', ' ').slice(0, 19)
+        );
+        const openTs =
+          this.parseStoredUtcTimestamp(openDateStr, r.open_timestamp) ?? 1700000000000;
         const closeDateStr = r.close_date ? String(r.close_date) : null;
-        const closeTs = closeDateStr ? Date.parse(closeDateStr) || Date.now() : null;
+        const closeTs = closeDateStr
+          ? this.parseStoredUtcTimestamp(closeDateStr, r.close_timestamp) ?? openTs
+          : r.close_timestamp
+          ? Number(r.close_timestamp)
+          : null;
         const tradeIdNum = Number(r.id);
         const isShortBool = Boolean(r.is_short);
 
@@ -695,7 +868,8 @@ export class SqliteBotDatabase {
                 price: Number(o.price || r.open_rate),
                 amount: Number(o.amount || r.amount),
                 stake_amount: Number(o.cost || r.stake_amount),
-                timestamp: Date.parse(String(o.created_at || openDateStr)) || openTs,
+                timestamp:
+                  this.parseStoredUtcTimestamp(String(o.created_at || openDateStr)) ?? openTs,
                 date: String(o.created_at || openDateStr),
               }));
             } else {
@@ -1013,6 +1187,7 @@ export class SqliteBotDatabase {
 
   public loadExchangeAccounts(): any[] {
     try {
+      this.restoreAccountsFromBackupOrEnvIfEmpty();
       const rows = this.db.prepare(`SELECT * FROM exchange_accounts ORDER BY rowid ASC`).all();
       return rows.map((r: any) => ({
         id: String(r.id),
@@ -1044,55 +1219,60 @@ export class SqliteBotDatabase {
     }
   }
 
+  private upsertExchangeAccountInternal(acc: any) {
+    const stmt = this.db.prepare(`
+      INSERT INTO exchange_accounts (
+        id, name, owner_label, exchange, market_type, api_key_masked,
+        has_passphrase, is_owner, client_access_code, enabled,
+        copy_trading, copy_multiplier, max_leverage, balance_usdt,
+        status, last_sync, api_key_raw, api_secret_raw, passphrase_raw, connected_at, is_testnet
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        owner_label = excluded.owner_label,
+        enabled = excluded.enabled,
+        copy_trading = excluded.copy_trading,
+        copy_multiplier = excluded.copy_multiplier,
+        max_leverage = excluded.max_leverage,
+        balance_usdt = excluded.balance_usdt,
+        client_access_code = excluded.client_access_code,
+        status = excluded.status,
+        last_sync = excluded.last_sync,
+        is_testnet = excluded.is_testnet,
+        api_key_raw = COALESCE(excluded.api_key_raw, exchange_accounts.api_key_raw),
+        api_secret_raw = COALESCE(excluded.api_secret_raw, exchange_accounts.api_secret_raw),
+        passphrase_raw = COALESCE(excluded.passphrase_raw, exchange_accounts.passphrase_raw),
+        connected_at = CASE WHEN exchange_accounts.connected_at > 0 THEN exchange_accounts.connected_at ELSE excluded.connected_at END
+    `);
+    stmt.run(
+      acc.id,
+      acc.name,
+      acc.owner_label || acc.name,
+      acc.exchange,
+      acc.market_type || 'futures',
+      acc.api_key_masked,
+      acc.has_passphrase ? 1 : 0,
+      acc.is_owner ? 1 : 0,
+      acc.client_access_code,
+      acc.enabled ? 1 : 0,
+      acc.copy_trading ? 1 : 0,
+      acc.copy_multiplier || 1.0,
+      acc.max_leverage || 25,
+      Number.isFinite(Number(acc.balance_usdt)) && Number(acc.balance_usdt) > 0 ? Number(acc.balance_usdt) : 1000,
+      acc.status || 'connected',
+      acc.last_sync,
+      acc.api_key_raw ?? null,
+      acc.api_secret_raw ?? null,
+      acc.passphrase_raw ?? null,
+      acc.connected_at || Date.now(),
+      acc.is_testnet ? 1 : 0
+    );
+  }
+
   public upsertExchangeAccount(acc: any) {
     try {
-      const stmt = this.db.prepare(`
-        INSERT INTO exchange_accounts (
-          id, name, owner_label, exchange, market_type, api_key_masked,
-          has_passphrase, is_owner, client_access_code, enabled,
-          copy_trading, copy_multiplier, max_leverage, balance_usdt,
-          status, last_sync, api_key_raw, api_secret_raw, passphrase_raw, connected_at, is_testnet
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          name = excluded.name,
-          owner_label = excluded.owner_label,
-          enabled = excluded.enabled,
-          copy_trading = excluded.copy_trading,
-          copy_multiplier = excluded.copy_multiplier,
-          max_leverage = excluded.max_leverage,
-          balance_usdt = excluded.balance_usdt,
-          client_access_code = excluded.client_access_code,
-          status = excluded.status,
-          last_sync = excluded.last_sync,
-          is_testnet = excluded.is_testnet,
-          api_key_raw = COALESCE(excluded.api_key_raw, exchange_accounts.api_key_raw),
-          api_secret_raw = COALESCE(excluded.api_secret_raw, exchange_accounts.api_secret_raw),
-          passphrase_raw = COALESCE(excluded.passphrase_raw, exchange_accounts.passphrase_raw),
-          connected_at = CASE WHEN exchange_accounts.connected_at > 0 THEN exchange_accounts.connected_at ELSE excluded.connected_at END
-      `);
-      stmt.run(
-        acc.id,
-        acc.name,
-        acc.owner_label || acc.name,
-        acc.exchange,
-        acc.market_type || 'futures',
-        acc.api_key_masked,
-        acc.has_passphrase ? 1 : 0,
-        acc.is_owner ? 1 : 0,
-        acc.client_access_code,
-        acc.enabled ? 1 : 0,
-        acc.copy_trading ? 1 : 0,
-        acc.copy_multiplier || 1.0,
-        acc.max_leverage || 25,
-        Number.isFinite(Number(acc.balance_usdt)) && Number(acc.balance_usdt) > 0 ? Number(acc.balance_usdt) : 1000,
-        acc.status || 'connected',
-        acc.last_sync,
-        acc.api_key_raw ?? null,
-        acc.api_secret_raw ?? null,
-        acc.passphrase_raw ?? null,
-        acc.connected_at || Date.now(),
-        acc.is_testnet ? 1 : 0
-      );
+      this.upsertExchangeAccountInternal(acc);
+      this.syncAccountsBackupFile();
     } catch (e) {
       console.error('upsertExchangeAccount error:', e);
     }
@@ -1101,6 +1281,7 @@ export class SqliteBotDatabase {
   public deleteExchangeAccount(id: string) {
     try {
       this.db.prepare(`DELETE FROM exchange_accounts WHERE id = ?`).run(id);
+      this.syncAccountsBackupFile();
     } catch {
       // ignore
     }
@@ -1111,6 +1292,7 @@ export class SqliteBotDatabase {
       this.db.prepare(`DELETE FROM exchange_accounts`).run();
       this.db.prepare(`DELETE FROM signals`).run();
       this.db.prepare(`DELETE FROM bot_levels WHERE manual_override = 0`).run();
+      this.syncAccountsBackupFile();
     } catch {
       // ignore
     }

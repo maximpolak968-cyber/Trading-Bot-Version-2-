@@ -1038,18 +1038,87 @@ export async function executeExchangeFuturesOrder(
               : baseUrl.includes('demo')
               ? 'Bybit Demo'
               : 'Bybit Mainnet';
+            const orderId = String(json.result?.orderId || `bybit-${Date.now()}`);
+
+            let actualAvgPrice = params.referencePrice;
+            let actualExecQty = Number(formattedQtyStr);
+            let actualExecFee = Number(
+              (params.referencePrice * Number(formattedQtyStr) * 0.00055).toFixed(4)
+            );
+            let actualExchangeTime = Date.now();
+
+            // Запрашиваем реальную цену исполнения (avgPrice), объём и комиссию напрямую из Bybit V5 API
+            if (json.result?.orderId) {
+              try {
+                await new Promise((r) => setTimeout(r, 180));
+                const qTs = await getBybitTimestamp(baseUrl, false);
+                const recvWindow = '10000';
+                const qStr = `category=linear&symbol=${symbol}&orderId=${encodeURIComponent(orderId)}`;
+                const qSig = signBybitV5(qTs, cleanKey, recvWindow, qStr, cleanSecret);
+                const ordRes = await makeHttpsRequest(`${baseUrl}/v5/order/realtime?${qStr}`, {
+                  method: 'GET',
+                  headers: {
+                    'X-BAPI-API-KEY': cleanKey,
+                    'X-BAPI-TIMESTAMP': qTs,
+                    'X-BAPI-SIGN': qSig,
+                    'X-BAPI-RECV-WINDOW': recvWindow,
+                  },
+                  timeoutMs: 4000,
+                });
+                let ordItem: any = null;
+                if (ordRes.statusCode === 200) {
+                  const ordJson = JSON.parse(ordRes.data);
+                  ordItem = ordJson?.result?.list?.[0] || null;
+                }
+                if (!ordItem || !(Number(ordItem.avgPrice || 0) > 0)) {
+                  const hTs = await getBybitTimestamp(baseUrl, false);
+                  const hSig = signBybitV5(hTs, cleanKey, recvWindow, qStr, cleanSecret);
+                  const histRes = await makeHttpsRequest(`${baseUrl}/v5/order/history?${qStr}`, {
+                    method: 'GET',
+                    headers: {
+                      'X-BAPI-API-KEY': cleanKey,
+                      'X-BAPI-TIMESTAMP': hTs,
+                      'X-BAPI-SIGN': hSig,
+                      'X-BAPI-RECV-WINDOW': recvWindow,
+                    },
+                    timeoutMs: 4000,
+                  });
+                  if (histRes.statusCode === 200) {
+                    const histJson = JSON.parse(histRes.data);
+                    ordItem = histJson?.result?.list?.[0] || ordItem;
+                  }
+                }
+                if (ordItem) {
+                  if (Number(ordItem.avgPrice || 0) > 0) {
+                    actualAvgPrice = Number(ordItem.avgPrice);
+                  }
+                  if (Number(ordItem.cumExecQty || 0) > 0) {
+                    actualExecQty = Number(ordItem.cumExecQty);
+                  }
+                  if (Number(ordItem.cumExecFee || 0) > 0) {
+                    actualExecFee = Math.abs(Number(ordItem.cumExecFee));
+                  } else {
+                    actualExecFee = Number((actualAvgPrice * actualExecQty * 0.00055).toFixed(4));
+                  }
+                  if (Number(ordItem.updatedTime || ordItem.createdTime || 0) > 0) {
+                    actualExchangeTime = Number(ordItem.updatedTime || ordItem.createdTime);
+                  }
+                }
+              } catch {
+                // fallback to referencePrice if detail lookup times out
+              }
+            }
+
             return {
               success: true,
-              order_id: String(json.result?.orderId || `bybit-${Date.now()}`),
+              order_id: orderId,
               symbol,
               side,
-              price: params.referencePrice,
-              qty: Number(formattedQtyStr),
+              price: actualAvgPrice,
+              qty: actualExecQty,
               status: 'FILLED',
-              exchange_time: Date.now(),
-              commission_usdt: Number(
-                (params.referencePrice * Number(formattedQtyStr) * 0.00055).toFixed(4)
-              ),
+              exchange_time: actualExchangeTime,
+              commission_usdt: actualExecFee,
               network_label: netLabel,
             };
           }

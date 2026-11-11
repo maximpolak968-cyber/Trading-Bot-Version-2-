@@ -933,6 +933,131 @@ async function runVerification() {
     `   📈 [8A-8B] Доказана работа сложного процента и быстрого скальп-TP: Реинвест-баланс=${compoundedEquityMaster}$ ➔ Новая ставка 0.5%=${avaxTrade.stake_amount}$ | Нач. скальп-TP=+${tpDistancePct.toFixed(2)}% (+${avaxTrade.take_profit_pct}% чистыми) | После DCA скальп-TP=+${dcaTpDistancePct.toFixed(2)}% (+${avaxAfterDca.take_profit_pct}% чистыми) | Лимит сделок=${cfgFastRes.data.max_open_trades}`
   );
 
+  // ---------------------------------------------------------------------------
+  // ТЕСТ 9: ПРОВЕРКА 5 НОВЫХ ИСПРАВЛЕНИЙ (MTF RSI ФИЛЬТР ARIA/USDT, ЗАЩИТА DCA ОТ 0.027629,
+  //         НЕИЗМЕННОСТЬ ВРЕМЕНИ ЗАКРЫТИЯ, РЕЗЕРВНОЕ ВОССТАНОВЛЕНИЕ API-КЛЮЧЕЙ И ФИКСАЦИЯ УРОВНЕЙ)
+  // ---------------------------------------------------------------------------
+  console.log('\n9️⃣ Проверка 5 исправлений: строгий MTF RSI фильтр (ARIA/USDT), лимит дистанции DCA, неизменность времени закрытия и авто-восстановление API-ключей...');
+
+  const {
+    analyzeMultiTimeframe,
+    evaluateScalpingStrategy,
+    findStrongestDcaLevel,
+    calcRsiSeries,
+  } = await import('../src/bot/scalpBotEngine');
+
+  // 9A. Имитируем параболический памп ARIA/USDT с 0.03 до 0.26491 (1D RSI ~89, 4H RSI ~65, 1H RSI ~54)
+  const makePumpCandles = (count: number, startPrice: number, endPrice: number, stepMs: number) => {
+    const arr: {
+      timestamp: number;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+    }[] = [];
+    const baseTs = Date.now() - count * stepMs;
+    for (let i = 0; i < count; i++) {
+      // Первые 60% свечей — флэт около startPrice (0.0276 - 0.032), затем резкий памп до endPrice (0.26491)
+      let close: number;
+      if (i < Math.floor(count * 0.6)) {
+        close = startPrice * (1 + Math.sin(i * 0.5) * 0.03);
+      } else {
+        const progress = (i - Math.floor(count * 0.6)) / (count - Math.floor(count * 0.6));
+        close = startPrice + (endPrice - startPrice) * Math.pow(progress, 1.8);
+      }
+      const open: number = i > 0 ? arr[i - 1].close : close * 0.99;
+      const high = Math.max(open, close) * 1.012;
+      const low = Math.min(open, close) * 0.992;
+      arr.push({
+        timestamp: baseTs + i * stepMs,
+        open: Number(open.toFixed(6)),
+        high: Number(high.toFixed(6)),
+        low: Number(low.toFixed(6)),
+        close: Number(close.toFixed(6)),
+        volume: 100000 + i * 5000,
+      });
+    }
+    return arr;
+  };
+
+  const aria1d = makePumpCandles(80, 0.027629, 0.26491, 86_400_000);
+  const aria4h = makePumpCandles(120, 0.027629, 0.26491, 4 * 3600_000);
+  const aria1h = makePumpCandles(120, 0.12, 0.26491, 3600_000);
+
+  const ariaRsi1d = calcRsiSeries(aria1d.map((c) => c.close), 14);
+  const lastRsi1d = ariaRsi1d[ariaRsi1d.length - 1];
+  assert.ok(lastRsi1d > 68, `На пампе ARIA/USDT 1D RSI по Уайлдеру должен быть > 68 (получено: ${lastRsi1d.toFixed(2)})`);
+
+  const ariaMtf = analyzeMultiTimeframe('ARIA/USDT:USDT', aria1h, aria4h, aria1d);
+  assert.equal(
+    ariaMtf.allow_long,
+    false,
+    `Строгий MTF RSI фильтр ОБЯЗАН запретить LONG при перекупленном 1D RSI=${ariaMtf.rsi_1d} / 4H RSI=${ariaMtf.rsi_4h} / 1H RSI=${ariaMtf.rsi_1h}!`
+  );
+
+  const ariaDecision = evaluateScalpingStrategy(
+    aria1h,
+    ariaMtf.key_4h_support,
+    ariaMtf.key_4h_resistance
+  );
+  assert.equal(
+    ariaDecision.enter_long,
+    false,
+    'Стратегия НЕ должна открывать LONG на перекупленном рынке (ARIA/USDT)'
+  );
+
+  // 9B. Проверяем, что findStrongestDcaLevel для входа @ 0.26491 НИКОГДА не берет старое дно 0.027629 (-89% от входа)
+  const safeDca = findStrongestDcaLevel(aria4h, aria1d, 0.26491, false, 1.5, 12.0);
+  const safeDcaDistPct = ((0.26491 - safeDca.price) / 0.26491) * 100;
+  assert.ok(
+    safeDcaDistPct >= 1.0 && safeDcaDistPct <= 12.5,
+    `Уровень DCA (${safeDca.price}$) обязан быть в пределах 1.5%–12% от цены входа 0.26491$, а не на 0.027629$ (дистанция=${safeDcaDistPct.toFixed(2)}%)`
+  );
+  console.log(
+    `   🛡️ [9A-9B] Фильтр MTF RSI (1D RSI=${ariaMtf.rsi_1d}, 4H RSI=${ariaMtf.rsi_4h}, 1H RSI=${ariaMtf.rsi_1h}) заблокировал LONG (allow_long=${ariaMtf.allow_long}). Уровень DCA ограничен разумной дистанцией: ${safeDca.price}$ (-${safeDcaDistPct.toFixed(2)}% вместо старого дна 0.027629$)`
+  );
+
+  // 9C. Проверяем неизменность времени закрытия (close_timestamp и close_date) после перезапуска и повторных запросов
+  const closedListBefore = await api('/api/v1/trades');
+  const closedEthBefore = closedListBefore.data.trades.find((t: any) => t.trade_id === masterEthTrade.trade_id);
+  assert.ok(closedEthBefore && closedEthBefore.close_timestamp > 0, 'Закрытая сделка ETH должна иметь сохраненный close_timestamp');
+  const savedCloseTs = closedEthBefore.close_timestamp;
+  const savedCloseDate = closedEthBefore.close_date;
+
+  await new Promise((r) => setTimeout(r, 1100));
+  await api('/api/v1/simulate_crash_recovery', { method: 'POST' });
+
+  const closedListAfter = await api('/api/v1/trades');
+  const closedEthAfter = closedListAfter.data.trades.find((t: any) => t.trade_id === masterEthTrade.trade_id);
+  assert.equal(
+    closedEthAfter.close_timestamp,
+    savedCloseTs,
+    'Время закрытия close_timestamp НЕ должно меняться при перезапуске или обновлении!'
+  );
+  assert.equal(
+    closedEthAfter.close_date,
+    savedCloseDate,
+    'Дата закрытия close_date НЕ должна меняться при перезапуске или обновлении!'
+  );
+  console.log(
+    `   ⏱️ [9C] Время закрытия сделки #${masterEthTrade.trade_id} неизменно: close_date="${closedEthAfter.close_date}", close_timestamp=${closedEthAfter.close_timestamp}`
+  );
+
+  // 9D. Проверяем резервное авто-восстановление API-ключей при сбое/обнулении таблицы SQLite
+  const accsBeforeWipe = sqliteDb.loadExchangeAccounts();
+  assert.ok(accsBeforeWipe.length >= 1, 'До имитации сбоя аккаунты должны быть подключены');
+  // Имитируем потерю строк только в SQLite без удаления backup-файла (как при пересоздании контейнера с сохраненным backup)
+  (sqliteDb as any).db.prepare('DELETE FROM exchange_accounts').run();
+  const restoredAccs = sqliteDb.loadExchangeAccounts();
+  assert.ok(
+    restoredAccs.length >= 1 && restoredAccs[0].api_key_raw,
+    'При пустой таблице exchange_accounts ключи должны автоматически восстановиться из резервного хранилища .exchange_accounts.backup.json!'
+  );
+  console.log(
+    `   🔑 [9D] Авто-восстановление API-ключей после сбоя БД сработало: восстановлено аккаунтов=${restoredAccs.length} (${restoredAccs.map((a) => a.name).join(', ')})`
+  );
+
   // Если передан флаг --leave-for-restart, оставляем эти сделки в БД для проверки через реальный перезапуск процесса Node.js (restart_dev_server)
   if (process.argv.includes('--leave-for-restart')) {
     console.log('\n⏸️ Режим --leave-for-restart: сделки оставлены в trades.sqlite для проверки реального перезапуска процесса Node.js.');
@@ -964,7 +1089,7 @@ async function runVerification() {
   );
 
   console.log('\n================================================================');
-  console.log('✅ ВСЕ 8 БЛОКОВ ТЕСТОВ ПРОВЕРЕНЫ НА ПРАКТИКЕ И ПОЛНОСТЬЮ ПОДТВЕРЖДЕНЫ!');
+  console.log('✅ ВСЕ 9 БЛОКОВ ТЕСТОВ ПРОВЕРЕНЫ НА ПРАКТИКЕ И ПОЛНОСТЬЮ ПОДТВЕРЖДЕНЫ!');
   console.log('================================================================');
 }
 

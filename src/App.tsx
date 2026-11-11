@@ -201,15 +201,23 @@ export default function App() {
     [selectedPair, timeframe, strategy]
   );
 
+  const lastLevelMutationTsRef = useRef<number>(0);
+
   const fetchPairBotLevels = useCallback(
     async (pairArg = selectedPair, tfArg = timeframe) => {
+      const reqStartTs = Date.now();
+      if (reqStartTs - lastLevelMutationTsRef.current < 2500) {
+        return;
+      }
       try {
         const res = await fetch(
           `/api/v1/pair_levels?pair=${encodeURIComponent(pairArg)}&timeframe=${encodeURIComponent(tfArg)}`
         );
         if (res.ok) {
           const data = await res.json();
-          setBotLevels(data.levels || []);
+          if (reqStartTs >= lastLevelMutationTsRef.current && Date.now() - lastLevelMutationTsRef.current >= 1500) {
+            setBotLevels(data.levels || []);
+          }
         }
       } catch (err) {
         console.error('Failed to fetch pair_levels:', err);
@@ -233,6 +241,8 @@ export default function App() {
     [selectedPair]
   );
 
+  const restoringVaultRef = useRef<boolean>(false);
+
   const fetchAccounts = useCallback(async () => {
     if (authState.role !== 'owner') {
       setAccounts([]);
@@ -244,14 +254,48 @@ export default function App() {
       });
       if (res.ok) {
         const data = await res.json();
-        setAccounts(data.accounts || []);
+        const serverAccounts: ExchangeAccount[] = data.accounts || [];
+        if (serverAccounts.length === 0 && !restoringVaultRef.current) {
+          try {
+            const rawVault = localStorage.getItem('scalpbot_saved_accounts_vault_v1');
+            const vaultItems = rawVault ? JSON.parse(rawVault) : [];
+            if (Array.isArray(vaultItems) && vaultItems.length > 0) {
+              restoringVaultRef.current = true;
+              let latestAccounts: ExchangeAccount[] = [];
+              for (const item of vaultItems) {
+                if (item && item.api_key && item.api_secret) {
+                  const restoreRes = await fetch('/api/v1/accounts', {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+                    },
+                    body: JSON.stringify(item),
+                  });
+                  if (restoreRes.ok) {
+                    const restoreData = await restoreRes.json();
+                    if (Array.isArray(restoreData.accounts)) {
+                      latestAccounts = restoreData.accounts;
+                    }
+                  }
+                }
+              }
+              restoringVaultRef.current = false;
+              if (latestAccounts.length > 0) {
+                setAccounts(latestAccounts);
+                return;
+              }
+            }
+          } catch {
+            restoringVaultRef.current = false;
+          }
+        }
+        setAccounts(serverAccounts);
       }
     } catch (err) {
       console.error('Failed to fetch accounts:', err);
     }
   }, [authState.role, authToken]);
-
-  const lastLevelMutationTsRef = useRef<number>(0);
 
   const fetchBotState = useCallback(async () => {
     const reqStartTs = Date.now();
@@ -288,7 +332,10 @@ export default function App() {
       if (cfgRes.ok) setBotConfig(await cfgRes.json());
       if (statusRes.ok) {
         const statusData = await statusRes.json();
-        if (reqStartTs >= lastLevelMutationTsRef.current) {
+        if (
+          reqStartTs >= lastLevelMutationTsRef.current &&
+          Date.now() - lastLevelMutationTsRef.current >= 1500
+        ) {
           setOpenTrades(statusData);
         }
       }
@@ -553,12 +600,11 @@ export default function App() {
           setStatusNotification(`🛡️ ${data.warning}`);
         } else {
           setStatusNotification(
-            `Бот обновил ${lvlName} по ${updatedTrade.pair.split('/')[0]}: ${data.previous_price}$ ➔ ${data.new_price}$ (старый уровень отменён)`
+            `Бот обновил ${lvlName} по ${updatedTrade.pair.split('/')[0]}: ${data.previous_price}$ ➔ ${data.new_price}$ (бот отталкивается от вашего уровня)`
           );
         }
       }
     }
-    await fetchBotState();
   };
 
   const handleUpdateBotLevel = async (id: string, price: number) => {
@@ -583,7 +629,6 @@ export default function App() {
         );
       }
     }
-    await fetchBotState();
   };
 
   const handleAddBotLevel = async (price: number) => {
@@ -728,6 +773,40 @@ export default function App() {
     if (res.ok) {
       const data = await res.json();
       if (data.accounts) setAccounts(data.accounts);
+      try {
+        if (payload.api_key && payload.api_secret) {
+          const rawPayload = payload as Record<string, any>;
+          const rawVault = localStorage.getItem('scalpbot_saved_accounts_vault_v1');
+          const vaultItems = rawVault ? JSON.parse(rawVault) : [];
+          const list = Array.isArray(vaultItems) ? vaultItems : [];
+          const createdId = data.account?.id;
+          const nextList = list.filter(
+            (item: any) =>
+              item.api_key !== payload.api_key && (!createdId || item.id !== createdId)
+          );
+          nextList.push({
+            id: createdId,
+            name: payload.name,
+            exchange: payload.exchange,
+            market_type: payload.market_type,
+            network_mode: rawPayload.network_mode,
+            is_testnet: payload.is_testnet,
+            api_key: payload.api_key,
+            api_secret: payload.api_secret,
+            passphrase: payload.passphrase,
+            subaccount: rawPayload.subaccount,
+            is_owner: payload.is_owner,
+            enabled: payload.enabled ?? true,
+            max_leverage: payload.max_leverage,
+            copy_trading: payload.copy_trading,
+            balance_usdt: data.account?.balance_usdt ?? payload.balance_usdt,
+            client_access_code: payload.client_access_code,
+          });
+          localStorage.setItem('scalpbot_saved_accounts_vault_v1', JSON.stringify(nextList));
+        }
+      } catch {
+        // ignore storage error
+      }
       await fetchBotState();
       return data;
     }
@@ -743,11 +822,36 @@ export default function App() {
     if (res.ok) {
       const data = await res.json();
       if (data.accounts) setAccounts(data.accounts);
+      try {
+        const rawVault = localStorage.getItem('scalpbot_saved_accounts_vault_v1');
+        const vaultItems = rawVault ? JSON.parse(rawVault) : [];
+        if (Array.isArray(vaultItems)) {
+          const nextList = vaultItems.map((item: any) =>
+            item.id === id ? { ...item, enabled } : item
+          );
+          localStorage.setItem('scalpbot_saved_accounts_vault_v1', JSON.stringify(nextList));
+        }
+      } catch {
+        // ignore
+      }
       await fetchBotState();
     }
   };
 
   const handleDeleteAccount = async (id: string) => {
+    try {
+      const targetAcc = accounts.find((a) => a.id === id);
+      const rawVault = localStorage.getItem('scalpbot_saved_accounts_vault_v1');
+      const vaultItems = rawVault ? JSON.parse(rawVault) : [];
+      if (Array.isArray(vaultItems)) {
+        const nextList = vaultItems.filter(
+          (item: any) => item.id !== id && (!targetAcc || item.name !== targetAcc.name)
+        );
+        localStorage.setItem('scalpbot_saved_accounts_vault_v1', JSON.stringify(nextList));
+      }
+    } catch {
+      // ignore
+    }
     const res = await fetch(`/api/v1/accounts/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     });
@@ -759,6 +863,11 @@ export default function App() {
   };
 
   const handleClearAllAccounts = async () => {
+    try {
+      localStorage.removeItem('scalpbot_saved_accounts_vault_v1');
+    } catch {
+      // ignore
+    }
     const res = await fetch('/api/v1/accounts', {
       method: 'DELETE',
     });
