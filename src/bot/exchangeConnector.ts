@@ -2202,3 +2202,529 @@ export function calculateClientProportionalOrder(params: {
     coinAmount,
   };
 }
+
+/**
+ * Возвращает реальную ставку комиссии Taker для фьючерсов конкретной биржи:
+ * - Bybit V5 Linear Futures: 0.055% (0.00055)
+ * - Binance USDⓈ-M Futures: 0.05% (0.0005)
+ * - OKX V5 Perpetual Swap: 0.05% (0.0005)
+ * - Bitget V2 USDT-Futures: 0.06% (0.0006)
+ * - BingX Perpetual Swap: 0.05% (0.0005)
+ */
+export function getExchangeTakerFeeRate(exchange?: string): number {
+  const clean = String(exchange || 'bybit').trim().toLowerCase();
+  if (clean === 'bybit') return 0.00055;
+  if (clean === 'binance') return 0.0005;
+  if (clean === 'okx') return 0.0005;
+  if (clean === 'bingx') return 0.0005;
+  return 0.0006;
+}
+
+/**
+ * Преобразует биржевой символ ('ETHUSDT', 'ETH-USDT-SWAP', 'ETH-USDT') в формат пары 'ETH/USDT:USDT'.
+ */
+export function symbolToFreqtradePair(rawSymbol: string): string {
+  const s = String(rawSymbol || '')
+    .trim()
+    .toUpperCase()
+    .replace('-SWAP', '')
+    .replace('_UMCBL', '');
+  if (s.includes('/')) {
+    return s.includes(':USDT') ? s : `${s}:USDT`;
+  }
+  if (s.includes('-USDT')) {
+    const base = s.split('-USDT')[0];
+    return `${base}/USDT:USDT`;
+  }
+  if (s.endsWith('USDT') && s.length > 4) {
+    const base = s.slice(0, -4);
+    return `${base}/USDT:USDT`;
+  }
+  return `${s}/USDT:USDT`;
+}
+
+export interface ExchangePositionItem {
+  pair: string;
+  symbol: string;
+  is_short: boolean;
+  size: number;
+  entry_price: number;
+  mark_price: number;
+  leverage: number;
+  margin_usdt: number;
+  unrealized_pnl: number;
+  take_profit?: number;
+  stop_loss?: number;
+  created_time: number;
+  updated_time: number;
+}
+
+export interface ExchangeClosedPnlItem {
+  order_id: string;
+  pair: string;
+  symbol: string;
+  is_short: boolean;
+  qty: number;
+  entry_price: number;
+  exit_price: number;
+  leverage: number;
+  closed_pnl: number;
+  open_fee: number;
+  close_fee: number;
+  created_time: number;
+  updated_time: number;
+}
+
+/**
+ * Запрашивает ВСЕ реально открытые фьючерсные позиции на аккаунте биржи (Bybit, Binance, OKX, Bitget, BingX).
+ * Позволяет боту видеть уже открытые сделки после обновления кода/перезапуска или ручного открытия на бирже,
+ * не открывать дубликаты и вести существующие позиции по стратегии.
+ */
+export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Promise<{
+  success: boolean;
+  positions: ExchangePositionItem[];
+  network_label?: string;
+  is_testnet?: boolean;
+}> {
+  const cleanKey = String(creds.apiKey || '').trim();
+  const cleanSecret = String(creds.apiSecret || '').trim();
+  if (!cleanKey || !cleanSecret || isSimulatedTestApiKey(cleanKey)) {
+    return { success: false, positions: [] };
+  }
+
+  // 1. BYBIT V5 LINEAR FUTURES (/v5/position/list?category=linear&settleCoin=USDT&limit=200)
+  if (creds.exchange === 'bybit') {
+    const candidateHosts = getBybitCandidateHosts(cleanKey, creds.isTestnet);
+    for (const baseUrl of candidateHosts) {
+      try {
+        const timestamp = await getBybitTimestamp(baseUrl, false);
+        const recvWindow = '10000';
+        const queryString = 'category=linear&settleCoin=USDT&limit=200';
+        const signature = signBybitV5(timestamp, cleanKey, recvWindow, queryString, cleanSecret);
+        const res = await makeHttpsRequest(`${baseUrl}/v5/position/list?${queryString}`, {
+          method: 'GET',
+          headers: {
+            'X-BAPI-API-KEY': cleanKey,
+            'X-BAPI-TIMESTAMP': timestamp,
+            'X-BAPI-SIGN': signature,
+            'X-BAPI-RECV-WINDOW': recvWindow,
+            'Content-Type': 'application/json',
+          },
+          timeoutMs: 6500,
+        });
+        if (res.statusCode === 200) {
+          const json = JSON.parse(res.data);
+          if (json.retCode === 10003 || json.retCode === 10004 || json.retCode === 33004) {
+            continue;
+          }
+          if (json.retCode === 0 && Array.isArray(json.result?.list)) {
+            bybitHostCache.set(cleanKey, baseUrl);
+            const netLabel = baseUrl.includes('testnet')
+              ? 'Bybit Testnet'
+              : baseUrl.includes('demo')
+              ? 'Bybit Demo'
+              : 'Bybit Mainnet';
+            const positions: ExchangePositionItem[] = [];
+            for (const p of json.result.list) {
+              const size = Math.abs(Number(p.size || 0));
+              if (!(size > 0)) continue;
+              const sym = String(p.symbol || '');
+              const entryPrice = Number(p.avgPrice || p.entryPrice || 0);
+              if (!(entryPrice > 0)) continue;
+              const markPrice = Number(p.markPrice || entryPrice);
+              const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
+              const sideStr = String(p.side || '').toLowerCase();
+              const isShort = sideStr === 'sell' || Number(p.positionIdx) === 2;
+              const notional = size * entryPrice;
+              const rawIm = Number(p.positionIM || p.positionBalance || 0);
+              const marginUsdt = rawIm > 0 ? Number(rawIm.toFixed(2)) : Number((notional / lev).toFixed(2));
+              const tp = Number(p.takeProfit || 0);
+              const sl = Number(p.stopLoss || 0);
+              const cTime = Number(p.createdTime || p.updatedTime || Date.now());
+              const uTime = Number(p.updatedTime || cTime);
+              positions.push({
+                pair: symbolToFreqtradePair(sym),
+                symbol: sym,
+                is_short: isShort,
+                size,
+                entry_price: entryPrice,
+                mark_price: markPrice > 0 ? markPrice : entryPrice,
+                leverage: lev,
+                margin_usdt: marginUsdt,
+                unrealized_pnl: Number(p.unrealisedPnl || 0),
+                take_profit: tp > 0 ? tp : undefined,
+                stop_loss: sl > 0 ? sl : undefined,
+                created_time: cTime,
+                updated_time: uTime,
+              });
+            }
+            return {
+              success: true,
+              positions,
+              network_label: netLabel,
+              is_testnet: baseUrl !== 'https://api.bybit.com',
+            };
+          }
+        }
+      } catch {
+        // try next host
+      }
+    }
+    return { success: false, positions: [] };
+  }
+
+  // 2. BINANCE USDT-M FUTURES (/fapi/v2/positionRisk)
+  if (creds.exchange === 'binance') {
+    const candidateHosts = getBinanceCandidateHosts(cleanKey, creds.isTestnet);
+    for (const baseUrl of candidateHosts) {
+      try {
+        const ts = await getBinanceTimestamp(false, baseUrl);
+        const query = `timestamp=${ts}&recvWindow=10000`;
+        const sig = signBinanceFuturesQuery(query, cleanSecret);
+        const res = await makeHttpsRequest(
+          `${baseUrl}/fapi/v2/positionRisk?${query}&signature=${sig}`,
+          {
+            method: 'GET',
+            headers: { 'X-MBX-APIKEY': cleanKey },
+            timeoutMs: 6500,
+          }
+        );
+        if (res.statusCode === 200) {
+          binanceHostCache.set(cleanKey, baseUrl);
+          const list = JSON.parse(res.data);
+          if (Array.isArray(list)) {
+            const positions: ExchangePositionItem[] = [];
+            for (const p of list) {
+              const rawAmt = Number(p.positionAmt || 0);
+              const size = Math.abs(rawAmt);
+              if (!(size > 0)) continue;
+              const sym = String(p.symbol || '');
+              if (!sym.endsWith('USDT')) continue;
+              const entryPrice = Number(p.entryPrice || 0);
+              if (!(entryPrice > 0)) continue;
+              const markPrice = Number(p.markPrice || entryPrice);
+              const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
+              const posSide = String(p.positionSide || '').toUpperCase();
+              const isShort = posSide === 'SHORT' || rawAmt < 0;
+              const notional = size * entryPrice;
+              const isolatedWallet = Number(p.isolatedWallet || 0);
+              const marginUsdt =
+                isolatedWallet > 0
+                  ? Number(isolatedWallet.toFixed(2))
+                  : Number((notional / lev).toFixed(2));
+              const uTime = Number(p.updateTime || Date.now());
+              positions.push({
+                pair: symbolToFreqtradePair(sym),
+                symbol: sym,
+                is_short: isShort,
+                size,
+                entry_price: entryPrice,
+                mark_price: markPrice > 0 ? markPrice : entryPrice,
+                leverage: lev,
+                margin_usdt: marginUsdt,
+                unrealized_pnl: Number(p.unRealizedProfit || 0),
+                created_time: uTime,
+                updated_time: uTime,
+              });
+            }
+            return {
+              success: true,
+              positions,
+              network_label: baseUrl.includes('testnet')
+                ? 'Binance Futures Testnet'
+                : 'Binance USDⓈ-M Mainnet',
+              is_testnet: baseUrl.includes('testnet'),
+            };
+          }
+        }
+      } catch {
+        // try next host
+      }
+    }
+    return { success: false, positions: [] };
+  }
+
+  // 3. OKX V5 SWAP (/api/v5/account/positions?instType=SWAP)
+  if (creds.exchange === 'okx') {
+    const cleanPass = String(creds.passphrase || '').trim();
+    if (!cleanPass) return { success: false, positions: [] };
+    const isDemo = creds.isTestnet ?? okxDemoCache.get(cleanKey) ?? false;
+    try {
+      const isoTimestamp = new Date().toISOString();
+      const requestPath = '/api/v5/account/positions?instType=SWAP';
+      const preHash = `${isoTimestamp}GET${requestPath}`;
+      const signature = crypto.createHmac('sha256', cleanSecret).update(preHash).digest('base64');
+      const headers: Record<string, string> = {
+        'OK-ACCESS-KEY': cleanKey,
+        'OK-ACCESS-SIGN': signature,
+        'OK-ACCESS-TIMESTAMP': isoTimestamp,
+        'OK-ACCESS-PASSPHRASE': cleanPass,
+        'Content-Type': 'application/json',
+      };
+      if (isDemo) headers['x-simulated-trading'] = '1';
+      const res = await makeHttpsRequest(`https://www.okx.com${requestPath}`, {
+        method: 'GET',
+        headers,
+        timeoutMs: 6500,
+      });
+      if (res.statusCode === 200) {
+        const json = JSON.parse(res.data);
+        if (json.code === '0' && Array.isArray(json.data)) {
+          const positions: ExchangePositionItem[] = [];
+          for (const p of json.data) {
+            const rawPos = Number(p.pos || 0);
+            const size = Math.abs(rawPos);
+            if (!(size > 0)) continue;
+            const instId = String(p.instId || '');
+            const entryPrice = Number(p.avgPx || 0);
+            if (!(entryPrice > 0)) continue;
+            const markPrice = Number(p.markPx || entryPrice);
+            const lev = Math.max(1, Math.round(Number(p.lever || 25)));
+            const isShort = String(p.posSide || '').toLowerCase() === 'short' || rawPos < 0;
+            const marginUsdt = Number(p.margin || p.imr || (size * entryPrice) / lev);
+            positions.push({
+              pair: symbolToFreqtradePair(instId),
+              symbol: instId,
+              is_short: isShort,
+              size,
+              entry_price: entryPrice,
+              mark_price: markPrice,
+              leverage: lev,
+              margin_usdt: Number(marginUsdt.toFixed(2)),
+              unrealized_pnl: Number(p.upl || 0),
+              created_time: Number(p.cTime || Date.now()),
+              updated_time: Number(p.uTime || Date.now()),
+            });
+          }
+          return {
+            success: true,
+            positions,
+            network_label: isDemo ? 'OKX Demo Trading' : 'OKX V5 Mainnet',
+            is_testnet: isDemo,
+          };
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return { success: false, positions: [] };
+  }
+
+  // 4. BITGET V2 USDT-FUTURES (/api/v2/mix/position/all-position?productType=USDT-FUTURES&marginCoin=USDT)
+  if (creds.exchange === 'bitget') {
+    const cleanPass = String(creds.passphrase || '').trim();
+    if (!cleanPass) return { success: false, positions: [] };
+    const isDemo = creds.isTestnet ?? bitgetDemoCache.get(cleanKey) ?? false;
+    try {
+      const timestamp = Date.now().toString();
+      const requestPath = '/api/v2/mix/position/all-position?productType=USDT-FUTURES&marginCoin=USDT';
+      const preHash = `${timestamp}GET${requestPath}`;
+      const signature = crypto.createHmac('sha256', cleanSecret).update(preHash).digest('base64');
+      const headers: Record<string, string> = {
+        'ACCESS-KEY': cleanKey,
+        'ACCESS-SIGN': signature,
+        'ACCESS-TIMESTAMP': timestamp,
+        'ACCESS-PASSPHRASE': cleanPass,
+        'Content-Type': 'application/json',
+        locale: 'en-US',
+      };
+      if (isDemo) headers.paptrading = '1';
+      const res = await makeHttpsRequest(`https://api.bitget.com${requestPath}`, {
+        method: 'GET',
+        headers,
+        timeoutMs: 6500,
+      });
+      if (res.statusCode === 200) {
+        const json = JSON.parse(res.data);
+        if (json.code === '00000' && Array.isArray(json.data)) {
+          const positions: ExchangePositionItem[] = [];
+          for (const p of json.data) {
+            const size = Math.abs(Number(p.total || p.available || 0));
+            if (!(size > 0)) continue;
+            const sym = String(p.symbol || '');
+            const entryPrice = Number(p.openPriceAvg || 0);
+            if (!(entryPrice > 0)) continue;
+            const markPrice = Number(p.markPrice || entryPrice);
+            const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
+            const isShort = String(p.holdSide || '').toLowerCase() === 'short';
+            const marginUsdt = Number(p.marginSize || (size * entryPrice) / lev);
+            positions.push({
+              pair: symbolToFreqtradePair(sym),
+              symbol: sym,
+              is_short: isShort,
+              size,
+              entry_price: entryPrice,
+              mark_price: markPrice,
+              leverage: lev,
+              margin_usdt: Number(marginUsdt.toFixed(2)),
+              unrealized_pnl: Number(p.unrealizedPL || 0),
+              created_time: Number(p.cTime || Date.now()),
+              updated_time: Number(p.uTime || Date.now()),
+            });
+          }
+          return {
+            success: true,
+            positions,
+            network_label: isDemo ? 'Bitget Demo Futures' : 'Bitget USDT-Futures Mainnet',
+            is_testnet: isDemo,
+          };
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return { success: false, positions: [] };
+  }
+
+  // 5. BINGX SWAP V2 (/openApi/swap/v2/user/positions)
+  if (creds.exchange === 'bingx') {
+    try {
+      const timestamp = Date.now();
+      const query = `timestamp=${timestamp}`;
+      const signature = crypto.createHmac('sha256', cleanSecret).update(query).digest('hex');
+      const res = await makeHttpsRequest(
+        `https://open-api.bingx.com/openApi/swap/v2/user/positions?${query}&signature=${signature}`,
+        {
+          method: 'GET',
+          headers: { 'X-BX-APIKEY': cleanKey },
+          timeoutMs: 6500,
+        }
+      );
+      if (res.statusCode === 200) {
+        const json = JSON.parse(res.data);
+        if (json.code === 0 && Array.isArray(json.data)) {
+          const positions: ExchangePositionItem[] = [];
+          for (const p of json.data) {
+            const size = Math.abs(Number(p.positionAmt || p.availableAmt || 0));
+            if (!(size > 0)) continue;
+            const sym = String(p.symbol || '');
+            const entryPrice = Number(p.avgPrice || 0);
+            if (!(entryPrice > 0)) continue;
+            const markPrice = Number(p.markPrice || entryPrice);
+            const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
+            const isShort = String(p.positionSide || '').toUpperCase() === 'SHORT';
+            const marginUsdt = Number(p.margin || (size * entryPrice) / lev);
+            positions.push({
+              pair: symbolToFreqtradePair(sym),
+              symbol: sym,
+              is_short: isShort,
+              size,
+              entry_price: entryPrice,
+              mark_price: markPrice,
+              leverage: lev,
+              margin_usdt: Number(marginUsdt.toFixed(2)),
+              unrealized_pnl: Number(p.unrealizedProfit || 0),
+              created_time: Number(p.updateTime || Date.now()),
+              updated_time: Number(p.updateTime || Date.now()),
+            });
+          }
+          return {
+            success: true,
+            positions,
+            network_label: 'BingX Swap V2',
+          };
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return { success: false, positions: [] };
+  }
+
+  return { success: false, positions: [] };
+}
+
+/**
+ * Запрашивает реальную историю закрытых сделок (Closed PnL) с биржи (Bybit V5 /v5/position/closed-pnl, Binance Futures).
+ * Используется для точной синхронизации цены закрытия, комиссий, времени закрытия и истории доходности в Дашборде.
+ */
+export async function fetchExchangeClosedPnl(
+  creds: ExchangeCredentials,
+  limit = 50
+): Promise<{
+  success: boolean;
+  closed: ExchangeClosedPnlItem[];
+}> {
+  const cleanKey = String(creds.apiKey || '').trim();
+  const cleanSecret = String(creds.apiSecret || '').trim();
+  if (!cleanKey || !cleanSecret || isSimulatedTestApiKey(cleanKey)) {
+    return { success: false, closed: [] };
+  }
+
+  if (creds.exchange === 'bybit') {
+    const candidateHosts = getBybitCandidateHosts(cleanKey, creds.isTestnet);
+    for (const baseUrl of candidateHosts) {
+      try {
+        const timestamp = await getBybitTimestamp(baseUrl, false);
+        const recvWindow = '10000';
+        const queryString = `category=linear&limit=${Math.min(100, Math.max(10, limit))}`;
+        const signature = signBybitV5(timestamp, cleanKey, recvWindow, queryString, cleanSecret);
+        const res = await makeHttpsRequest(`${baseUrl}/v5/position/closed-pnl?${queryString}`, {
+          method: 'GET',
+          headers: {
+            'X-BAPI-API-KEY': cleanKey,
+            'X-BAPI-TIMESTAMP': timestamp,
+            'X-BAPI-SIGN': signature,
+            'X-BAPI-RECV-WINDOW': recvWindow,
+            'Content-Type': 'application/json',
+          },
+          timeoutMs: 6500,
+        });
+        if (res.statusCode === 200) {
+          const json = JSON.parse(res.data);
+          if (json.retCode === 10003 || json.retCode === 10004 || json.retCode === 33004) {
+            continue;
+          }
+          if (json.retCode === 0 && Array.isArray(json.result?.list)) {
+            bybitHostCache.set(cleanKey, baseUrl);
+            const closed: ExchangeClosedPnlItem[] = [];
+            for (const item of json.result.list) {
+              const sym = String(item.symbol || '');
+              const qty = Math.abs(Number(item.qty || item.closedSize || 0));
+              const entryPrice = Number(item.avgEntryPrice || item.orderPrice || 0);
+              const exitPrice = Number(item.avgExitPrice || item.execPrice || 0);
+              if (!sym || !(qty > 0) || !(entryPrice > 0) || !(exitPrice > 0)) continue;
+              // В Bybit closed-pnl поле side означает сторону закрывающего ордера:
+              // Если закрывающий ордер 'Sell', значит закрыта позиция LONG (is_short = false).
+              // Если закрывающий ордер 'Buy', значит закрыта позиция SHORT (is_short = true).
+              const closingSide = String(item.side || '').toLowerCase();
+              const isShort = closingSide === 'buy';
+              const lev = Math.max(1, Math.round(Number(item.leverage || 25)));
+              const closedPnl = Number(item.closedPnl || 0);
+              const openFee = Math.abs(
+                Number(item.openFee || entryPrice * qty * 0.00055)
+              );
+              const closeFee = Math.abs(
+                Number(item.closeFee || exitPrice * qty * 0.00055)
+              );
+              const cTime = Number(item.createdTime || item.updatedTime || Date.now());
+              const uTime = Number(item.updatedTime || cTime);
+              closed.push({
+                order_id: String(item.orderId || `${sym}-${uTime}`),
+                pair: symbolToFreqtradePair(sym),
+                symbol: sym,
+                is_short: isShort,
+                qty,
+                entry_price: entryPrice,
+                exit_price: exitPrice,
+                leverage: lev,
+                closed_pnl: Number(closedPnl.toFixed(4)),
+                open_fee: Number(openFee.toFixed(4)),
+                close_fee: Number(closeFee.toFixed(4)),
+                created_time: cTime,
+                updated_time: uTime,
+              });
+            }
+            return { success: true, closed };
+          }
+        }
+      } catch {
+        // try next host
+      }
+    }
+    return { success: false, closed: [] };
+  }
+
+  return { success: false, closed: [] };
+}
+

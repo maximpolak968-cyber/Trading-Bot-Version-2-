@@ -325,13 +325,18 @@ export class SqliteBotDatabase {
     return paths;
   }
 
-  private syncAccountsBackupFile() {
+  private syncAccountsBackupFile(allowEmptyOverwrite = false) {
     try {
       const rows = this.db.prepare(`SELECT * FROM exchange_accounts ORDER BY rowid ASC`).all();
       const realAccounts = rows.filter((r: any) => {
         const key = String(r.api_key_raw || '').trim().toLowerCase();
         return key && !key.startsWith('test_') && !key.startsWith('mock_') && !key.startsWith('sim_');
       });
+      // Защита от случайного затирания резервной копии API-ключей при тестах или пустой БД:
+      // перезаписываем пустым массивом ТОЛЬКО при явной очистке пользователем (allowEmptyOverwrite = true).
+      if (realAccounts.length === 0 && !allowEmptyOverwrite) {
+        return;
+      }
       const jsonStr = JSON.stringify(realAccounts, null, 2);
       for (const p of this.getAccountsBackupPaths()) {
         try {
@@ -1287,12 +1292,12 @@ export class SqliteBotDatabase {
     }
   }
 
-  public clearAllExchangeAccounts() {
+  public clearAllExchangeAccounts(explicitUserClear = false) {
     try {
       this.db.prepare(`DELETE FROM exchange_accounts`).run();
       this.db.prepare(`DELETE FROM signals`).run();
       this.db.prepare(`DELETE FROM bot_levels WHERE manual_override = 0`).run();
-      this.syncAccountsBackupFile();
+      this.syncAccountsBackupFile(explicitUserClear);
     } catch {
       // ignore
     }

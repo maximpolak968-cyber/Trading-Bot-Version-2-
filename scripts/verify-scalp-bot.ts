@@ -1,5 +1,12 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { SqliteBotDatabase } from '../src/bot/sqliteStore';
+import {
+  getExchangeTakerFeeRate,
+  symbolToFreqtradePair,
+  isSimulatedTestApiKey,
+} from '../src/bot/exchangeConnector';
 
 const sqliteDb = new SqliteBotDatabase();
 const BASE_URL = 'http://127.0.0.1:3000';
@@ -20,6 +27,19 @@ async function runVerification() {
   console.log('================================================================');
   console.log('🚀 ЗАПУСК ПОЛНОЙ ПРОВЕРКИ БД, УМНОГО АНАЛИЗА, СКАНЕРА И БИРЖИ');
   console.log('================================================================\n');
+
+  // Сохраняем реальные пользовательские аккаунты и сделки перед запуском автотестов, чтобы гарантированно вернуть их после завершения
+  const preTestAccounts = sqliteDb
+    .loadExchangeAccounts()
+    .filter((a) => !isSimulatedTestApiKey(a.api_key_raw));
+  const preTestTrades = sqliteDb
+    .loadAllTrades()
+    .filter(
+      (t) =>
+        t.enter_tag === 'EXCHANGE_SYNC_LIVE' ||
+        t.enter_tag === 'EXCHANGE_HISTORY' ||
+        preTestAccounts.some((a) => a.id === t.account_id || a.is_owner)
+    );
 
   // ---------------------------------------------------------------------------
   // ТЕСТ 1: СТРОГИЙ ЗАПРЕТ РАБОТЫ БЕЗ ПОДКЛЮЧЕННОЙ БИРЖИ (Пункт 4)
@@ -747,6 +767,7 @@ async function runVerification() {
   assert.equal(patchDca2Res.status, 200);
 
   // Добавляем и перетаскиваем графический объект (линию тренда / линейку) на графике LINK
+  await api('/api/v1/chart_drawings?pair=LINK/USDT:USDT', { method: 'DELETE' });
   const addDrwRes = await api('/api/v1/chart_drawings', {
     method: 'POST',
     body: JSON.stringify({
@@ -1067,13 +1088,45 @@ async function runVerification() {
   // ---------------------------------------------------------------------------
   // ОЧИСТКА ТЕСТОВЫХ ДАННЫХ (Чистое состояние после проверки)
   // ---------------------------------------------------------------------------
+  console.log('\n🔟 Проверка комиссий бирж, нормализации символов и защиты резервной копии API-ключей...');
+  assert.equal(getExchangeTakerFeeRate('bybit'), 0.00055, 'Комиссия Taker Bybit должна быть 0.055%');
+  assert.equal(getExchangeTakerFeeRate('binance'), 0.0005, 'Комиссия Taker Binance должна быть 0.05%');
+  assert.equal(getExchangeTakerFeeRate('okx'), 0.0005, 'Комиссия Taker OKX должна быть 0.05%');
+  assert.equal(getExchangeTakerFeeRate('bitget'), 0.0006, 'Комиссия Taker Bitget должна быть 0.06%');
+  assert.equal(getExchangeTakerFeeRate('bingx'), 0.0005, 'Комиссия Taker BingX должна быть 0.05%');
+
+  assert.equal(symbolToFreqtradePair('ETHUSDT'), 'ETH/USDT:USDT');
+  assert.equal(symbolToFreqtradePair('BTC-USDT-SWAP'), 'BTC/USDT:USDT');
+  assert.equal(symbolToFreqtradePair('SOL-USDT'), 'SOL/USDT:USDT');
+
+  // Проверяем, что резервный файл .exchange_accounts.backup.json НЕ затирается пустым массивом при clearAllExchangeAccounts(false)
+  const backupPath = path.resolve(process.cwd(), '.exchange_accounts.backup.json');
+  const dummyBackup = JSON.stringify([{ id: 'keep-test', name: 'Protected', api_key_raw: 'REALKEY1234567890' }]);
+  const existingBackup = fs.existsSync(backupPath) ? fs.readFileSync(backupPath, 'utf-8') : null;
+  fs.writeFileSync(backupPath, dummyBackup, 'utf-8');
+  sqliteDb.clearAllExchangeAccounts(false);
+  const afterClearBackup = fs.readFileSync(backupPath, 'utf-8');
+  assert.equal(
+    afterClearBackup,
+    dummyBackup,
+    'Резервная копия .exchange_accounts.backup.json НЕ должна затираться при фоновом/тестовом сбросе без явного подтверждения владельца!'
+  );
+  if (existingBackup !== null) {
+    fs.writeFileSync(backupPath, existingBackup, 'utf-8');
+  } else {
+    fs.unlinkSync(backupPath);
+  }
+  console.log(
+    '   ✅ Доказано: реальные комиссии всех 5 бирж (Bybit 0.055%, Binance/OKX/BingX 0.05%, Bitget 0.06%), маппинг позиций и защита .exchange_accounts.backup.json работают безотказно!'
+  );
+
   console.log('\n🧹 Очистка тестовых аккаунтов и тестовых сделок...');
   await api('/api/v1/accounts', { method: 'DELETE' });
   const allRemainingTrades = sqliteDb.loadAllTrades();
   for (const t of allRemainingTrades) {
     sqliteDb.deleteTrade(t.trade_id);
   }
-  sqliteDb.clearAllExchangeAccounts();
+  sqliteDb.clearAllExchangeAccounts(false);
   sqliteDb.clearBotLevelsForPair('BTC/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('ETH/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('SOL/USDT:USDT');
@@ -1088,8 +1141,37 @@ async function runVerification() {
     `   ✅ База очищена. Финальный статус бота без подключенной биржи: state="${finalCfg.data.state}", exchange_connected=${finalCfg.data.exchange_connected}, баланс=${finalBal.data.total} USDT`
   );
 
+  // Восстанавливаем реальные пользовательские аккаунты и сделки, если они были подключены до запуска теста
+  if (preTestAccounts.length > 0) {
+    for (const acc of preTestAccounts) {
+      sqliteDb.upsertExchangeAccount(acc);
+      await api('/api/v1/accounts', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: acc.name,
+          exchange: acc.exchange,
+          market_type: acc.market_type,
+          api_key: acc.api_key_raw,
+          api_secret: acc.api_secret_raw,
+          passphrase: acc.passphrase_raw,
+          is_owner: acc.is_owner,
+          copy_trading: acc.copy_trading,
+          copy_multiplier: acc.copy_multiplier,
+          max_leverage: acc.max_leverage,
+          balance_usdt: acc.balance_usdt,
+          client_access_code: acc.client_access_code,
+          is_testnet: acc.is_testnet,
+        }),
+      });
+    }
+    for (const tr of preTestTrades) {
+      sqliteDb.upsertTrade(tr);
+    }
+    console.log(`   🔄 Восстановлено реальных аккаунтов пользователя: ${preTestAccounts.length}`);
+  }
+
   console.log('\n================================================================');
-  console.log('✅ ВСЕ 9 БЛОКОВ ТЕСТОВ ПРОВЕРЕНЫ НА ПРАКТИКЕ И ПОЛНОСТЬЮ ПОДТВЕРЖДЕНЫ!');
+  console.log('✅ ВСЕ 10 БЛОКОВ ТЕСТОВ ПРОВЕРЕНЫ НА ПРАКТИКЕ И ПОЛНОСТЬЮ ПОДТВЕРЖДЕНЫ!');
   console.log('================================================================');
 }
 

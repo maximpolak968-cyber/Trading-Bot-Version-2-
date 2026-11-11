@@ -868,7 +868,7 @@ export default function App() {
     } catch {
       // ignore
     }
-    const res = await fetch('/api/v1/accounts', {
+    const res = await fetch('/api/v1/accounts?confirm=true', {
       method: 'DELETE',
     });
     if (res.ok) {
