@@ -95,31 +95,9 @@ function shortPairName(pair: string): string {
   return pair.split('/')[0] || pair;
 }
 
-function shortDateStr(dateStr?: string, timestamp?: number): string {
-  if (typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0) {
-    const d = new Date(timestamp);
-    if (!Number.isNaN(d.getTime())) {
-      const mm = String(d.getMonth() + 1).padStart(2, '0');
-      const dd = String(d.getDate()).padStart(2, '0');
-      const hh = String(d.getHours()).padStart(2, '0');
-      const min = String(d.getMinutes()).padStart(2, '0');
-      const ss = String(d.getSeconds()).padStart(2, '0');
-      return `${mm}-${dd} ${hh}:${min}:${ss}`;
-    }
-  }
+function shortDateStr(dateStr?: string): string {
   if (!dateStr) return '—';
-  const isoCandidate = dateStr.includes('T') ? dateStr : `${dateStr.replace(' ', 'T')}Z`;
-  const parsed = Date.parse(isoCandidate);
-  if (Number.isFinite(parsed)) {
-    const d = new Date(parsed);
-    const mm = String(d.getMonth() + 1).padStart(2, '0');
-    const dd = String(d.getDate()).padStart(2, '0');
-    const hh = String(d.getHours()).padStart(2, '0');
-    const min = String(d.getMinutes()).padStart(2, '0');
-    const ss = String(d.getSeconds()).padStart(2, '0');
-    return `${mm}-${dd} ${hh}:${min}:${ss}`;
-  }
-  return dateStr.length >= 16 ? dateStr.slice(5, 19) : dateStr;
+  return dateStr.length >= 16 ? dateStr.slice(5, 16) : dateStr;
 }
 
 export const TradeView: React.FC<TradeViewProps> = ({
@@ -156,7 +134,6 @@ export const TradeView: React.FC<TradeViewProps> = ({
   onDeleteDrawing,
   onClearAllDrawings,
   onQuickOrderFromChart,
-  onDeleteTrade,
   onOpenForceEnterModal,
   onRefresh,
   loadingChart,
@@ -256,11 +233,7 @@ export const TradeView: React.FC<TradeViewProps> = ({
   const handleTriggerClose = async (trade: FreqtradeTrade, e: React.MouseEvent) => {
     e.stopPropagation();
     await onForceExit(trade.trade_id);
-  };
-
-  const handleTriggerDelete = async (trade: FreqtradeTrade, e: React.MouseEvent) => {
-    e.stopPropagation();
-    await onDeleteTrade(trade.trade_id);
+    setRightTab('closed');
   };
 
   return (
@@ -562,7 +535,7 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                 className="py-1.5 px-1.5 whitespace-nowrap font-mono text-[10px] text-[#9ca3af]"
                                 title={trade.open_date}
                               >
-                                {shortDateStr(trade.open_date, trade.open_timestamp)}
+                                {shortDateStr(trade.open_date)}
                               </td>
 
                               {/* 8. Act (+DCA / Close) */}
@@ -580,19 +553,10 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                   <button
                                     type="button"
                                     onClick={(e) => handleTriggerClose(trade, e)}
-                                    title="Закрыть сделку в плюс (перейдёт в Закрытые)"
+                                    title="Закрыть сделку (перейдёт в Закрытые)"
                                     className="px-1.5 py-0.5 rounded-[3px] bg-[#3b1219] hover:bg-[#ef4444] border border-[#ef4444]/70 text-[#fca5a5] hover:text-white text-[10px] font-semibold transition-colors"
                                   >
                                     Close
-                                  </button>
-
-                                  <button
-                                    type="button"
-                                    onClick={(e) => handleTriggerDelete(trade, e)}
-                                    title="Удалить сделку из базы"
-                                    className="px-1.5 py-0.5 rounded-[3px] bg-[#21252b] hover:bg-[#ef4444] border border-[#383e48] hover:border-[#ef4444] text-[#9ca3af] hover:text-white text-[10px] font-bold transition-colors"
-                                  >
-                                    ×
                                   </button>
                                 </div>
                               </td>
@@ -734,14 +698,6 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                     className="px-1.5 py-0.5 rounded-[3px] bg-[#3b1219] hover:bg-[#ef4444] border border-[#ef4444]/70 text-[#fca5a5] hover:text-white text-[10px] font-semibold transition-colors"
                                   >
                                     Close
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={(e) => handleTriggerDelete(trade, e)}
-                                    title="Удалить сделку из базы"
-                                    className="px-1.5 py-0.5 rounded-[3px] bg-[#21252b] hover:bg-[#ef4444] border border-[#383e48] hover:border-[#ef4444] text-[#9ca3af] hover:text-white text-[10px] font-bold transition-colors"
-                                  >
-                                    ×
                                   </button>
                                 </div>
                               </td>
@@ -892,19 +848,10 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                   <button
                                     type="button"
                                     onClick={(e) => handleTriggerClose(trade, e)}
-                                    title="Закрыть сделку в плюс (перейдёт в Закрытые)"
+                                    title="Закрыть сделку (перейдёт в Закрытые)"
                                     className="px-1.5 py-0.5 rounded-[3px] bg-[#3b1219] hover:bg-[#ef4444] border border-[#ef4444]/70 text-[#fca5a5] hover:text-white text-[10px] font-semibold transition-colors"
                                   >
                                     Close
-                                  </button>
-
-                                  <button
-                                    type="button"
-                                    onClick={(e) => handleTriggerDelete(trade, e)}
-                                    title="Удалить сделку из базы"
-                                    className="px-1.5 py-0.5 rounded-[3px] bg-[#21252b] hover:bg-[#ef4444] border border-[#383e48] hover:border-[#ef4444] text-[#9ca3af] hover:text-white text-[10px] font-bold transition-colors"
-                                  >
-                                    ×
                                   </button>
                                 </div>
                               </td>
@@ -991,14 +938,9 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                 {formatSmartNumber(trade.amount)}
                               </td>
 
-                              {/* 5. Entry -> Close */}
+                              {/* 5. Entry */}
                               <td className="py-1.5 px-1.5 whitespace-nowrap font-mono tabular-nums">
-                                <span>{formatSmartNumber(trade.open_rate)}$</span>
-                                {trade.close_rate ? (
-                                  <span className="text-[#9ca3af]">
-                                    {' '}➔ <span className="text-white font-semibold">{formatSmartNumber(trade.close_rate)}$</span>
-                                  </span>
-                                ) : null}
+                                {formatSmartNumber(trade.open_rate)}$
                               </td>
 
                               {/* 6. Lev */}
@@ -1020,24 +962,12 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                 </span>
                               </td>
 
-                              {/* 8. Date + Delete */}
+                              {/* 8. Date */}
                               <td
                                 className="py-1.5 px-1.5 whitespace-nowrap font-mono text-[10px] text-[#9ca3af]"
                                 title={trade.close_date || trade.open_date}
                               >
-                                <div className="flex items-center justify-between gap-1">
-                                  <span>
-                                    {shortDateStr(trade.close_date || trade.open_date, trade.close_timestamp || trade.open_timestamp)}
-                                  </span>
-                                  <button
-                                    type="button"
-                                    onClick={(e) => handleTriggerDelete(trade, e)}
-                                    title="Удалить закрытую сделку из истории"
-                                    className="px-1 py-0.2 rounded-[3px] bg-[#21252b] hover:bg-[#ef4444] border border-[#383e48] hover:border-[#ef4444] text-[#9ca3af] hover:text-white text-[10px] font-bold transition-colors"
-                                  >
-                                    ×
-                                  </button>
-                                </div>
+                                {shortDateStr(trade.close_date || trade.open_date)}
                               </td>
                             </tr>
                           );

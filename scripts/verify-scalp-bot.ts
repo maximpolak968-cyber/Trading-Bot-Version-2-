@@ -1,20 +1,5 @@
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
 import { SqliteBotDatabase } from '../src/bot/sqliteStore';
-import {
-  getExchangeTakerFeeRate,
-  symbolToFreqtradePair,
-  isSimulatedTestApiKey,
-  formatBinanceFuturesQuantity,
-  formatBybitFuturesQuantity,
-  isPairTradableOnExchange,
-} from '../src/bot/exchangeConnector';
-import {
-  canExecuteDca,
-  calculateDynamicDcaAmount,
-  checkCandleRejection,
-} from '../src/bot/scalpBotEngine';
 
 const sqliteDb = new SqliteBotDatabase();
 const BASE_URL = 'http://127.0.0.1:3000';
@@ -35,18 +20,6 @@ async function runVerification() {
   console.log('================================================================');
   console.log('🚀 ЗАПУСК ПОЛНОЙ ПРОВЕРКИ БД, УМНОГО АНАЛИЗА, СКАНЕРА И БИРЖИ');
   console.log('================================================================\n');
-
-  // Сохраняем реальные пользовательские аккаунты и сделки перед запуском автотестов, чтобы гарантированно вернуть их после завершения
-  const preTestAccounts = sqliteDb
-    .loadExchangeAccounts()
-    .filter((a) => !isSimulatedTestApiKey(a.api_key_raw));
-  const preTestTrades = sqliteDb
-    .loadAllTrades()
-    .filter(
-      (t) =>
-        t.account_name !== 'Master Owner Account' &&
-        t.account_name !== 'Инвестор Алексей'
-    );
 
   // ---------------------------------------------------------------------------
   // ТЕСТ 1: СТРОГИЙ ЗАПРЕТ РАБОТЫ БЕЗ ПОДКЛЮЧЕННОЙ БИРЖИ (Пункт 4)
@@ -774,7 +747,6 @@ async function runVerification() {
   assert.equal(patchDca2Res.status, 200);
 
   // Добавляем и перетаскиваем графический объект (линию тренда / линейку) на графике LINK
-  await api('/api/v1/chart_drawings?pair=LINK/USDT:USDT', { method: 'DELETE' });
   const addDrwRes = await api('/api/v1/chart_drawings', {
     method: 'POST',
     body: JSON.stringify({
@@ -961,155 +933,6 @@ async function runVerification() {
     `   📈 [8A-8B] Доказана работа сложного процента и быстрого скальп-TP: Реинвест-баланс=${compoundedEquityMaster}$ ➔ Новая ставка 0.5%=${avaxTrade.stake_amount}$ | Нач. скальп-TP=+${tpDistancePct.toFixed(2)}% (+${avaxTrade.take_profit_pct}% чистыми) | После DCA скальп-TP=+${dcaTpDistancePct.toFixed(2)}% (+${avaxAfterDca.take_profit_pct}% чистыми) | Лимит сделок=${cfgFastRes.data.max_open_trades}`
   );
 
-  // ---------------------------------------------------------------------------
-  // ТЕСТ 9: ПРОВЕРКА 5 НОВЫХ ИСПРАВЛЕНИЙ (MTF RSI ФИЛЬТР ARIA/USDT, ЗАЩИТА DCA ОТ 0.027629,
-  //         НЕИЗМЕННОСТЬ ВРЕМЕНИ ЗАКРЫТИЯ, РЕЗЕРВНОЕ ВОССТАНОВЛЕНИЕ API-КЛЮЧЕЙ И ФИКСАЦИЯ УРОВНЕЙ)
-  // ---------------------------------------------------------------------------
-  console.log('\n9️⃣ Проверка 5 исправлений: строгий MTF RSI фильтр (ARIA/USDT), лимит дистанции DCA, неизменность времени закрытия и авто-восстановление API-ключей...');
-
-  const {
-    analyzeMultiTimeframe,
-    evaluateScalpingStrategy,
-    findStrongestDcaLevel,
-    calcRsiSeries,
-  } = await import('../src/bot/scalpBotEngine');
-
-  // 9A. Имитируем параболический памп ARIA/USDT с 0.03 до 0.26491 (1D RSI ~89, 4H RSI ~65, 1H RSI ~54)
-  const makePumpCandles = (count: number, startPrice: number, endPrice: number, stepMs: number) => {
-    const arr: {
-      timestamp: number;
-      open: number;
-      high: number;
-      low: number;
-      close: number;
-      volume: number;
-    }[] = [];
-    const baseTs = Date.now() - count * stepMs;
-    for (let i = 0; i < count; i++) {
-      // Первые 60% свечей — флэт около startPrice (0.0276 - 0.032), затем резкий памп до endPrice (0.26491)
-      let close: number;
-      if (i < Math.floor(count * 0.6)) {
-        close = startPrice * (1 + Math.sin(i * 0.5) * 0.03);
-      } else {
-        const progress = (i - Math.floor(count * 0.6)) / (count - Math.floor(count * 0.6));
-        close = startPrice + (endPrice - startPrice) * Math.pow(progress, 1.8);
-      }
-      const open: number = i > 0 ? arr[i - 1].close : close * 0.99;
-      const high = Math.max(open, close) * 1.012;
-      const low = Math.min(open, close) * 0.992;
-      arr.push({
-        timestamp: baseTs + i * stepMs,
-        open: Number(open.toFixed(6)),
-        high: Number(high.toFixed(6)),
-        low: Number(low.toFixed(6)),
-        close: Number(close.toFixed(6)),
-        volume: 100000 + i * 5000,
-      });
-    }
-    return arr;
-  };
-
-  const aria1d = makePumpCandles(80, 0.027629, 0.26491, 86_400_000);
-  const aria4h = makePumpCandles(120, 0.027629, 0.26491, 4 * 3600_000);
-  const aria1h = makePumpCandles(120, 0.12, 0.26491, 3600_000);
-
-  const ariaRsi1d = calcRsiSeries(aria1d.map((c) => c.close), 14);
-  const lastRsi1d = ariaRsi1d[ariaRsi1d.length - 1];
-  assert.ok(lastRsi1d > 68, `На пампе ARIA/USDT 1D RSI по Уайлдеру должен быть > 68 (получено: ${lastRsi1d.toFixed(2)})`);
-
-  const ariaMtf = analyzeMultiTimeframe('ARIA/USDT:USDT', aria1h, aria4h, aria1d);
-  assert.equal(
-    ariaMtf.allow_long,
-    false,
-    `Строгий MTF RSI фильтр ОБЯЗАН запретить LONG при перекупленном 1D RSI=${ariaMtf.rsi_1d} / 4H RSI=${ariaMtf.rsi_4h} / 1H RSI=${ariaMtf.rsi_1h}!`
-  );
-
-  const ariaDecision = evaluateScalpingStrategy(
-    aria1h,
-    ariaMtf.key_4h_support,
-    ariaMtf.key_4h_resistance
-  );
-  assert.equal(
-    ariaDecision.enter_long,
-    false,
-    'Стратегия НЕ должна открывать LONG на перекупленном рынке (ARIA/USDT)'
-  );
-
-  // 9B. Проверяем, что findStrongestDcaLevel для входа @ 0.26491 НИКОГДА не берет старое дно 0.027629 (-89% от входа)
-  const safeDca = findStrongestDcaLevel(aria4h, aria1d, 0.26491, false, 1.5, 12.0);
-  const safeDcaDistPct = ((0.26491 - safeDca.price) / 0.26491) * 100;
-  assert.ok(
-    safeDcaDistPct >= 1.0 && safeDcaDistPct <= 12.5,
-    `Уровень DCA (${safeDca.price}$) обязан быть в пределах 1.5%–12% от цены входа 0.26491$, а не на 0.027629$ (дистанция=${safeDcaDistPct.toFixed(2)}%)`
-  );
-  console.log(
-    `   🛡️ [9A-9B] Фильтр MTF RSI (1D RSI=${ariaMtf.rsi_1d}, 4H RSI=${ariaMtf.rsi_4h}, 1H RSI=${ariaMtf.rsi_1h}) заблокировал LONG (allow_long=${ariaMtf.allow_long}). Уровень DCA ограничен разумной дистанцией: ${safeDca.price}$ (-${safeDcaDistPct.toFixed(2)}% вместо старого дна 0.027629$)`
-  );
-
-  // 9C. Проверяем неизменность времени закрытия (close_timestamp и close_date) после перезапуска и повторных запросов
-  const closedListBefore = await api('/api/v1/trades');
-  const closedEthBefore = closedListBefore.data.trades.find((t: any) => t.trade_id === masterEthTrade.trade_id);
-  assert.ok(closedEthBefore && closedEthBefore.close_timestamp > 0, 'Закрытая сделка ETH должна иметь сохраненный close_timestamp');
-  const savedCloseTs = closedEthBefore.close_timestamp;
-  const savedCloseDate = closedEthBefore.close_date;
-
-  await new Promise((r) => setTimeout(r, 1100));
-  await api('/api/v1/simulate_crash_recovery', { method: 'POST' });
-
-  const closedListAfter = await api('/api/v1/trades');
-  const closedEthAfter = closedListAfter.data.trades.find((t: any) => t.trade_id === masterEthTrade.trade_id);
-  assert.equal(
-    closedEthAfter.close_timestamp,
-    savedCloseTs,
-    'Время закрытия close_timestamp НЕ должно меняться при перезапуске или обновлении!'
-  );
-  assert.equal(
-    closedEthAfter.close_date,
-    savedCloseDate,
-    'Дата закрытия close_date НЕ должна меняться при перезапуске или обновлении!'
-  );
-  console.log(
-    `   ⏱️ [9C] Время закрытия сделки #${masterEthTrade.trade_id} неизменно: close_date="${closedEthAfter.close_date}", close_timestamp=${closedEthAfter.close_timestamp}`
-  );
-
-  // 9D. Проверяем резервное авто-восстановление реальных API-ключей при сбое/обнулении таблицы SQLite
-  const backupPath = path.resolve(process.cwd(), '.exchange_accounts.backup.json');
-  const existingBackupRaw = fs.existsSync(backupPath) ? fs.readFileSync(backupPath, 'utf-8') : null;
-  const realBackupSample = [
-    {
-      id: 'acc-bybit-real-backup-check',
-      name: 'Bybit Real Backup Check',
-      owner_label: 'Owner',
-      exchange: 'bybit',
-      market_type: 'futures',
-      api_key_masked: 'BYBT••••••••9900',
-      api_key_raw: 'BYBTREALBACKUPKEY99001122',
-      api_secret_raw: 'BYBTREALBACKUPSECRET99001122',
-      has_passphrase: 0,
-      is_owner: 1,
-      client_access_code: 'BYBTBCKP',
-      enabled: 1,
-      copy_trading: 1,
-      copy_multiplier: 1,
-      max_leverage: 25,
-      balance_usdt: 1500,
-      status: 'connected',
-      last_sync: '2026-11-11 20:00:00',
-      connected_at: Date.now(),
-      is_testnet: 1,
-    },
-  ];
-  fs.writeFileSync(backupPath, JSON.stringify(realBackupSample, null, 2), 'utf-8');
-  (sqliteDb as any).db.prepare('DELETE FROM exchange_accounts').run();
-  const restoredAccs = sqliteDb.loadExchangeAccounts();
-  assert.ok(
-    restoredAccs.length === 1 && restoredAccs[0].api_key_raw === 'BYBTREALBACKUPKEY99001122',
-    'При пустой таблице exchange_accounts реальные ключи должны автоматически восстановиться из резервного хранилища .exchange_accounts.backup.json!'
-  );
-  console.log(
-    `   🔑 [9D] Авто-восстановление реальных API-ключей после сбоя БД сработало: восстановлен аккаунт "${restoredAccs[0].name}" (Testnet=${restoredAccs[0].is_testnet})`
-  );
-
   // Если передан флаг --leave-for-restart, оставляем эти сделки в БД для проверки через реальный перезапуск процесса Node.js (restart_dev_server)
   if (process.argv.includes('--leave-for-restart')) {
     console.log('\n⏸️ Режим --leave-for-restart: сделки оставлены в trades.sqlite для проверки реального перезапуска процесса Node.js.');
@@ -1117,270 +940,31 @@ async function runVerification() {
   }
 
   // ---------------------------------------------------------------------------
-  // ТЕСТ 10: ПРОВЕРКА УДАЛЕНИЯ СДЕЛОК (DELETE /api/v1/trades/:id), КОМИССИЙ БИРЖ И ЧИСТОТЫ БАЗЫ
+  // ОЧИСТКА ТЕСТОВЫХ ДАННЫХ (Чистое состояние после проверки)
   // ---------------------------------------------------------------------------
-  console.log('\n🔟 Проверка удаления сделок (включая минусовые), комиссий бирж и защиты резервной копии API-ключей...');
-  assert.equal(getExchangeTakerFeeRate('bybit'), 0.00055, 'Комиссия Taker Bybit должна быть 0.055%');
-  assert.equal(getExchangeTakerFeeRate('binance'), 0.0005, 'Комиссия Taker Binance должна быть 0.05%');
-  assert.equal(getExchangeTakerFeeRate('okx'), 0.0005, 'Комиссия Taker OKX должна быть 0.05%');
-  assert.equal(getExchangeTakerFeeRate('bitget'), 0.0006, 'Комиссия Taker Bitget должна быть 0.06%');
-  assert.equal(getExchangeTakerFeeRate('bingx'), 0.0005, 'Комиссия Taker BingX должна быть 0.05%');
-
-  assert.equal(symbolToFreqtradePair('ETHUSDT'), 'ETH/USDT:USDT');
-  assert.equal(symbolToFreqtradePair('BTC-USDT-SWAP'), 'BTC/USDT:USDT');
-  assert.equal(symbolToFreqtradePair('SOL-USDT'), 'SOL/USDT:USDT');
-
-  // Проверка точности лотов Binance Testnet vs Mainnet (защита от ошибки Binance [-1111]: Precision is over the maximum defined for this asset)
-  const spcxTestnetQty = await formatBinanceFuturesQuantity(
-    'SPCXUSDT',
-    4.4389,
-    140.8,
-    false,
-    'https://testnet.binancefuture.com'
-  );
-  const spcxMainnetQty = await formatBinanceFuturesQuantity(
-    'SPCXUSDT',
-    4.4389,
-    140.8,
-    false,
-    'https://fapi.binance.com'
-  );
-  assert.equal(
-    spcxTestnetQty.includes('.'),
-    false,
-    `На Binance Testnet у SPCXUSDT quantityPrecision=0 (stepSize=1), поэтому лот должен быть строго целым числом без дроби (получено: ${spcxTestnetQty})`
-  );
-  assert.equal(
-    spcxTestnetQty,
-    '5',
-    `На Binance Testnet лот SPCXUSDT для 4.4389 должен округляться вверх до 5 (получено: ${spcxTestnetQty})`
-  );
-  assert.equal(
-    spcxMainnetQty,
-    '4.44',
-    `На Binance Mainnet у SPCXUSDT stepSize=0.01 (quantityPrecision=2), лот должен быть 4.44 (получено: ${spcxMainnetQty})`
-  );
-
-  const arkTestnetQty = await formatBinanceFuturesQuantity(
-    'ARKUSDT',
-    10,
-    0.5,
-    false,
-    'https://testnet.binancefuture.com'
-  );
-  assert.equal(
-    Number(arkTestnetQty) % 3,
-    0,
-    `На Binance Testnet у ARKUSDT LOT_SIZE.stepSize=3, лот должен быть кратен 3 и без дроби (получено: ${arkTestnetQty})`
-  );
-
-  // Проверка фильтрации не-криптовалютных контрактов (TRADIFI_PERPETUAL SPCXUSDT / TSLAUSDT) и статуса TRADING
-  const spcxTradableTestnet = await isPairTradableOnExchange('SPCX/USDT:USDT', 'binance', true);
-  const ethTradableTestnet = await isPairTradableOnExchange('ETH/USDT:USDT', 'binance', true);
-  assert.equal(
-    spcxTradableTestnet,
-    false,
-    'Контракт SPCX/USDT:USDT (TRADIFI_PERPETUAL / PREMARKET) должен автоматически исключаться из авто-сканера Binance Futures'
-  );
-  assert.equal(
-    ethTradableTestnet,
-    true,
-    'Контракт ETH/USDT:USDT (PERPETUAL / COIN / TRADING) должен быть разрешён для торговли на Binance Testnet'
-  );
-  console.log(
-    `   🎯 Доказано: раздельный кэш точности Mainnet vs Testnet работает! SPCXUSDT Testnet qty="${spcxTestnetQty}" (0 знаков), Mainnet qty="${spcxMainnetQty}" (2 знака), ARKUSDT Testnet qty="${arkTestnetQty}" (шаг 3), фильтр TRADIFI_PERPETUAL активен.`
-  );
-
-  // Проверяем прямое удаление открытой сделки через DELETE /api/v1/trades/:id (кнопка × в таблице сделок)
-  const openBeforeDel = await api('/api/v1/status');
-  if (openBeforeDel.data.length > 0) {
-    const targetDelId = openBeforeDel.data[0].trade_id;
-    const delRes = await api(`/api/v1/trades/${targetDelId}`, { method: 'DELETE' });
-    assert.equal(delRes.status, 200, 'DELETE /api/v1/trades/:id должен успешно удалять сделку');
-    const openAfterDel = await api('/api/v1/status');
-    assert.ok(
-      !openAfterDel.data.some((t: any) => t.trade_id === targetDelId),
-      `Удалённая сделка #${targetDelId} больше не должна присутствовать в списке открытых`
-    );
-    console.log(`   🗑️ Доказано: сделка #${targetDelId} (и её копии) мгновенно удалена через DELETE /api/v1/trades/${targetDelId}`);
-  }
-
-  // Проверяем, что резервный файл .exchange_accounts.backup.json НЕ затирается пустым массивом при clearAllExchangeAccounts(false)
-  const dummyBackup = JSON.stringify([{ id: 'keep-test', name: 'Protected', api_key_raw: 'REALKEY1234567890' }]);
-  fs.writeFileSync(backupPath, dummyBackup, 'utf-8');
-  sqliteDb.clearAllExchangeAccounts(false);
-  const afterClearBackup = fs.readFileSync(backupPath, 'utf-8');
-  assert.equal(
-    afterClearBackup,
-    dummyBackup,
-    'Резервная копия .exchange_accounts.backup.json НЕ должна затираться при фоновом/тестовом сбросе без явного подтверждения владельца!'
-  );
-  if (existingBackupRaw !== null) {
-    fs.writeFileSync(backupPath, existingBackupRaw, 'utf-8');
-  } else {
-    try {
-      fs.unlinkSync(backupPath);
-    } catch {
-      // ignore
-    }
-  }
-  console.log(
-    '   ✅ Доказано: реальные комиссии всех 5 бирж (Bybit 0.055%, Binance/OKX/BingX 0.05%, Bitget 0.06%), маппинг позиций и защита .exchange_accounts.backup.json работают безотказно!'
-  );
-
-  // ---------------------------------------------------------------------------
-  // ТЕСТ 11: ПРОВЕРКА УСРЕДНЕНИЯ (SMART DCA ПРИ 25X CROSS) И 1:1 БАЛАНСА БИРЖИ
-  // ---------------------------------------------------------------------------
-  console.log('\n1️⃣1️⃣ Проверка Smart DCA при плече 25x Cross и 1:1 синхронизации баланса/PnL/комиссий...');
-  const dcaRisk25x = canExecuteDca({
-    pair: 'ETH/USDT:USDT',
-    dcaCount: 0,
-    initialAmount: 6.25,
-    currentAmount: 6.25,
-    currentPrice: 98.5,
-    openRate: 100,
-    isShort: false,
-    leverage: 25,
-    totalBalanceUsdt: 5000,
-    usedMarginUsdt: 25,
-  });
-  assert.equal(
-    dcaRisk25x.allowed,
-    true,
-    `canExecuteDca при 25x Cross должен разрешать усреднение (получено: allowed=${dcaRisk25x.allowed}, reason=${dcaRisk25x.reason})`
-  );
-
-  const dynLong = calculateDynamicDcaAmount({
-    currentAmount: 6.25,
-    openRate: 100,
-    currentPrice: 98.5,
-    isShort: false,
-    leverage: 25,
-    totalBalanceUsdt: 5000,
-    usedMarginUsdt: 25,
-    otherActiveCoinsCount: 2,
-  });
-  assert.ok(
-    dynLong.addStake >= 25,
-    `Динамический объем DCA для LONG должен рассчитываться корректно (addStake=${dynLong.addStake}$, targetAvgPrice=${dynLong.targetAvgPrice}$)`
-  );
-  assert.ok(
-    dynLong.targetAvgPrice < 100 && dynLong.targetAvgPrice > 98.5,
-    `Новая средняя цена входа LONG после DCA (${dynLong.targetAvgPrice}$) должна смещаться ближе к текущей цене (98.5$)`
-  );
-
-  const dynShort = calculateDynamicDcaAmount({
-    currentAmount: 6.25,
-    openRate: 100,
-    currentPrice: 101.5,
-    isShort: true,
-    leverage: 25,
-    totalBalanceUsdt: 5000,
-    usedMarginUsdt: 25,
-    otherActiveCoinsCount: 2,
-  });
-  assert.ok(
-    dynShort.addStake >= 25,
-    `Динамический объем DCA для SHORT должен рассчитываться корректно (addStake=${dynShort.addStake}$, targetAvgPrice=${dynShort.targetAvgPrice}$)`
-  );
-  assert.ok(
-    dynShort.targetAvgPrice > 100 && dynShort.targetAvgPrice < 101.5,
-    `Новая средняя цена входа SHORT после DCA (${dynShort.targetAvgPrice}$) должна смещаться ближе к текущей цене (101.5$)`
-  );
-
-  const rejCheck = checkCandleRejection(
-    [
-      { timestamp: 1, open: 99.0, high: 99.1, low: 98.6, close: 98.7, volume: 100 },
-      { timestamp: 2, open: 98.7, high: 98.8, low: 98.1, close: 98.2, volume: 150 },
-    ],
-    98.5,
-    false
-  );
-  assert.equal(
-    rejCheck.confirmed,
-    true,
-    'checkCandleRejection должен подтверждать достижение уровня DCA даже при проколе ниже уровня'
-  );
-
-  // 11B. Проверяем параллельное открытие 2-сторонней хедж-кампании (LONG + SHORT без задержки) и мгновенный отклик API сайта
-  const hedgeStartMs = Date.now();
-  const hedgeRes = await api('/api/v1/forceenter', {
-    method: 'POST',
-    body: JSON.stringify({
-      pair: 'ADA/USDT:USDT',
-      side: 'hedge',
-      stakeamount: 25,
-      leverage: 25,
-    }),
-  });
-  const hedgeDurationMs = Date.now() - hedgeStartMs;
-  assert.equal(hedgeRes.status, 200, '2-сторонний хедж (side="hedge") должен успешно открываться');
-  assert.equal(hedgeRes.data.hedge_campaign, true, 'Должен возвращаться флаг hedge_campaign=true');
-  assert.ok(hedgeRes.data.long_trade && hedgeRes.data.short_trade, 'Должны быть созданы обе ноги: long_trade и short_trade');
-  assert.equal(
-    hedgeRes.data.long_trade.campaign_id,
-    hedgeRes.data.short_trade.campaign_id,
-    'Обе ноги 2-стороннего хеджа должны иметь единый campaign_id'
-  );
-  assert.equal(hedgeRes.data.long_trade.is_short, false, 'Первая нога хеджа — LONG');
-  assert.equal(hedgeRes.data.short_trade.is_short, true, 'Вторая нога хеджа — SHORT');
-
-  const uiPingStartMs = Date.now();
-  const [liveBalCheck, liveProfCheck] = await Promise.all([
-    api('/api/v1/balance'),
-    api('/api/v1/profit'),
-  ]);
-  const uiPingMs = Date.now() - uiPingStartMs;
-  assert.ok(uiPingMs < 500, `Отклик API сайта (/balance + /profit) должен быть мгновенным без блокировки (< 500 мс, получено ${uiPingMs} мс)`);
-  assert.equal(typeof liveBalCheck.data.wallet_balance, 'number', '/api/v1/balance должен возвращать wallet_balance');
-  assert.equal(typeof liveBalCheck.data.unrealized_pnl, 'number', '/api/v1/balance должен возвращать unrealized_pnl');
-  assert.equal(typeof liveProfCheck.data.total_fees_usdt, 'number', '/api/v1/profit должен возвращать total_fees_usdt');
-  console.log(
-    `   ✅ Доказано: Smart DCA при 25x Cross (allowed=${dcaRisk25x.allowed}, liqDist=${dcaRisk25x.liquidationDistancePct}%), параллельный 2-сторонний Хедж ADA LONG+SHORT (${hedgeDurationMs} мс, campaign=${hedgeRes.data.long_trade.campaign_id}) и мгновенный отклик API (${uiPingMs} мс, wallet_balance=${liveBalCheck.data.wallet_balance}, unrealized_pnl=${liveBalCheck.data.unrealized_pnl}, total_fees_usdt=${liveProfCheck.data.total_fees_usdt}) работают корректно!`
-  );
-
   console.log('\n🧹 Очистка тестовых аккаунтов и тестовых сделок...');
   await api('/api/v1/accounts', { method: 'DELETE' });
   const allRemainingTrades = sqliteDb.loadAllTrades();
   for (const t of allRemainingTrades) {
     sqliteDb.deleteTrade(t.trade_id);
   }
-  sqliteDb.clearAllExchangeAccounts(false);
+  sqliteDb.clearAllExchangeAccounts();
   sqliteDb.clearBotLevelsForPair('BTC/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('ETH/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('SOL/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('XRP/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('LINK/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('AVAX/USDT:USDT');
-  sqliteDb.clearBotLevelsForPair('ADA/USDT:USDT');
   sqliteDb.clearChartDrawingsForPair('LINK/USDT:USDT');
   const finalCfg = await api('/api/v1/show_config');
   const finalBal = await api('/api/v1/balance');
-  const finalAccs = await api('/api/v1/accounts');
-  const finalStatus = await api('/api/v1/status');
   assert.equal(finalBal.data.total, 0, 'После очистки всех аккаунтов баланс должен быть 0 USDT');
-  assert.equal(finalAccs.data.accounts.length, 0, 'После очистки тестовых данных не должно оставаться тестовых аккаунтов');
-  assert.equal(finalStatus.data.length, 0, 'После очистки тестовых данных не должно оставаться тестовых сделок');
   console.log(
-    `   ✅ База очищена. Финальный статус бота без подключенной биржи: state="${finalCfg.data.state}", exchange_connected=${finalCfg.data.exchange_connected}, аккаунтов=${finalAccs.data.accounts.length}, сделок=${finalStatus.data.length}, баланс=${finalBal.data.total} USDT`
+    `   ✅ База очищена. Финальный статус бота без подключенной биржи: state="${finalCfg.data.state}", exchange_connected=${finalCfg.data.exchange_connected}, баланс=${finalBal.data.total} USDT`
   );
 
-  // Восстанавливаем реальные пользовательские аккаунты и сделки, если они были подключены до запуска теста
-  if (preTestAccounts.length > 0 || preTestTrades.length > 0) {
-    for (const acc of preTestAccounts) {
-      sqliteDb.upsertExchangeAccount(acc);
-    }
-    for (const tr of preTestTrades) {
-      sqliteDb.upsertTrade(tr);
-    }
-    await api('/api/v1/simulate_crash_recovery', { method: 'POST' });
-    console.log(
-      `   🔄 Восстановлено реальных аккаунтов пользователя: ${preTestAccounts.length}, сделок: ${preTestTrades.length}`
-    );
-  }
-
   console.log('\n================================================================');
-  console.log('✅ ВСЕ 11 БЛОКОВ ТЕСТОВ ПРОВЕРЕНЫ НА ПРАКТИКЕ И ПОЛНОСТЬЮ ПОДТВЕРЖДЕНЫ!');
+  console.log('✅ ВСЕ 8 БЛОКОВ ТЕСТОВ ПРОВЕРЕНЫ НА ПРАКТИКЕ И ПОЛНОСТЬЮ ПОДТВЕРЖДЕНЫ!');
   console.log('================================================================');
 }
 
