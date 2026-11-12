@@ -62,6 +62,7 @@ export const SiteLoginScreen: React.FC<SiteLoginScreenProps> = ({
   const [login, setLogin] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  const [inputUnlocked, setInputUnlocked] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -160,7 +161,7 @@ export const SiteLoginScreen: React.FC<SiteLoginScreenProps> = ({
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="p-5 space-y-3.5">
+        <form onSubmit={handleSubmit} autoComplete="off" className="p-5 space-y-3.5">
           {error && (
             <div className="p-2.5 rounded-lg bg-rose-500/15 border border-rose-500/40 text-rose-300 text-[12px]">
               {error}
@@ -173,10 +174,19 @@ export const SiteLoginScreen: React.FC<SiteLoginScreenProps> = ({
             </label>
             <input
               type="text"
+              name="scalpbot_owner_id_noautofill"
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              data-lpignore="true"
+              data-form-type="other"
+              readOnly={!inputUnlocked}
+              onFocus={() => setInputUnlocked(true)}
               value={login}
               onChange={(e) => setLogin(e.target.value)}
-              autoFocus
               required
+              placeholder="Введите логин владельца"
               className="w-full px-3 py-2 rounded-lg bg-[#0f1216] border border-[#2d333f] text-[13px] text-white focus:outline-none focus:border-[#00b4d8]"
             />
           </div>
@@ -188,9 +198,19 @@ export const SiteLoginScreen: React.FC<SiteLoginScreenProps> = ({
             <div className="relative">
               <input
                 type={showPassword ? 'text' : 'password'}
+                name="scalpbot_owner_secret_noautofill"
+                autoComplete="new-password"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                data-lpignore="true"
+                data-form-type="other"
+                readOnly={!inputUnlocked}
+                onFocus={() => setInputUnlocked(true)}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
+                placeholder="Введите пароль"
                 className="w-full pl-3 pr-9 py-2 rounded-lg bg-[#0f1216] border border-[#2d333f] text-[13px] text-white focus:outline-none focus:border-[#00b4d8]"
               />
               <button

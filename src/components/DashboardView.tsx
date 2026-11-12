@@ -44,7 +44,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [profitMode, setProfitMode] = useState<'Абс $' | 'Отн %'>('Отн %');
   const [binsCount, setBinsCount] = useState<'15' | '20' | '30'>('20');
 
-  // 1. Live Account Balance and Equity Calculation (strictly scoped to current user's deposit)
+  // 1. Live Account Balance and Equity Calculation (1:1 with Exchange API)
   const ownerAccount =
     accounts.find((a) => a.enabled && a.is_owner) || accounts.find((a) => a.enabled);
   const startingBalance =
@@ -61,12 +61,22 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const botName = String(botConfig?.bot_name || 'ScalpBot');
   const strategyName = String(botConfig?.strategy || 'ScalpingStrategy (v2.5-MTF)');
 
-  // 2. Open Trades Metrics
-  const openProfitAbs = openTrades.reduce((acc, t) => acc + (t.profit_abs || 0), 0);
-  const openStakeSum = openTrades.reduce((acc, t) => acc + (t.stake_amount || 0), 0);
+  // 2. Open Trades Metrics (1:1 with Exchange Unrealized PNL & Margin)
+  const tradesOpenProfitSum = openTrades.reduce((acc, t) => acc + (t.profit_abs || 0), 0);
+  const openProfitAbs =
+    typeof balance?.unrealized_pnl === 'number' &&
+    Number.isFinite(balance.unrealized_pnl) &&
+    (balance.unrealized_pnl !== 0 || openTrades.length === 0)
+      ? balance.unrealized_pnl
+      : tradesOpenProfitSum;
+  const tradesOpenStakeSum = openTrades.reduce((acc, t) => acc + (t.stake_amount || 0), 0);
+  const openStakeSum =
+    typeof balance?.used_margin === 'number' && balance.used_margin > 0
+      ? balance.used_margin
+      : tradesOpenStakeSum;
   const openProfitPct = openStakeSum > 0 ? (openProfitAbs / openStakeSum) * 100 : 0;
 
-  // 3. Closed Trades Metrics (strictly real net profit after 0.06% exchange fees)
+  // 3. Closed Trades Metrics (strictly real net profit after exchange fees)
   const closedTradesChronological = useMemo(
     () =>
       [...closedTrades].sort(
@@ -123,10 +133,27 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       ? 100
       : 0;
 
-  // 4. Current Equity and Free Margin
-  const currentEquity = startingBalance + closedProfitAbs + openProfitAbs;
-  const freeMargin = Math.max(0, currentEquity - openStakeSum);
-  const marginUsagePct = currentEquity > 0 ? (openStakeSum / currentEquity) * 100 : 0;
+  // 4. Exact Wallet Balance (1:1 Exchange Balance), Current Equity, and Free Margin
+  const walletBalance =
+    typeof balance?.wallet_balance === 'number' && balance.wallet_balance > 0
+      ? balance.wallet_balance
+      : typeof balance?.total === 'number' && balance.total > 0
+      ? balance.total
+      : ownerAccount?.wallet_balance_usdt && ownerAccount.wallet_balance_usdt > 0
+      ? ownerAccount.wallet_balance_usdt
+      : ownerAccount?.balance_usdt && ownerAccount.balance_usdt > 0
+      ? ownerAccount.balance_usdt
+      : startingBalance + closedProfitAbs;
+
+  const currentEquity =
+    typeof balance?.equity_balance === 'number' && balance.equity_balance > 0
+      ? balance.equity_balance
+      : walletBalance + openProfitAbs;
+  const freeMargin =
+    typeof balance?.available_balance === 'number' && balance.available_balance > 0
+      ? balance.available_balance
+      : Math.max(0, currentEquity - openStakeSum);
+  const marginUsagePct = walletBalance > 0 ? (openStakeSum / walletBalance) * 100 : 0;
 
   // 5. Dynamic Time-based Profit aggregation (Days / Weeks / Months) from real chronological trades
   const timeBasedData = useMemo(() => {
@@ -305,20 +332,19 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       ===================================================================== */}
       <div className="bg-[#14181f] border-b border-[#242b35] px-4 py-3">
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-          {/* 1. Общий баланс (Авто-реинвест / Сложный процент) */}
+          {/* 1. Общий баланс биржи (1:1 Wallet Balance с биржи + Реинвест) */}
           <div className="bg-[#191e26] border border-[#2b3340] rounded-[6px] p-2.5 flex flex-col justify-between">
             <div className="flex items-center justify-between text-[#94a3b8] text-[11px]">
-              <span className="font-medium">Реинвест-капитал</span>
+              <span className="font-medium">Баланс биржи (Balance)</span>
               <Wallet className="w-3.5 h-3.5 text-[#38bdf8]" />
             </div>
             <div className="mt-1">
               <div className="text-[17px] font-bold text-white tracking-tight font-mono">
-                {fmtComma(currentEquity, 2)}{' '}
+                {fmtComma(walletBalance, 2)}{' '}
                 <span className="text-[11px] font-normal text-[#94a3b8]">USDT</span>
               </div>
               <div className="text-[10px] text-[#64748b] mt-0.5">
-                Старт: ${fmtComma(startingBalance, 0)} | Вход 0.5%: $
-                {fmtComma(Math.max(0, startingBalance + closedProfitAbs) * 0.005, 2)}
+                Equity: ${fmtComma(currentEquity, 2)} | Старт: ${fmtComma(startingBalance, 0)}
               </div>
             </div>
           </div>
@@ -335,7 +361,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <span className="text-[11px] font-normal text-[#94a3b8]">USDT</span>
               </div>
               <div className="text-[10px] text-[#64748b] mt-0.5">
-                Доступно для входов и DCA
+                Доступно для входов и DCA (вход 0.5%: ${fmtComma(walletBalance * 0.005, 2)})
               </div>
             </div>
           </div>
@@ -352,12 +378,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <span className="text-[11px] font-normal text-[#94a3b8]">USDT</span>
               </div>
               <div className="text-[10px] text-[#f59e0b] mt-0.5">
-                {marginUsagePct.toFixed(1)}% от капитала (сложный %)
+                {marginUsagePct.toFixed(1)}% от баланса биржи
               </div>
             </div>
           </div>
 
-          {/* 4. Плавающий PnL */}
+          {/* 4. Плавающий PnL (Unrealized PNL с биржи 1:1) */}
           <div className="bg-[#191e26] border border-[#2b3340] rounded-[6px] p-2.5 flex flex-col justify-between">
             <div className="flex items-center justify-between text-[#94a3b8] text-[11px]">
               <span className="font-medium">Плавающий PnL</span>
@@ -385,15 +411,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 }`}
               >
                 {openProfitPct >= 0 ? '+' : ''}
-                {openProfitPct.toFixed(2)}% ROI на маржу
+                {openProfitPct.toFixed(2)}% ROI на маржу (Live API)
               </div>
             </div>
           </div>
 
-          {/* 5. Зафиксированный PnL и цель >= 50%/мес */}
+          {/* 5. Зафиксированный PnL с учетом всех комиссий биржи */}
           <div className="bg-[#191e26] border border-[#2b3340] rounded-[6px] p-2.5 flex flex-col justify-between">
             <div className="flex items-center justify-between text-[#94a3b8] text-[11px]">
-              <span className="font-medium">Чистый PnL (Цель 50%+)</span>
+              <span className="font-medium">Чистый PnL (Биржа)</span>
               <TrendingUp className="w-3.5 h-3.5 text-[#10b981]" />
             </div>
             <div className="mt-1">
@@ -407,7 +433,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </div>
               <div className="text-[10px] text-[#10b981] mt-0.5">
                 {closedProfitPct >= 0 ? '+' : ''}
-                {closedProfitPct.toFixed(2)}% к депо | Цель: &ge;50%/мес
+                {closedProfitPct.toFixed(2)}% к депо | Комиссии: ${fmtComma(totalFeesPaid, 2)}
               </div>
             </div>
           </div>
@@ -547,7 +573,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       />
                     </td>
                     <td className="py-2.5 px-3 font-mono text-[#38bdf8]">
-                      {fmtComma(currentEquity, 2)} USDT
+                      {fmtComma(walletBalance, 2)} USDT
                     </td>
                     <td className="py-2.5 px-3 font-mono text-[#10b981]">{winRatePct.toFixed(0)}%</td>
                   </tr>

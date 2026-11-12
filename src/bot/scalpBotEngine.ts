@@ -53,8 +53,14 @@ export interface MarketStructureResult {
 
 export interface MultiTimeframeAnalysis {
   d1_trend: 'BULLISH' | 'BEARISH' | 'MILD_BULLISH' | 'MILD_BEARISH' | 'NEUTRAL';
+  h4_trend?: 'BULLISH' | 'BEARISH' | 'MILD_BULLISH' | 'MILD_BEARISH' | 'NEUTRAL';
+  h1_trend?: 'BULLISH' | 'BEARISH' | 'MILD_BULLISH' | 'MILD_BEARISH' | 'NEUTRAL';
+  market_trend?: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   d1_high: number;
   d1_low: number;
+  rsi_1d: number;
+  rsi_4h: number;
+  rsi_1h: number;
   key_4h_support: number;
   key_4h_resistance: number;
   pos_4h_pct: number;
@@ -188,24 +194,26 @@ export function calcRsiSeries(closes: number[], period = 14): number[] {
   const rsi = new Array<number>(n).fill(50);
   if (n < period + 1) return rsi;
 
-  const gains = new Array<number>(n).fill(0);
-  const losses = new Array<number>(n).fill(0);
-  for (let i = 1; i < n; i++) {
+  let avgGain = 0;
+  let avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
     const d = closes[i] - closes[i - 1];
-    if (d > 0) gains[i] = d;
-    else if (d < 0) losses[i] = -d;
+    if (d > 0) avgGain += d;
+    else if (d < 0) avgLoss += -d;
   }
+  avgGain /= period;
+  avgLoss /= period;
 
-  for (let i = period; i < n; i++) {
-    let sumG = 0;
-    let sumL = 0;
-    for (let j = i - period + 1; j <= i; j++) {
-      sumG += gains[j];
-      sumL += losses[j];
-    }
-    const avgG = sumG / period;
-    const avgL = sumL / period;
-    const rs = avgG / (avgL + 1e-9);
+  const firstRs = avgGain / (avgLoss + 1e-9);
+  rsi[period] = 100 - 100 / (1 + firstRs);
+
+  for (let i = period + 1; i < n; i++) {
+    const d = closes[i] - closes[i - 1];
+    const gain = d > 0 ? d : 0;
+    const loss = d < 0 ? -d : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    const rs = avgGain / (avgLoss + 1e-9);
     rsi[i] = 100 - 100 / (1 + rs);
   }
   return rsi;
@@ -406,9 +414,12 @@ export function detectMarketStructure(
   const subset = candles.slice(-Math.max(15, lookback));
   const currentPrice = subset[subset.length - 1].close;
 
+  // Use recent active window (up to 48 bars = 8 days on 4H or 48h on 1H) for active range position
+  // so ancient highs/lows from 40 days ago don't pin range_position_pct at 1% or 99%
+  const activeWindow = subset.slice(-Math.min(subset.length, 48));
   let rangeHigh = -Infinity;
   let rangeLow = Infinity;
-  for (const c of subset) {
+  for (const c of activeWindow) {
     if (c.high > rangeHigh) rangeHigh = c.high;
     if (c.low < rangeLow) rangeLow = c.low;
   }
@@ -431,45 +442,78 @@ export function detectMarketStructure(
   }
 
   const minDistPct = 0.8;
+  const maxActiveLevelDistPct = 15.0;
   const levelsWithHistory = buildLevelsWithHistory(subset, 3, 3, 0.6);
 
-  const supportsHist = levelsWithHistory.filter(
+  const supportsHistAll = levelsWithHistory.filter(
     (l) => l.type === 'support' && ((currentPrice - l.price) / currentPrice) * 100 >= minDistPct
   );
-  const resistancesHist = levelsWithHistory.filter(
+  const supportsHistNear = supportsHistAll.filter(
+    (l) => ((currentPrice - l.price) / currentPrice) * 100 <= maxActiveLevelDistPct
+  );
+  const supportsPool = supportsHistNear.length > 0 ? supportsHistNear : supportsHistAll;
+
+  const resistancesHistAll = levelsWithHistory.filter(
     (l) => l.type === 'resistance' && ((l.price - currentPrice) / currentPrice) * 100 >= minDistPct
   );
+  const resistancesHistNear = resistancesHistAll.filter(
+    (l) => ((l.price - currentPrice) / currentPrice) * 100 <= maxActiveLevelDistPct
+  );
+  const resistancesPool =
+    resistancesHistNear.length > 0 ? resistancesHistNear : resistancesHistAll;
 
   const supportHistory =
-    supportsHist.length > 0
-      ? supportsHist.reduce((best, cur) => (cur.strength_score > best.strength_score ? cur : best))
+    supportsPool.length > 0
+      ? supportsPool.reduce((best, cur) => {
+          const distBest = Math.abs(currentPrice - best.price) / Math.max(1e-9, currentPrice) * 100;
+          const distCur = Math.abs(currentPrice - cur.price) / Math.max(1e-9, currentPrice) * 100;
+          const scoreBest = best.strength_score / (1 + distBest * 0.12);
+          const scoreCur = cur.strength_score / (1 + distCur * 0.12);
+          return scoreCur > scoreBest ? cur : best;
+        })
       : null;
 
   const resistanceHistory =
-    resistancesHist.length > 0
-      ? resistancesHist.reduce((best, cur) =>
-          cur.strength_score > best.strength_score ? cur : best
-        )
+    resistancesPool.length > 0
+      ? resistancesPool.reduce((best, cur) => {
+          const distBest = Math.abs(cur.price - currentPrice) / Math.max(1e-9, currentPrice) * 100;
+          const distCur = Math.abs(best.price - currentPrice) / Math.max(1e-9, currentPrice) * 100;
+          const scoreBest = best.strength_score / (1 + distCur * 0.12);
+          const scoreCur = cur.strength_score / (1 + distBest * 0.12);
+          return scoreCur > scoreBest ? cur : best;
+        })
       : null;
 
   let nearestSupport = rangeLow;
-  if (supportHistory) {
+  if (
+    supportHistory &&
+    ((currentPrice - supportHistory.price) / currentPrice) * 100 <= maxActiveLevelDistPct
+  ) {
     nearestSupport = supportHistory.price;
   } else {
-    const supportsBelow = swingLows.filter(
-      (s) => ((currentPrice - s) / currentPrice) * 100 >= minDistPct
-    );
+    const supportsBelow = swingLows.filter((s) => {
+      const d = ((currentPrice - s) / currentPrice) * 100;
+      return d >= minDistPct && d <= maxActiveLevelDistPct;
+    });
     if (supportsBelow.length > 0) nearestSupport = Math.max(...supportsBelow);
+    else if (rangeLow < currentPrice * 0.992) nearestSupport = rangeLow;
+    else nearestSupport = currentPrice * 0.975;
   }
 
   let nearestResistance = rangeHigh;
-  if (resistanceHistory) {
+  if (
+    resistanceHistory &&
+    ((resistanceHistory.price - currentPrice) / currentPrice) * 100 <= maxActiveLevelDistPct
+  ) {
     nearestResistance = resistanceHistory.price;
   } else {
-    const resistancesAbove = swingHighs.filter(
-      (r) => ((r - currentPrice) / currentPrice) * 100 >= minDistPct
-    );
+    const resistancesAbove = swingHighs.filter((r) => {
+      const d = ((r - currentPrice) / currentPrice) * 100;
+      return d >= minDistPct && d <= maxActiveLevelDistPct;
+    });
     if (resistancesAbove.length > 0) nearestResistance = Math.min(...resistancesAbove);
+    else if (rangeHigh > currentPrice * 1.008) nearestResistance = rangeHigh;
+    else nearestResistance = currentPrice * 1.025;
   }
 
   const rawTp = nearestResistance * 0.998;
@@ -495,6 +539,23 @@ export function detectMarketStructure(
   };
 }
 
+function classifyTimeframeTrend(
+  candles: OhlcvCandle[]
+): 'BULLISH' | 'BEARISH' | 'MILD_BULLISH' | 'MILD_BEARISH' | 'NEUTRAL' {
+  if (!candles || candles.length < 15) return 'NEUTRAL';
+  const closes = candles.map((c) => c.close);
+  const emaFastSeries = calcEmaSeries(closes, Math.min(20, closes.length));
+  const emaSlowSeries = calcEmaSeries(closes, Math.min(50, closes.length));
+  const lastClose = closes[closes.length - 1];
+  const ema20 = emaFastSeries[emaFastSeries.length - 1];
+  const ema50 = emaSlowSeries[emaSlowSeries.length - 1];
+
+  if (lastClose > ema20 && ema20 > ema50) return 'BULLISH';
+  if (lastClose < ema20 && ema20 < ema50) return 'BEARISH';
+  if (lastClose > ema20) return 'MILD_BULLISH';
+  return 'MILD_BEARISH';
+}
+
 export function analyzeMultiTimeframe(
   pair: string,
   candles1h: OhlcvCandle[],
@@ -509,30 +570,75 @@ export function analyzeMultiTimeframe(
   let d1Low = currentPrice * 0.9;
 
   if (candles1d.length >= 15) {
-    const closes1d = candles1d.map((c) => c.close);
-    const ema20Series = calcEmaSeries(closes1d, 20);
-    const ema50Series = calcEmaSeries(closes1d, Math.min(50, closes1d.length));
-    const d1Ema20 = ema20Series[ema20Series.length - 1];
-    const d1Ema50 = ema50Series[ema50Series.length - 1];
+    d1Trend = classifyTimeframeTrend(candles1d);
     d1High = Math.max(...candles1d.map((c) => c.high));
     d1Low = Math.min(...candles1d.map((c) => c.low));
-    const last1dClose = closes1d[closes1d.length - 1];
-
-    if (last1dClose > d1Ema20 && d1Ema20 > d1Ema50) d1Trend = 'BULLISH';
-    else if (last1dClose < d1Ema20 && d1Ema20 < d1Ema50) d1Trend = 'BEARISH';
-    else if (last1dClose > d1Ema20) d1Trend = 'MILD_BULLISH';
-    else d1Trend = 'MILD_BEARISH';
   }
+
+  const h4Trend = classifyTimeframeTrend(candles4h);
+  const h1Trend = classifyTimeframeTrend(candles1h);
+
+  // Compute composite market trend from 1D, 4H, and 1H so the bot knows the real direction of the market
+  let trendScore = 0;
+  if (d1Trend === 'BULLISH') trendScore += 2;
+  else if (d1Trend === 'MILD_BULLISH') trendScore += 1;
+  else if (d1Trend === 'BEARISH') trendScore -= 2;
+  else if (d1Trend === 'MILD_BEARISH') trendScore -= 1;
+
+  if (h4Trend === 'BULLISH') trendScore += 2;
+  else if (h4Trend === 'MILD_BULLISH') trendScore += 1;
+  else if (h4Trend === 'BEARISH') trendScore -= 2;
+  else if (h4Trend === 'MILD_BEARISH') trendScore -= 1;
+
+  if (h1Trend === 'BULLISH') trendScore += 1.5;
+  else if (h1Trend === 'MILD_BULLISH') trendScore += 0.5;
+  else if (h1Trend === 'BEARISH') trendScore -= 1.5;
+  else if (h1Trend === 'MILD_BEARISH') trendScore -= 0.5;
+
+  const isBullish4h = h4Trend === 'BULLISH' || h4Trend === 'MILD_BULLISH';
+  const isBearish4h = h4Trend === 'BEARISH' || h4Trend === 'MILD_BEARISH';
+  const isBullish1h = h1Trend === 'BULLISH' || h1Trend === 'MILD_BULLISH';
+  const isBearish1h = h1Trend === 'BEARISH' || h1Trend === 'MILD_BEARISH';
+
+  // If 4H and 1H both agree on direction, that defines the active trading trend (1D EMA50 lags during sharp reversals like -38% dumps)
+  const marketTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL' =
+    isBearish4h && isBearish1h
+      ? 'BEARISH'
+      : isBullish4h && isBullish1h
+      ? 'BULLISH'
+      : trendScore >= 1.5
+      ? 'BULLISH'
+      : trendScore <= -1.5
+      ? 'BEARISH'
+      : 'NEUTRAL';
+
+  // Calculate Wilder's RSI (14) on 1D, 4H, and 1H timeframes
+  const rsi1dSeries =
+    candles1d.length >= 15 ? calcRsiSeries(candles1d.map((c) => c.close), 14) : [];
+  const rsi4hSeries =
+    candles4h.length >= 15 ? calcRsiSeries(candles4h.map((c) => c.close), 14) : [];
+  const rsi1hSeries =
+    candles1h.length >= 15 ? calcRsiSeries(candles1h.map((c) => c.close), 14) : [];
+
+  const rsi1d = Number(
+    (rsi1dSeries.length > 0 ? rsi1dSeries[rsi1dSeries.length - 1] : 50).toFixed(2)
+  );
+  const rsi4h = Number(
+    (rsi4hSeries.length > 0 ? rsi4hSeries[rsi4hSeries.length - 1] : 50).toFixed(2)
+  );
+  const rsi1h = Number(
+    (rsi1hSeries.length > 0 ? rsi1hSeries[rsi1hSeries.length - 1] : 50).toFixed(2)
+  );
 
   const structure4h =
     candles4h.length >= 15
-      ? detectMarketStructure(candles4h, candles4h.length)
-      : detectMarketStructure(candles1h, 40);
+      ? detectMarketStructure(candles4h, Math.min(120, candles4h.length))
+      : detectMarketStructure(candles1h, 48);
 
   const structure1d =
     candles1d.length >= 30 ? detectMarketStructure(candles1d, candles1d.length) : null;
 
-  const structure1h = detectMarketStructure(candles1h, 30);
+  const structure1h = detectMarketStructure(candles1h, 36);
 
   const hasCustomSup = Boolean(customLevels?.support && customLevels.support > 0);
   const hasCustomRes = Boolean(customLevels?.resistance && customLevels.resistance > 0);
@@ -565,23 +671,60 @@ export function analyzeMultiTimeframe(
   let allowLong = true;
   let rejectionReasonLong = '';
 
-  if (distTo4hResPct < 0.85) {
+  // 1. Overbought MTF RSI & Resistance Guard for LONG:
+  // Never enter Long on overbought 1D/4H/1H pumps (e.g. ARIA pump where 1D RSI > 68 or 4H RSI > 62)
+  const maxAllowed1hRsiForLong = marketTrend === 'BULLISH' ? 62.0 : 45.0;
+  if (rsi1d > 68.0 || rsi4h > 62.0 || rsi1h > maxAllowed1hRsiForLong) {
+    allowLong = false;
+    rejectionReasonLong = `MTF RSI фильтр блокирует LONG: 1D RSI=${rsi1d} (макс 68), 4H RSI=${rsi4h} (макс 62), 1H RSI=${rsi1h} (макс ${maxAllowed1hRsiForLong})`;
+  } else if ((marketTrend !== 'BULLISH' || hasCustomRes) && distTo4hResPct < 0.85) {
     allowLong = false;
     rejectionReasonLong = `Close to 4H Resistance (${key4hResistance}, only +${distTo4hResPct.toFixed(2)}% room)`;
-  } else if (pos4hPct > 85.0 && d1Trend !== 'BULLISH') {
+  } else if (marketTrend !== 'BULLISH' && pos4hPct > 82.0) {
     allowLong = false;
-    rejectionReasonLong = `Top of 4H range (${pos4hPct.toFixed(1)}%) without strong 1D Bullish trend (${d1Trend})`;
+    rejectionReasonLong = `Top of 4H range (${pos4hPct.toFixed(1)}%) — overbought zone`;
+  } else if (isPumpExhaustion(candles1h)) {
+    allowLong = false;
+    rejectionReasonLong = `Parabolic pump exhaustion detected on 1H`;
+  } else if (isKnifeDrop(candles1h)) {
+    allowLong = false;
+    rejectionReasonLong = `Falling knife detected on 1H — waiting for reversal`;
+  } else if (marketTrend === 'BEARISH') {
+    // 2. Trend Protection: In a BEARISH market (4H + 1H downtrend), forbid opening Longs against the trend
+    allowLong = false;
+    rejectionReasonLong = `Медвежий тренд рынка (1D=${d1Trend}, 4H=${h4Trend}, 1H=${h1Trend}) — вход в LONG против тренда заблокирован`;
   }
 
   let allowShort = true;
   let rejectionReasonShort = '';
 
-  if (distTo4hSupPct < 0.85) {
+  // 1. Oversold & Support Guard for SHORT:
+  // In a BEARISH market trend, RSI naturally stays between 24 and 55 on 1H/4H, so Short is allowed along the trend!
+  // In a BULLISH market trend, Short is only allowed on overbought resistance rejection (1H RSI >= 55).
+  const minAllowed1hRsiForShort = marketTrend === 'BEARISH' ? 24.0 : 54.0;
+  const minAllowed4hRsiForShort = marketTrend === 'BEARISH' ? 22.0 : 38.0;
+  const minAllowed1dRsiForShort = marketTrend === 'BEARISH' ? 20.0 : 32.0;
+
+  if (
+    rsi1d < minAllowed1dRsiForShort ||
+    rsi4h < minAllowed4hRsiForShort ||
+    rsi1h < minAllowed1hRsiForShort
+  ) {
+    allowShort = false;
+    rejectionReasonShort = `MTF RSI фильтр блокирует SHORT: 1D RSI=${rsi1d} (мин ${minAllowed1dRsiForShort}), 4H RSI=${rsi4h} (мин ${minAllowed4hRsiForShort}), 1H RSI=${rsi1h} (мин ${minAllowed1hRsiForShort})`;
+  } else if (marketTrend !== 'BEARISH' && distTo4hSupPct < 0.85) {
     allowShort = false;
     rejectionReasonShort = `Close to 4H Support (${key4hSupport}, only -${distTo4hSupPct.toFixed(2)}% room)`;
-  } else if (pos4hPct < 15.0 && d1Trend !== 'BEARISH') {
+  } else if (marketTrend !== 'BEARISH' && pos4hPct < 20.0) {
     allowShort = false;
-    rejectionReasonShort = `Bottom of 4H range (${pos4hPct.toFixed(1)}%) without strong 1D Bearish trend (${d1Trend})`;
+    rejectionReasonShort = `Bottom of 4H range (${pos4hPct.toFixed(1)}%) — oversold zone`;
+  } else if (isKnifeDrop(candles1h)) {
+    allowShort = false;
+    rejectionReasonShort = `Cascade knife drop detected on 1H`;
+  } else if (marketTrend === 'BULLISH') {
+    // 2. Trend Protection: In a BULLISH market (4H + 1H uptrend), forbid opening Shorts against the uptrend
+    allowShort = false;
+    rejectionReasonShort = `Бычий тренд рынка (1D=${d1Trend}, 4H=${h4Trend}, 1H=${h1Trend}) — вход в SHORT против тренда заблокирован`;
   }
 
   // Long Fast Scalp TP: 0.8% to 1.5% price move (+20% to +37.5% gross / ~17%-34% net ROI on 25x after 0.06% fees)
@@ -659,13 +802,27 @@ export function analyzeMultiTimeframe(
         )
       : null;
 
-  if (!hasCustomSup && supportHistory && supportHistory.breaks > supportHistory.bounces) {
+  if (
+    !hasCustomSup &&
+    marketTrend !== 'BULLISH' &&
+    supportHistory &&
+    supportHistory.breaks > supportHistory.bounces
+  ) {
     allowLong = false;
-    rejectionReasonLong = `Support at ${supportHistory.price} has weak history: ${supportHistory.bounces} bounces vs ${supportHistory.breaks} breaks`;
+    rejectionReasonLong =
+      rejectionReasonLong ||
+      `Support at ${supportHistory.price} has weak history: ${supportHistory.bounces} bounces vs ${supportHistory.breaks} breaks`;
   }
-  if (!hasCustomRes && resistanceHistory && resistanceHistory.breaks > resistanceHistory.bounces) {
+  if (
+    !hasCustomRes &&
+    marketTrend !== 'BEARISH' &&
+    resistanceHistory &&
+    resistanceHistory.breaks > resistanceHistory.bounces
+  ) {
     allowShort = false;
-    rejectionReasonShort = `Resistance at ${resistanceHistory.price} has weak history: ${resistanceHistory.bounces} bounces vs ${resistanceHistory.breaks} breaks`;
+    rejectionReasonShort =
+      rejectionReasonShort ||
+      `Resistance at ${resistanceHistory.price} has weak history: ${resistanceHistory.bounces} bounces vs ${resistanceHistory.breaks} breaks`;
   }
 
   // Collect top institutional levels (4H + 1D) for chart visualization
@@ -679,14 +836,20 @@ export function analyzeMultiTimeframe(
   ].sort((a, b) => b.strength_score - a.strength_score);
 
   const levelMapSummary =
-    `1D: ${d1Trend} [${d1Low.toPrecision(5)} - ${d1High.toPrecision(5)}] | ` +
+    `Trend: ${marketTrend} (1D=${d1Trend} RSI ${rsi1d}, 4H=${h4Trend} RSI ${rsi4h}, 1H=${h1Trend} RSI ${rsi1h}) | ` +
     `4H: Sup=${key4hSupport.toPrecision(6)} / Res=${key4hResistance.toPrecision(6)} (Pos: ${pos4hPct.toFixed(0)}%) | ` +
     `1H: Sup=${local1hSupport.toPrecision(6)} / Res=${local1hResistance.toPrecision(6)} (Pos: ${pos1hPct.toFixed(0)}%)`;
 
   return {
     d1_trend: d1Trend,
+    h4_trend: h4Trend,
+    h1_trend: h1Trend,
+    market_trend: marketTrend,
     d1_high: d1High,
     d1_low: d1Low,
+    rsi_1d: rsi1d,
+    rsi_4h: rsi4h,
+    rsi_1h: rsi1h,
     key_4h_support: key4hSupport,
     key_4h_resistance: key4hResistance,
     pos_4h_pct: pos4hPct,
@@ -790,7 +953,8 @@ export function checkCandleRejection(
   const body = Math.abs(closeP - openP);
 
   if (!isShort) {
-    const nearLevel = lowP <= level * (1 + tolerancePct / 100.0);
+    const nearLevel =
+      lowP <= level * (1 + tolerancePct / 100.0) || closeP <= level * (1 + tolerancePct / 100.0);
     if (!nearLevel) {
       return { confirmed: false, reason: `Price ${lowP} not testing support ${level}` };
     }
@@ -798,19 +962,20 @@ export function checkCandleRejection(
       return { confirmed: false, reason: 'Knife drop detected (no lower wick, strong dump candle)' };
     }
     const lowerWick = Math.min(openP, closeP) - lowP;
-    const hasRejectionWick = lowerWick / candleRange >= 0.35 || lowerWick >= body * 0.8;
-    const closedAboveLevel = closeP >= level * 0.998;
+    const hasRejectionWick = lowerWick / candleRange >= 0.2 || lowerWick >= body * 0.5;
+    const reachedLevelZone = closeP <= level * 1.002 || lowP <= level;
     const isGreen = closeP > openP;
     const bullishEngulfing = isGreen && closeP > prevRow.open && prevRow.close < prevRow.open;
-    const confirmed = closedAboveLevel && (hasRejectionWick || isGreen || bullishEngulfing);
+    const confirmed = reachedLevelZone && (hasRejectionWick || isGreen || bullishEngulfing || closeP <= level);
     return {
       confirmed,
       reason: confirmed
-        ? 'Support bounce confirmed by price action'
+        ? 'Support / DCA level reached and confirmed by price action'
         : 'Waiting for support bounce confirmation',
     };
   } else {
-    const nearLevel = highP >= level * (1 - tolerancePct / 100.0);
+    const nearLevel =
+      highP >= level * (1 - tolerancePct / 100.0) || closeP >= level * (1 - tolerancePct / 100.0);
     if (!nearLevel) {
       return { confirmed: false, reason: `Price ${highP} not testing resistance ${level}` };
     }
@@ -818,15 +983,15 @@ export function checkCandleRejection(
       return { confirmed: false, reason: 'Rocket pump detected (no upper wick, strong pump candle)' };
     }
     const upperWick = highP - Math.max(openP, closeP);
-    const hasRejectionWick = upperWick / candleRange >= 0.35 || upperWick >= body * 0.8;
-    const closedBelowLevel = closeP <= level * 1.002;
+    const hasRejectionWick = upperWick / candleRange >= 0.2 || upperWick >= body * 0.5;
+    const reachedLevelZone = closeP >= level * 0.998 || highP >= level;
     const isRed = closeP < openP;
     const bearishEngulfing = isRed && closeP < prevRow.open && prevRow.close > prevRow.open;
-    const confirmed = closedBelowLevel && (hasRejectionWick || isRed || bearishEngulfing);
+    const confirmed = reachedLevelZone && (hasRejectionWick || isRed || bearishEngulfing || closeP >= level);
     return {
       confirmed,
       reason: confirmed
-        ? 'Resistance rejection confirmed by price action'
+        ? 'Resistance / DCA level reached and confirmed by price action'
         : 'Waiting for resistance rejection confirmation',
     };
   }
@@ -846,24 +1011,24 @@ export function checkRsiCondition(
   const rsiPrev = rsiSeries[rsiSeries.length - 2];
 
   if (!isShort) {
-    const isOversold = rsiNow <= 40.0;
-    const reversal = isOversold && (rsiNow > rsiPrev || rsiNow <= 30.0);
+    const isOversold = rsiNow <= 45.0;
+    const reversal = isOversold && (rsiNow > rsiPrev || rsiNow <= 32.0);
     return {
       confirmed: reversal,
       rsi: Number(rsiNow.toFixed(2)),
       reason: reversal
         ? `RSI ${rsiNow.toFixed(1)} oversold and turning up`
-        : `RSI ${rsiNow.toFixed(1)} not in reversal setup for Long`,
+        : `RSI ${rsiNow.toFixed(1)} not in reversal setup for Long (must be <= 45)`,
     };
   } else {
-    const isOverbought = rsiNow >= 60.0;
-    const reversal = isOverbought && (rsiNow < rsiPrev || rsiNow >= 70.0);
+    const isOverbought = rsiNow >= 55.0;
+    const reversal = isOverbought && (rsiNow < rsiPrev || rsiNow >= 68.0);
     return {
       confirmed: reversal,
       rsi: Number(rsiNow.toFixed(2)),
       reason: reversal
         ? `RSI ${rsiNow.toFixed(1)} overbought and turning down`
-        : `RSI ${rsiNow.toFixed(1)} not in reversal setup for Short`,
+        : `RSI ${rsiNow.toFixed(1)} not in reversal setup for Short (must be >= 55)`,
     };
   }
 }
@@ -873,7 +1038,8 @@ export function findStrongestDcaLevel(
   candles1d: OhlcvCandle[],
   currentPrice: number,
   isShort: boolean,
-  minDistPct = 1.5
+  minDistPct = 1.5,
+  maxDistPct = 12.0
 ): {
   price: number;
   strength_score: number;
@@ -911,13 +1077,14 @@ export function findStrongestDcaLevel(
     }
   }
 
+  // Filter levels strictly within [minDistPct, maxDistPct] so parabolic pumps never pick ancient levels 80% away
   const validLevels = allCandidates.filter((lvl) => {
     if (!isShort) {
       const distPct = ((currentPrice - lvl.price) / currentPrice) * 100.0;
-      return lvl.type === 'support' && distPct >= minDistPct;
+      return lvl.type === 'support' && distPct >= minDistPct && distPct <= maxDistPct;
     } else {
       const distPct = ((lvl.price - currentPrice) / currentPrice) * 100.0;
-      return lvl.type === 'resistance' && distPct >= minDistPct;
+      return lvl.type === 'resistance' && distPct >= minDistPct && distPct <= maxDistPct;
     }
   });
 
@@ -981,18 +1148,34 @@ export function isHedgeEntryCandidate(
 
 export function checkBtcMarketHealth(btc1hCandles: OhlcvCandle[]): {
   isSafe: boolean;
+  btcTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   reason: string;
   btcPrice?: number;
   candleChangePct?: number;
 } {
   if (!btc1hCandles || btc1hCandles.length < 20) {
-    return { isSafe: true, reason: 'Insufficient BTC data, proceeding with caution' };
+    return {
+      isSafe: true,
+      btcTrend: 'NEUTRAL',
+      reason: 'Insufficient BTC data, proceeding with caution',
+    };
   }
   const closes = btc1hCandles.map((c) => c.close);
+  const ema20Series = calcEmaSeries(closes, 20);
   const ema50Series = calcEmaSeries(closes, 50);
+  const rsiSeries = calcRsiSeries(closes, 14);
   const last = btc1hCandles[btc1hCandles.length - 1];
   const prev = btc1hCandles[btc1hCandles.length - 2];
+  const ema20 = ema20Series[ema20Series.length - 1];
   const ema50 = ema50Series[ema50Series.length - 1];
+  const btcRsi = rsiSeries[rsiSeries.length - 1];
+
+  const btcTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL' =
+    last.close > ema20 && ema20 >= ema50 * 0.998
+      ? 'BULLISH'
+      : last.close < ema20 && ema20 <= ema50 * 1.002
+      ? 'BEARISH'
+      : 'NEUTRAL';
 
   const candleChangePct =
     last.open > 0 ? ((last.close - last.open) / last.open) * 100.0 : 0;
@@ -1002,6 +1185,7 @@ export function checkBtcMarketHealth(btc1hCandles: OhlcvCandle[]): {
   if (candleChangePct < -2.0) {
     return {
       isSafe: false,
+      btcTrend: 'BEARISH',
       reason: `BTC flash dumping: ${candleChangePct.toFixed(2)}% in current 1h candle`,
       btcPrice: last.close,
       candleChangePct,
@@ -1010,6 +1194,7 @@ export function checkBtcMarketHealth(btc1hCandles: OhlcvCandle[]): {
   if (last.close < ema50 * 0.985 && candleChangePct < -0.8) {
     return {
       isSafe: false,
+      btcTrend: 'BEARISH',
       reason: `BTC breakdown below EMA 50 (${last.close.toFixed(1)} vs EMA50 ${ema50.toFixed(1)})`,
       btcPrice: last.close,
       candleChangePct,
@@ -1018,6 +1203,7 @@ export function checkBtcMarketHealth(btc1hCandles: OhlcvCandle[]): {
   if (candleChangePct < -1.0 && prevChangePct < -1.0) {
     return {
       isSafe: false,
+      btcTrend: 'BEARISH',
       reason: 'BTC consecutive sell-off: 2 hours of heavy selling',
       btcPrice: last.close,
       candleChangePct,
@@ -1026,7 +1212,13 @@ export function checkBtcMarketHealth(btc1hCandles: OhlcvCandle[]): {
 
   return {
     isSafe: true,
-    reason: 'BTC is stable / bullish',
+    btcTrend,
+    reason:
+      btcTrend === 'BEARISH'
+        ? `BTC в нисходящем тренде (RSI 1H=${btcRsi.toFixed(1)}, ниже EMA20/EMA50)`
+        : btcTrend === 'BULLISH'
+        ? `BTC в восходящем тренде (RSI 1H=${btcRsi.toFixed(1)}, выше EMA20/EMA50)`
+        : 'BTC нейтрален / в боковике',
     btcPrice: last.close,
     candleChangePct,
   };
@@ -1092,17 +1284,24 @@ export function evaluateScalpingStrategy(
   const redCandle = c.close < c.open;
 
   const volumeOk =
-    c.volume >= volMean[idx] * 0.7 || p.volume >= volMean[prev] * 0.95;
+    c.volume >= volMean[idx] * 0.65 || p.volume >= volMean[prev] * 0.85;
   const volumeTrendOk =
-    c.volume >= volMean[idx] * 0.8 || p.volume >= volMean[prev] * 1.05;
+    c.volume >= volMean[idx] * 0.7 || p.volume >= volMean[prev] * 0.9;
 
   // Support bounce / Resistance rejection (detect_reversal_patterns / detect_bearish_reversal_patterns)
   const body = Math.abs(c.close - c.open);
   const lowerWick = Math.min(c.open, c.close) - c.low;
   const upperWick = c.high - Math.max(c.open, c.close);
-  const hasLowerWick = lowerWick >= body * 0.5 || lowerWick >= c.close * 0.003;
-  const hasUpperWick = upperWick >= body * 0.5 || upperWick >= c.close * 0.003;
+  const hasLowerWick = lowerWick >= body * 0.5 || lowerWick >= c.close * 0.0025;
+  const hasUpperWick = upperWick >= body * 0.5 || upperWick >= c.close * 0.0025;
 
+  const trendBullish =
+    c.close > emaTrend[idx] * 0.996 && emaSlow[idx] >= emaTrend[idx] * 0.996;
+  const trendBearish =
+    c.close < emaTrend[idx] * 1.004 && emaSlow[idx] <= emaTrend[idx] * 1.004;
+
+  // --- LONG SIGNALS ---
+  // Mode A: Level Reversal Long (bounce from support in oversold zone)
   const supportBounce =
     c.low <= smartSupport * 1.008 &&
     c.close >= smartSupport * 0.995 &&
@@ -1112,36 +1311,48 @@ export function evaluateScalpingStrategy(
   const supportSignal = supportBounce || nearSupport;
 
   const waveOversoldCross =
-    wt1[idx] > wt2[idx] && (wt1[prev] <= wt2[prev] || wt2[idx] <= -25);
+    (wt1[idx] > wt2[idx] && (wt1[prev] <= wt2[prev] || wt2[idx] <= -25)) ||
+    (wt2[idx] <= -42 && wt1[idx] > wt1[prev]);
   const rsiOversoldOk =
-    rsiSeries[idx] <= 42 || (rsiSeries[idx] > rsiSeries[prev] && rsiSeries[idx] <= 55);
+    rsiSeries[idx] <= 45.0 && (rsiSeries[idx] <= 38.0 || rsiSeries[idx] > rsiSeries[prev]);
 
   const levelReversalEntryLong =
     supportSignal &&
     waveOversoldCross &&
     rsiOversoldOk &&
-    (greenCandle || c.close > c.low) &&
-    volumeOk;
+    (greenCandle || hasLowerWick) &&
+    volumeOk &&
+    !trendBearish &&
+    !isKnifeDrop(candles) &&
+    !isPumpExhaustion(candles);
 
-  const trendBullish =
-    c.close > emaTrend[idx] * 0.995 && emaSlow[idx] >= emaTrend[idx] * 0.995;
+  // Mode B: Trend Momentum / Pullback Long (trading along an active bullish trend)
   const emaCrossoverUp =
     emaFast[idx] > emaSlow[idx] && emaFast[prev] <= emaSlow[prev];
   const emaBounceUp =
     c.low <= emaSlow[idx] * 1.008 &&
     c.close > emaSlow[idx] &&
-    emaFast[idx] >= emaSlow[idx];
+    emaFast[idx] >= emaSlow[idx] * 0.998;
   const momentumSignalUp =
     emaCrossoverUp ||
     emaBounceUp ||
-    (c.close > emaFast[idx] && emaFast[idx] > emaSlow[idx]);
-  const momentumRsiUp = rsiSeries[idx] >= 42 && rsiSeries[idx] <= 68;
+    (c.close > emaFast[idx] && emaFast[idx] >= emaSlow[idx] * 0.999);
+  // In an active bullish trend (close > EMA21 >= EMA50), RSI(14) is in the bullish zone [38, 62]
+  const momentumRsiUp =
+    rsiSeries[idx] >= 38.0 &&
+    rsiSeries[idx] <= 62.0 &&
+    (rsiSeries[idx] >= rsiSeries[prev] - 1.5 || wt1[idx] >= wt2[idx]);
   const trendMomentumEntryLong =
-    trendBullish && momentumSignalUp && momentumRsiUp && volumeTrendOk && greenCandle;
+    trendBullish &&
+    momentumSignalUp &&
+    momentumRsiUp &&
+    volumeTrendOk &&
+    (greenCandle || hasLowerWick) &&
+    !isPumpExhaustion(candles) &&
+    !isKnifeDrop(candles);
 
-  const enterLong = levelReversalEntryLong || trendMomentumEntryLong;
-
-  // Short Entry
+  // --- SHORT SIGNALS ---
+  // Mode A: Level Reversal Short (rejection from resistance in overbought zone)
   const resistanceRejection =
     c.high >= smartResistance * 0.992 &&
     c.close <= smartResistance * 1.005 &&
@@ -1151,34 +1362,50 @@ export function evaluateScalpingStrategy(
   const resistanceSignal = resistanceRejection || nearResistance;
 
   const waveOverboughtCross =
-    wt1[idx] < wt2[idx] && (wt1[prev] >= wt2[prev] || wt2[idx] >= 25);
+    (wt1[idx] < wt2[idx] && (wt1[prev] >= wt2[prev] || wt2[idx] >= 25)) ||
+    (wt2[idx] >= 42 && wt1[idx] < wt1[prev]);
   const rsiOverboughtOk =
-    rsiSeries[idx] >= 58 || (rsiSeries[idx] < rsiSeries[prev] && rsiSeries[idx] >= 45);
+    rsiSeries[idx] >= 55.0 && (rsiSeries[idx] >= 62.0 || rsiSeries[idx] < rsiSeries[prev]);
 
   const levelReversalEntryShort =
     resistanceSignal &&
     waveOverboughtCross &&
     rsiOverboughtOk &&
-    (redCandle || c.close < c.high) &&
-    volumeOk;
+    (redCandle || hasUpperWick) &&
+    volumeOk &&
+    !trendBullish &&
+    !isPumpExhaustion(candles) &&
+    !isKnifeDrop(candles);
 
-  const trendBearish =
-    c.close < emaTrend[idx] * 1.005 && emaSlow[idx] <= emaTrend[idx] * 1.005;
+  // Mode B: Trend Momentum / Pullback Short (trading along an active bearish trend!)
   const emaCrossoverDown =
     emaFast[idx] < emaSlow[idx] && emaFast[prev] >= emaSlow[prev];
   const emaBounceDown =
-    c.high >= emaSlow[idx] * 0.992 &&
+    c.high >= emaFast[idx] * 0.995 &&
     c.close < emaSlow[idx] &&
-    emaFast[idx] <= emaSlow[idx];
+    emaFast[idx] <= emaSlow[idx] * 1.002;
   const momentumSignalDown =
     emaCrossoverDown ||
     emaBounceDown ||
-    (c.close < emaFast[idx] && emaFast[idx] < emaSlow[idx]);
-  const momentumRsiDown = rsiSeries[idx] >= 32 && rsiSeries[idx] <= 58;
+    (c.close < emaFast[idx] && emaFast[idx] <= emaSlow[idx] * 1.001);
+  // In an active bearish trend (close < EMA21 <= EMA50), RSI(14) is in the bearish zone [25, 62]
+  const momentumRsiDown =
+    rsiSeries[idx] >= 25.0 &&
+    rsiSeries[idx] <= 62.0 &&
+    (rsiSeries[idx] <= rsiSeries[prev] + 1.5 || wt1[idx] <= wt2[idx]);
   const trendMomentumEntryShort =
-    trendBearish && momentumSignalDown && momentumRsiDown && volumeTrendOk && redCandle;
+    trendBearish &&
+    momentumSignalDown &&
+    momentumRsiDown &&
+    volumeTrendOk &&
+    (redCandle || hasUpperWick) &&
+    !isPumpExhaustion(candles) &&
+    !isKnifeDrop(candles);
 
-  const enterShort = levelReversalEntryShort || trendMomentumEntryShort;
+  const enterLong =
+    (levelReversalEntryLong || trendMomentumEntryLong) && !trendMomentumEntryShort;
+  const enterShort =
+    (levelReversalEntryShort || trendMomentumEntryShort) && !trendMomentumEntryLong;
 
   // Exits
   const resistanceTested = c.high >= smartResistance * 0.998;
@@ -1202,10 +1429,10 @@ export function evaluateScalpingStrategy(
   const exitShort = levelTargetExitShort || rsiExhaustionShort || trendBreakShort;
 
   let enterTag = '';
-  if (enterLong) {
-    enterTag = levelReversalEntryLong ? 'MTF_Support_Bounce' : 'EMA_Trend_Momentum_Long';
-  } else if (enterShort) {
+  if (enterShort && (!enterLong || trendBearish)) {
     enterTag = levelReversalEntryShort ? 'MTF_Resistance_Reject' : 'EMA_Trend_Momentum_Short';
+  } else if (enterLong) {
+    enterTag = levelReversalEntryLong ? 'MTF_Support_Bounce' : 'EMA_Trend_Momentum_Long';
   }
 
   let exitTag = '';
@@ -1224,7 +1451,7 @@ export function evaluateScalpingStrategy(
   }
 
   return {
-    enter_long: enterLong,
+    enter_long: enterLong && !enterShort,
     enter_short: enterShort,
     exit_long: exitLong,
     exit_short: exitShort,
@@ -1330,19 +1557,27 @@ export function canExecuteDca(
     };
   }
 
-  // 6. Liquidation distance check
+  // 6. Liquidation distance check (Cross-Margin aware + scaled for high leverage like 25x)
+  const crossMarginBuffer = Math.min(
+    0.85,
+    Math.max(
+      0.92 / lev,
+      (currentPairMargin + availableBalance * 0.35) / Math.max(1, currentPairNotional)
+    )
+  );
   const approxLiqPrice = params.isShort
-    ? params.openRate * (1 + 0.92 / lev)
-    : params.openRate * (1 - 0.92 / lev);
+    ? params.openRate * (1 + crossMarginBuffer)
+    : params.openRate * (1 - crossMarginBuffer);
   const liqDistancePct =
     params.currentPrice > 0
       ? (Math.abs(params.currentPrice - approxLiqPrice) / params.currentPrice) * 100.0
       : 100;
+  const effectiveMinLiqPct = Math.min(minLiqDistPct, Number((25.0 / lev).toFixed(2)));
 
-  if (liqDistancePct < minLiqDistPct) {
+  if (liqDistancePct < effectiveMinLiqPct) {
     return {
       allowed: false,
-      reason: `Слишком близко к ликвидации: ${liqDistancePct.toFixed(1)}% (лимит ${minLiqDistPct}%)`,
+      reason: `Слишком близко к ликвидации: ${liqDistancePct.toFixed(1)}% (лимит ${effectiveMinLiqPct}%)`,
       multiplier: currentMultiplier,
       liquidationDistancePct: Number(liqDistancePct.toFixed(2)),
     };
@@ -1392,18 +1627,20 @@ export function calculateDynamicDcaAmount(params: {
     Math.max(25, Math.min(freeMargin * 0.5, fairShareMargin * 1.5))
   );
 
-  // Desired average entry price: pull within 0.8% of current reversal price
+  // Desired average entry price: pull within 0.8% towards current reversal price
+  // For LONG (openRate > currentPrice): targetAvgPrice is slightly above currentPrice (currentPrice * 1.008)
+  // For SHORT (openRate < currentPrice): targetAvgPrice is slightly below currentPrice (currentPrice * 0.992)
   const targetAvgPrice = params.isShort
-    ? params.currentPrice * 1.008
-    : params.currentPrice * 0.992;
+    ? Math.max(params.openRate, params.currentPrice * 0.992)
+    : Math.min(params.openRate, params.currentPrice * 1.008);
 
-  // Q_add = Q_old * (P_old - P_target) / (P_target - P_current)
+  // Q_add = Q_old * |P_old - P_target| / |P_target - P_current|
   const priceDiffOld = Math.abs(params.openRate - targetAvgPrice);
   const priceDiffNew = Math.abs(targetAvgPrice - params.currentPrice);
 
   let desiredAddAmount = params.currentAmount;
-  if (priceDiffNew > 1e-8) {
-    desiredAddAmount = params.currentAmount * (priceDiffOld / priceDiffNew);
+  if (priceDiffNew > 1e-8 && priceDiffOld > 1e-8) {
+    desiredAddAmount = Math.min(params.currentAmount * 2.5, params.currentAmount * (priceDiffOld / priceDiffNew));
   }
 
   // Convert desired amount to margin
