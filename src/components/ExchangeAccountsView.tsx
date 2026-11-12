@@ -326,7 +326,21 @@ export const ExchangeAccountsView: React.FC<ExchangeAccountsViewProps> = ({
               <input
                 type="text"
                 value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setApiKey(val);
+                  const clean = val.replace(/[\s"']/g, '');
+                  if (clean.length === 64 && exchange === 'bybit' && !passphrase) {
+                    setExchange('binance');
+                  } else if (
+                    clean.length >= 16 &&
+                    clean.length <= 24 &&
+                    exchange === 'binance' &&
+                    !passphrase
+                  ) {
+                    setExchange('bybit');
+                  }
+                }}
                 placeholder="Вставьте API Key..."
                 className="w-full px-3 py-2 text-[12.5px] bg-[#131722] border border-[#363a45] rounded-[4px] text-white font-mono placeholder:text-[#6c757d] focus:outline-none focus:border-[#2962ff]"
               />

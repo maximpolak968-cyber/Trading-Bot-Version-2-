@@ -32,6 +32,8 @@ import {
   fetchExchangeClosedPnl,
   ensureExchangeHedgeMode,
   isPairTradableOnExchange,
+  isBinanceHostRateLimited,
+  sanitizeCredentialString,
   ExchangeOrderParams,
   PlacedOrderResult,
 } from './src/bot/exchangeConnector.ts';
@@ -295,10 +297,12 @@ async function fetchTopVolatileFuturesPairs(minVolumeUsdt = 50_000_000): Promise
     // fallback to Binance endpoints below
   }
 
-  // 2. Fallback to Binance Futures / Vision 24hr tickers
+  // 2. Fallback to Binance Vision CDN (НЕ используем fapi.binance.com/fapi/v1/ticker/24hr с весом 40, чтобы не вызывать бан -1003)
   const endpoints = [
-    'https://fapi.binance.com/fapi/v1/ticker/24hr',
     'https://data-api.binance.vision/api/v3/ticker/24hr',
+    ...(!isBinanceHostRateLimited('https://fapi.binance.com').limited
+      ? ['https://fapi.binance.com/fapi/v1/ticker/24hr']
+      : []),
   ];
 
   for (const url of endpoints) {
@@ -394,7 +398,11 @@ async function fetchRealCandles(
   const interval = validIntervals[normTf] || '1h';
   const cacheKey = `${pair}_${interval}_${safeLimit}_${endTime || 'latest'}`;
   const cached = candleCache.get(cacheKey);
-  if (cached && Date.now() - cached.timestamp < 5000) {
+  const candleTtlMs =
+    interval === '1d' || interval === '1w' || interval === '4h' || interval === '6h' || interval === '12h'
+      ? 45_000
+      : 12_000;
+  if (cached && Date.now() - cached.timestamp < candleTtlMs) {
     return { candles: cached.candles, source: cached.source };
   }
 
@@ -452,8 +460,27 @@ async function fetchRealCandles(
     parse: (raw: any) => RawCandle[];
   }
 
+  // Публичные свечи запрашиваем в первую очередь через Binance Vision CDN (AWS CloudFront — 0 нагрузки на лимит IP fapi.binance.com!)
+  // и Bybit V5 Linear, чтобы никогда не расходовать лимит запросов боевого API fapi.binance.com (-1003).
   const allProviders: KlineProvider[] = [
-    ...(exchangeAccountsStore.some((a) => a.enabled && a.exchange === 'binance' && a.is_testnet)
+    {
+      id: 'binance',
+      name: `Binance (${interval})`,
+      url: `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
+      parse: (raw: any) =>
+        Array.isArray(raw)
+          ? raw.map((k: any[]) => ({
+              timestamp: Number(k[0]),
+              open: parseFloat(k[1]),
+              high: parseFloat(k[2]),
+              low: parseFloat(k[3]),
+              close: parseFloat(k[4]),
+              volume: parseFloat(k[5]),
+            }))
+          : [],
+    },
+    ...(exchangeAccountsStore.some((a) => a.enabled && a.exchange === 'binance' && a.is_testnet) &&
+    !isBinanceHostRateLimited('https://testnet.binancefuture.com').limited
       ? [
           {
             id: 'binance' as SupportedExchange,
@@ -473,38 +500,26 @@ async function fetchRealCandles(
           },
         ]
       : []),
-    {
-      id: 'binance',
-      name: `Binance Futures (${interval})`,
-      url: `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
-      parse: (raw: any) =>
-        Array.isArray(raw)
-          ? raw.map((k: any[]) => ({
-              timestamp: Number(k[0]),
-              open: parseFloat(k[1]),
-              high: parseFloat(k[2]),
-              low: parseFloat(k[3]),
-              close: parseFloat(k[4]),
-              volume: parseFloat(k[5]),
-            }))
-          : [],
-    },
-    {
-      id: 'binance',
-      name: `Binance (${interval})`,
-      url: `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
-      parse: (raw: any) =>
-        Array.isArray(raw)
-          ? raw.map((k: any[]) => ({
-              timestamp: Number(k[0]),
-              open: parseFloat(k[1]),
-              high: parseFloat(k[2]),
-              low: parseFloat(k[3]),
-              close: parseFloat(k[4]),
-              volume: parseFloat(k[5]),
-            }))
-          : [],
-    },
+    ...(!isBinanceHostRateLimited('https://fapi.binance.com').limited
+      ? [
+          {
+            id: 'binance' as SupportedExchange,
+            name: `Binance Futures (${interval})`,
+            url: `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
+            parse: (raw: any) =>
+              Array.isArray(raw)
+                ? raw.map((k: any[]) => ({
+                    timestamp: Number(k[0]),
+                    open: parseFloat(k[1]),
+                    high: parseFloat(k[2]),
+                    low: parseFloat(k[3]),
+                    close: parseFloat(k[4]),
+                    volume: parseFloat(k[5]),
+                  }))
+                : [],
+          },
+        ]
+      : []),
     ...(bybitIntervals[interval]
       ? [
           ...(exchangeAccountsStore.some((a) => a.enabled && a.exchange === 'bybit' && a.is_testnet)
@@ -2018,9 +2033,10 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
 }
 
 let exchangeSyncInFlight: Promise<void> | null = null;
+const lastSyncErrorLogByAcc = new Map<string, { msg: string; ts: number }>();
 
 function triggerBackgroundExchangeSync(force = false): void {
-  if (!force && Date.now() - lastExchangeBalanceSyncTs < 12_000) return;
+  if (!force && Date.now() - lastExchangeBalanceSyncTs < 35_000) return;
   if (exchangeSyncInFlight) return;
   exchangeSyncInFlight = syncRealExchangeBalancesIfNeeded(force).finally(() => {
     exchangeSyncInFlight = null;
@@ -2028,7 +2044,7 @@ function triggerBackgroundExchangeSync(force = false): void {
 }
 
 async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
-  if (!force && Date.now() - lastExchangeBalanceSyncTs < 12_000) return;
+  if (!force && Date.now() - lastExchangeBalanceSyncTs < 35_000) return;
   lastExchangeBalanceSyncTs = Date.now();
   const enabledAccs = exchangeAccountsStore.filter((a) => a.enabled);
   for (const acc of enabledAccs) {
@@ -2037,7 +2053,12 @@ async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
     try {
       const check = await testExchangeConnection(creds);
       if (check.success) {
+        lastSyncErrorLogByAcc.delete(acc.id);
         let changed = false;
+        if (check.exchange && acc.exchange !== check.exchange) {
+          acc.exchange = check.exchange;
+          changed = true;
+        }
         if (typeof check.is_testnet === 'boolean' && acc.is_testnet !== check.is_testnet) {
           acc.is_testnet = check.is_testnet;
           changed = true;
@@ -2077,11 +2098,16 @@ async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
           );
         }
       } else {
-        appendLog(
-          'freqtrade.exchange.sync',
-          'WARNING',
-          `⚠️ Проверка связи с биржей ${acc.exchange.toUpperCase()} (${acc.name}): ${check.message}`
-        );
+        // Не дублируем одно и то же предупреждение в логах чаще чем раз в 5 минут
+        const prevErr = lastSyncErrorLogByAcc.get(acc.id);
+        if (!prevErr || prevErr.msg !== check.message || Date.now() - prevErr.ts > 5 * 60_000) {
+          lastSyncErrorLogByAcc.set(acc.id, { msg: check.message, ts: Date.now() });
+          appendLog(
+            'freqtrade.exchange.sync',
+            'WARNING',
+            `⚠️ Проверка связи с биржей ${acc.exchange.toUpperCase()} (${acc.name}): ${check.message}`
+          );
+        }
       }
       // Синхронизируем реальные открытые позиции и закрытые сделки с биржи
       await syncPositionsAndHistoryFromExchanges(acc);
@@ -5395,11 +5421,15 @@ async function startServer() {
     } = req.body || {};
 
     const validExchanges: SupportedExchange[] = ['binance', 'bybit', 'okx', 'bitget', 'bingx'];
-    const cleanExchange: SupportedExchange = validExchanges.includes(exchange)
+    let cleanExchange: SupportedExchange = validExchanges.includes(exchange)
       ? exchange
       : 'bybit';
 
-    if (!name || !api_key || !api_secret) {
+    const cleanKeyInput = sanitizeCredentialString(String(api_key || ''));
+    const cleanSecretInput = sanitizeCredentialString(String(api_secret || ''));
+    const cleanPassInput = passphrase ? sanitizeCredentialString(String(passphrase)) : '';
+
+    if (!name || !cleanKeyInput || !cleanSecretInput) {
       res.status(400).json({ error: 'Укажите название аккаунта, API Key и Secret Key' });
       return;
     }
@@ -5409,17 +5439,20 @@ async function startServer() {
     let resolvedNetworkLabel: string | undefined;
     let liveCheckResult: any = null;
 
-    // Для реальных API-ключей всегда проверяем подключение к бирже (с авто-определением Mainnet / Testnet / Demo и запросом реального баланса USDT)
-    if (!isSimulatedTestApiKey(String(api_key))) {
+    // Для реальных API-ключей всегда проверяем подключение к бирже (с авто-определением биржи, Mainnet / Testnet / Demo и запросом реального баланса USDT)
+    if (!isSimulatedTestApiKey(cleanKeyInput)) {
       try {
         const liveCheck = await testExchangeConnection({
           exchange: cleanExchange,
-          apiKey: String(api_key).trim(),
-          apiSecret: String(api_secret).trim(),
-          passphrase: passphrase ? String(passphrase).trim() : undefined,
+          apiKey: cleanKeyInput,
+          apiSecret: cleanSecretInput,
+          passphrase: cleanPassInput || undefined,
           isTestnet: resolvedIsTestnet,
         });
         liveCheckResult = liveCheck;
+        if (liveCheck.exchange && validExchanges.includes(liveCheck.exchange)) {
+          cleanExchange = liveCheck.exchange;
+        }
         if (typeof liveCheck.is_testnet === 'boolean') {
           resolvedIsTestnet = liveCheck.is_testnet;
         }
