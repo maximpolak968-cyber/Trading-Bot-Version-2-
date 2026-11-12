@@ -30,6 +30,7 @@ import {
   getExchangeTakerFeeRate,
   fetchExchangeOpenPositions,
   fetchExchangeClosedPnl,
+  ensureExchangeHedgeMode,
   isPairTradableOnExchange,
   ExchangeOrderParams,
   PlacedOrderResult,
@@ -1679,7 +1680,7 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
   try {
     const [openPosRes, closedPnlRes] = await Promise.all([
       fetchExchangeOpenPositions(creds),
-      fetchExchangeClosedPnl(creds, 50, knownPairs),
+      fetchExchangeClosedPnl(creds, 150, knownPairs),
     ]);
 
     // 1. Синхронизация всех открытых позиций, которые уже есть на биржевом аккаунте
@@ -1885,11 +1886,11 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
       }
     }
 
-    // 3. Полная сверка и синхронизация истории закрытых сделок и комиссий с биржи
+    // 3. Полная сверка и синхронизация истории закрытых сделок и комиссий с биржи (без удаления существующих локальных сделок)
     if (closedPnlRes.success && closedPnlRes.closed.length > 0) {
       const matchedLocalIds = new Set<number>();
 
-      for (const c of closedPnlRes.closed.slice(0, 35)) {
+      for (const c of closedPnlRes.closed.slice(0, 150)) {
         const histKey = `closed:${targetAccountId}:${c.pair}:${c.order_id || c.updated_time}`;
         if (dismissedExchangeSyncKeys.has(histKey)) continue;
 
@@ -2010,28 +2011,20 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
         tradesStore.push(closedTrade);
         sqliteDb.upsertTrade(closedTrade);
       }
-
-      // Удаляем фантомные локальные закрытые записи этого реального аккаунта, которых нет в истории биржи
-      const staleLocalClosed = tradesStore.filter(
-        (t) =>
-          !t.is_open &&
-          t.exchange === acc.exchange &&
-          (targetAccountId === 'master'
-            ? !t.account_id || t.account_id === 'master'
-            : t.account_id === targetAccountId) &&
-          !matchedLocalIds.has(t.trade_id)
-      );
-      if (staleLocalClosed.length > 0) {
-        for (const stale of staleLocalClosed) {
-          sqliteDb.deleteTrade(stale.trade_id);
-        }
-        const staleSet = new Set(staleLocalClosed.map((s) => s.trade_id));
-        tradesStore = tradesStore.filter((t) => !staleSet.has(t.trade_id));
-      }
     }
   } catch {
     // ignore transient position sync errors
   }
+}
+
+let exchangeSyncInFlight: Promise<void> | null = null;
+
+function triggerBackgroundExchangeSync(force = false): void {
+  if (!force && Date.now() - lastExchangeBalanceSyncTs < 12_000) return;
+  if (exchangeSyncInFlight) return;
+  exchangeSyncInFlight = syncRealExchangeBalancesIfNeeded(force).finally(() => {
+    exchangeSyncInFlight = null;
+  });
 }
 
 async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
@@ -2916,13 +2909,30 @@ async function runScalpBotCycle(waitForActive = false) {
         reason: `MTF Scan [${pair}]: 1D=${mtf.d1_trend} (RSI 1D=${mtf.rsi_1d}, 4H=${mtf.rsi_4h}, 1H=${mtf.rsi_1h}) | 4H Sup=${roundPrice(customSup)} Res=${roundPrice(customRes)} | Signal=${sig.enter_tag || 'WAIT_LEVEL'}`,
       });
 
-      // CASE A: Master does NOT have this pair open yet -> Strict MTF-filtered Scalping Entry:
-      // 1. Primary Scalping Signal (Mode A Level Bounce / Mode B Trend Pullback) strictly obeying MTF RSI (Long: 1D<=68, 4H<=60, 1H<=45; Short: 1D>=32, 4H>=40, 1H>=55)
-      // 2. Secondary MTF Level + RSI Oversold/Overbought Entry (single-direction only, so One-Way Mode exchange accounts never net out Long+Short)
+      // CASE A: Master does NOT have this pair open yet -> Strict MTF-filtered Entry:
+      // 1. Primary 1H Scalping Signal (Mode A Level Bounce / Mode B Trend Pullback) strictly obeying MTF RSI (Long: 1D<=68, 4H<=60, 1H<=45; Short: 1D>=32, 4H>=40, 1H>=55)
+      // 2. Secondary MTF Level + RSI Oversold/Overbought 1H Scalp Entry
+      // 3. 2-Way Long-Term 4H Channel Hedge Entry (simultaneous LONG + SHORT in a wide >=2.2% 4H channel when price is in the 35%-65% middle zone)
       if (!masterHasPair && currentMasterOpen.length < botConfig.max_open_trades) {
         const { compoundedBalance: totalDeposit } = getCompoundedAccountBalance('master');
         const usedMargin = currentMasterOpen.reduce((acc, t) => acc + t.stake_amount, 0);
         const masterMarginOk = totalDeposit > 0 && (usedMargin / totalDeposit) * 100 < 40.0;
+        const channel4hWidthPct =
+          livePrice > 0 && customRes > customSup
+            ? ((customRes - customSup) / livePrice) * 100.0
+            : 0;
+        const is4hHedgeCandidate =
+          btcGuard.isSafe &&
+          currentMasterOpen.length + 2 <= botConfig.max_open_trades &&
+          channel4hWidthPct >= 2.2 &&
+          mtf.pos_4h_pct >= 35.0 &&
+          mtf.pos_4h_pct <= 65.0 &&
+          mtf.rsi_1h >= 38.0 &&
+          mtf.rsi_1h <= 62.0 &&
+          mtf.rsi_4h >= 35.0 &&
+          mtf.rsi_4h <= 65.0 &&
+          !isKnifeDrop(c1h) &&
+          !isPumpExhaustion(c1h);
 
         if (masterMarginOk) {
           try {
@@ -2973,6 +2983,11 @@ async function runScalpBotCycle(waitForActive = false) {
                 'MTF_Overbought_Scalp_Short'
               );
               openedInThisCycle++;
+              if (openedInThisCycle >= 3) break;
+              continue;
+            } else if (is4hHedgeCandidate) {
+              await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d);
+              openedInThisCycle += 2;
               if (openedInThisCycle >= 3) break;
               continue;
             }
@@ -3075,36 +3090,100 @@ async function openHedgeCampaign(
   entryPrice: number,
   mtf: ReturnType<typeof analyzeMultiTimeframe>,
   candles4h: RawCandle[],
-  candles1d: RawCandle[]
-): Promise<{ longTrade: FreqtradeTrade; shortTrade: FreqtradeTrade }> {
-  const campaignId = `hedge-${pair.split(':')[0].replace('/', '')}-${Date.now()}`;
+  candles1d: RawCandle[],
+  customOpts?: {
+    stake?: number;
+    leverage?: number;
+    skipClientSync?: boolean;
+  }
+): Promise<{ longTrade: FreqtradeTrade; shortTrade: FreqtradeTrade | null }> {
+  const cleanPair = pair.toUpperCase();
+  const campaignId = `hedge-${cleanPair.split(':')[0].replace('/', '')}-${Date.now()}`;
+
+  // 1. Одновременно проверяем/включаем режим хеджирования (Hedge Mode) на активных аккаунтах и предзагружаем уровни пары без задержки
+  const activeAccounts = exchangeAccountsStore.filter((a) => a.enabled);
+  const ownerAcc = activeAccounts.find((a) => a.is_owner) || activeAccounts[0];
+  const ownerCreds = ownerAcc ? getAccountCredentialsFromStore(ownerAcc) : null;
+
+  const [hedgeCheckList, preloadedPairLevels] = await Promise.all([
+    Promise.all(
+      activeAccounts.map(async (acc) => {
+        const creds = getAccountCredentialsFromStore(acc);
+        if (!creds) return { accId: acc.id, enabled: true, message: 'No creds' };
+        const res = await ensureExchangeHedgeMode(creds, cleanPair);
+        return { accId: acc.id, ...res };
+      })
+    ),
+    getOrComputeMtfBotLevels(cleanPair, botConfig.timeframe),
+  ]);
+
+  const ownerHedgeStatus = hedgeCheckList.find((h) => h.accId === ownerAcc?.id);
+  const canOpenBothSides =
+    !ownerCreds || isSimulatedTestApiKey(ownerCreds.apiKey) || (ownerHedgeStatus?.enabled ?? true);
+
+  if (!canOpenBothSides) {
+    // Если биржа заблокирована в One-Way Mode из-за других открытых позиций — открываем ногу по тренду, чтобы биржа не схлопнула встречный ордер
+    const fallbackSide: 'long' | 'short' =
+      mtf.d1_trend === 'BEARISH' || mtf.d1_trend === 'MILD_BEARISH' ? 'short' : 'long';
+    appendLog(
+      'freqtrade.bot.hedge',
+      'WARNING',
+      `⚠️ [${cleanPair}] На бирже активен режим One-Way Mode (${ownerHedgeStatus?.message || 'переключение на Hedge Mode требует закрытия текущих сделок'}). Открываю 4H сделку по тренду (${fallbackSide.toUpperCase()}) без схлопывания.`
+    );
+    const singleTrade = await createScalpBotPosition(
+      cleanPair,
+      fallbackSide,
+      entryPrice,
+      mtf,
+      candles4h,
+      candles1d,
+      fallbackSide === 'short' ? '4H_Hedge_Short' : '4H_Hedge_Long',
+      {
+        ...customOpts,
+        campaignId,
+        preloadedPairLevels,
+      }
+    );
+    return { longTrade: singleTrade, shortTrade: null };
+  }
+
   appendLog(
     'freqtrade.bot.hedge',
     'INFO',
-    `⚖️ Открываю 2-стороннюю хедж-кампанию ${campaignId} [${pair}] @ ${entryPrice}$: одновременный вход LONG и SHORT (0.5% депозит / 25x плечо)`
+    `⚖️ Открываю 2-стороннюю хедж-кампанию ${campaignId} [${cleanPair}] @ ${entryPrice}$: мгновенный параллельный вход LONG + SHORT в 4H канале (0.5% депозит / 25x плечо)`
   );
 
-  const longTrade = await createScalpBotPosition(
-    pair,
-    'long',
-    entryPrice,
-    mtf,
-    candles4h,
-    candles1d,
-    '4H_Hedge_Long',
-    { campaignId }
-  );
-
-  const shortTrade = await createScalpBotPosition(
-    pair,
-    'short',
-    entryPrice,
-    mtf,
-    candles4h,
-    candles1d,
-    '4H_Hedge_Short',
-    { campaignId }
-  );
+  // 2. Открываем LONG и SHORT строго параллельно (Promise.all) без малейшей задержки между ногами!
+  const [longTrade, shortTrade] = await Promise.all([
+    createScalpBotPosition(
+      cleanPair,
+      'long',
+      entryPrice,
+      mtf,
+      candles4h,
+      candles1d,
+      '4H_Hedge_Long',
+      {
+        ...customOpts,
+        campaignId,
+        preloadedPairLevels,
+      }
+    ),
+    createScalpBotPosition(
+      cleanPair,
+      'short',
+      entryPrice,
+      mtf,
+      candles4h,
+      candles1d,
+      '4H_Hedge_Short',
+      {
+        ...customOpts,
+        campaignId,
+        preloadedPairLevels,
+      }
+    ),
+  ]);
 
   return { longTrade, shortTrade };
 }
@@ -3128,6 +3207,7 @@ async function createScalpBotPosition(
     isCopyChild?: boolean;
     parentTradeId?: number;
     skipClientSync?: boolean;
+    preloadedPairLevels?: Awaited<ReturnType<typeof getOrComputeMtfBotLevels>>;
   }
 ): Promise<FreqtradeTrade> {
   const activeAccounts = exchangeAccountsStore.filter((a) => a.enabled);
@@ -3209,8 +3289,10 @@ async function createScalpBotPosition(
   const hasCustomTp = Boolean(customOpts?.customTp && customOpts.customTp > 0);
   const hasCustomSl = Boolean(customOpts?.customSl && customOpts.customSl > 0);
 
-  // Загружаем актуальные уровни бота (включая уровни SUP/RES, которые пользователь передвинул или добавил на графике)
-  const activePairLevels = await getOrComputeMtfBotLevels(cleanPair, botConfig.timeframe);
+  // Загружаем актуальные уровни бота (или используем уже предзагруженные уровни при параллельном открытии 2-стороннего хеджа)
+  const activePairLevels =
+    customOpts?.preloadedPairLevels ??
+    (await getOrComputeMtfBotLevels(cleanPair, botConfig.timeframe));
   const manualSupLvl = activePairLevels.find(
     (l) => l.role === 'support' && l.manual_override && l.price < entryRate
   );
@@ -4008,7 +4090,11 @@ async function startServer() {
 
   app.get('/api/v1/status', async (req, res) => {
     await initializeBotTrades();
-    await syncRealExchangeBalancesIfNeeded(false);
+    if (req.query.sync === 'true') {
+      await syncRealExchangeBalancesIfNeeded(true);
+    } else {
+      triggerBackgroundExchangeSync(false);
+    }
     const scope = resolveRequestAccountScope(req);
     const scopedTrades = filterTradesForScope(scope.accountId);
     for (const t of scopedTrades) {
@@ -4038,7 +4124,11 @@ async function startServer() {
 
   app.get('/api/v1/trades', async (req, res) => {
     await initializeBotTrades();
-    await syncRealExchangeBalancesIfNeeded(false);
+    if (req.query.sync === 'true') {
+      await syncRealExchangeBalancesIfNeeded(true);
+    } else {
+      triggerBackgroundExchangeSync(false);
+    }
     const scope = resolveRequestAccountScope(req);
     const scopedTrades = filterTradesForScope(scope.accountId);
     const closed = scopedTrades.filter((t) => !t.is_open);
@@ -4051,7 +4141,11 @@ async function startServer() {
 
   app.get('/api/v1/profit', async (req, res) => {
     await initializeBotTrades();
-    await syncRealExchangeBalancesIfNeeded(false);
+    if (req.query.sync === 'true') {
+      await syncRealExchangeBalancesIfNeeded(true);
+    } else {
+      triggerBackgroundExchangeSync(false);
+    }
     const scope = resolveRequestAccountScope(req);
     const scopedTrades = filterTradesForScope(scope.accountId);
     const open = scopedTrades.filter((t) => t.is_open);
@@ -4139,7 +4233,11 @@ async function startServer() {
 
   app.get('/api/v1/balance', async (req, res) => {
     await initializeBotTrades();
-    await syncRealExchangeBalancesIfNeeded(false);
+    if (req.query.sync === 'true') {
+      await syncRealExchangeBalancesIfNeeded(true);
+    } else {
+      triggerBackgroundExchangeSync(false);
+    }
     const scope = resolveRequestAccountScope(req);
     const scopedTrades = filterTradesForScope(scope.accountId);
     const isRealAcc = Boolean(
@@ -4394,7 +4492,39 @@ async function startServer() {
       customPrice && Number(customPrice) > 0 ? Number(customPrice) : latestPrice
     );
     const mtf = analyzeMultiTimeframe(cleanPair, c1h, c4h, c1d);
-    const isShort = side === 'short';
+    const normalizedSide = String(side || 'long').toLowerCase();
+    if (normalizedSide === 'hedge' || normalizedSide === 'both') {
+      try {
+        const { longTrade, shortTrade } = await openHedgeCampaign(
+          cleanPair,
+          entryRate,
+          mtf,
+          c4h,
+          c1d,
+          {
+            stake: stakeamount && Number(stakeamount) > 0 ? Number(stakeamount) : undefined,
+            leverage:
+              customLeverage && Number(customLeverage) >= 1 ? Number(customLeverage) : undefined,
+            skipClientSync: Boolean(skipClientSync),
+          }
+        );
+        res.json({
+          ...longTrade,
+          hedge_campaign: true,
+          long_trade: longTrade,
+          short_trade: shortTrade,
+        });
+        return;
+      } catch (err: any) {
+        res.status(400).json({
+          error: err?.message || 'Ошибка при открытии 2-сторонней хедж-сделки на бирже.',
+        });
+        return;
+      }
+    }
+
+    const isShort = normalizedSide === 'short';
+    const preloadedPairLevels = await getOrComputeMtfBotLevels(cleanPair);
 
     let newTrade: FreqtradeTrade;
     try {
@@ -4412,6 +4542,7 @@ async function startServer() {
           customTp: customTp && Number(customTp) > 0 ? Number(customTp) : undefined,
           customSl: customSl && Number(customSl) > 0 ? Number(customSl) : undefined,
           skipClientSync: Boolean(skipClientSync),
+          preloadedPairLevels,
         }
       );
     } catch (err: any) {
@@ -4420,9 +4551,6 @@ async function startServer() {
       });
       return;
     }
-
-    // Sync MTF levels into bot_levels table for this pair
-    await getOrComputeMtfBotLevels(cleanPair);
 
     res.json(newTrade);
   });
@@ -5199,9 +5327,13 @@ async function startServer() {
   // MULTI-EXCHANGE API ACCOUNTS & CLIENT ACCESS MANAGEMENT
   // Supported Exchanges: Binance, Bybit, OKX, Bitget, BingX
   // ============================================================================
-  app.get('/api/v1/accounts', async (_req, res) => {
+  app.get('/api/v1/accounts', async (req, res) => {
     await initializeBotTrades();
-    await syncRealExchangeBalancesIfNeeded(false);
+    if (req.query.sync === 'true') {
+      await syncRealExchangeBalancesIfNeeded(true);
+    } else {
+      triggerBackgroundExchangeSync(false);
+    }
     const masterOpen = tradesStore.filter(
       (t) => t.is_open && (!t.account_id || t.account_id === 'master')
     );

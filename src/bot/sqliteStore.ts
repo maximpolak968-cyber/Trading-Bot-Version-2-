@@ -1,6 +1,7 @@
 import { createRequire } from 'module';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import crypto from 'crypto';
 
 const require = createRequire(import.meta.url);
@@ -8,6 +9,20 @@ const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as {
   DatabaseSync: new (filename: string) => any;
 };
+
+function getPersistentHomeDir(): string | null {
+  try {
+    const home = os.homedir();
+    if (!home) return null;
+    const dir = path.join(home, '.scalpbot');
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    return dir;
+  } catch {
+    return null;
+  }
+}
 
 function resolveSqliteDbPath(): string {
   const customEnvPath = (process.env.SQLITE_DB_PATH || '').trim();
@@ -38,6 +53,19 @@ function resolveSqliteDbPath(): string {
     }
   } catch {
     // fallback to localDbPath
+  }
+
+  // Если при обновлении кода на сервере рабочая папка пересоздана, восстанавливаем БД из ~/.scalpbot/trades.sqlite.bak
+  try {
+    const homeDir = getPersistentHomeDir();
+    if (homeDir) {
+      const homeDbBak = path.join(homeDir, 'trades.sqlite.bak');
+      if (!fs.existsSync(localDbPath) && fs.existsSync(homeDbBak)) {
+        fs.copyFileSync(homeDbBak, localDbPath);
+      }
+    }
+  } catch {
+    // ignore
   }
   return localDbPath;
 }
@@ -321,7 +349,28 @@ export class SqliteBotDatabase {
     } catch {
       // ignore
     }
+    const homeDir = getPersistentHomeDir();
+    if (homeDir) {
+      paths.push(path.join(homeDir, '.exchange_accounts.backup.json'));
+    }
     paths.push(path.resolve(process.cwd(), '.exchange_accounts.backup.json'));
+    return paths;
+  }
+
+  private getTradesBackupPaths(): string[] {
+    const paths: string[] = [];
+    try {
+      if (fs.existsSync('/data') && fs.statSync('/data').isDirectory()) {
+        paths.push('/data/.trades.backup.json');
+      }
+    } catch {
+      // ignore
+    }
+    const homeDir = getPersistentHomeDir();
+    if (homeDir) {
+      paths.push(path.join(homeDir, '.trades.backup.json'));
+    }
+    paths.push(path.resolve(process.cwd(), '.trades.backup.json'));
     return paths;
   }
 
@@ -335,6 +384,82 @@ export class SqliteBotDatabase {
         !key.startsWith('ownr9988') &&
         !key.startsWith('clnt1122')
     );
+  }
+
+  private isRealUserTrade(tradeObj: any, simulatedAccountIds: Set<string>): boolean {
+    if (!tradeObj || !tradeObj.pair) return false;
+    const accId = String(tradeObj.account_id || '').trim();
+    if (accId && simulatedAccountIds.has(accId)) {
+      return false;
+    }
+    const accName = String(tradeObj.account_name || '').trim();
+    if (
+      accName === 'Master Owner Account' ||
+      accName === 'Инвестор Алексей' ||
+      accName.toLowerCase().includes('simulated test')
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  public syncTradesBackupFile(allowEmptyOverwrite = false) {
+    try {
+      const accRows = this.db.prepare(`SELECT id, api_key_raw FROM exchange_accounts`).all() as any[];
+      const simulatedAccIds = new Set<string>();
+      for (const a of accRows) {
+        if (a?.api_key_raw && !this.isRealUserAccountKey(a.api_key_raw)) {
+          simulatedAccIds.add(String(a.id));
+        }
+      }
+      const allTrades = this.loadAllTradesInternal();
+      const realTrades = allTrades.filter((t: any) => this.isRealUserTrade(t, simulatedAccIds));
+      if (realTrades.length === 0 && !allowEmptyOverwrite) {
+        return;
+      }
+      const jsonStr = JSON.stringify(realTrades, null, 2);
+      for (const p of this.getTradesBackupPaths()) {
+        try {
+          fs.writeFileSync(p, jsonStr, 'utf-8');
+        } catch {
+          // ignore write error
+        }
+      }
+    } catch {
+      // ignore backup error
+    }
+  }
+
+  public restoreTradesFromBackupIfEmpty(): number {
+    try {
+      const existingCount = Number(
+        (this.db.prepare(`SELECT COUNT(*) as cnt FROM trades`).get() as any)?.cnt || 0
+      );
+      if (existingCount > 0) return 0;
+
+      for (const p of this.getTradesBackupPaths()) {
+        try {
+          if (fs.existsSync(p)) {
+            const raw = fs.readFileSync(p, 'utf-8');
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              const validReal = parsed.filter((t: any) => this.isRealUserTrade(t, new Set()));
+              if (validReal.length > 0) {
+                for (const tr of validReal) {
+                  this.upsertTrade(tr, true);
+                }
+                return validReal.length;
+              }
+            }
+          }
+        } catch {
+          // try next path
+        }
+      }
+    } catch {
+      // ignore restore error
+    }
+    return 0;
   }
 
   private syncAccountsBackupFile(allowEmptyOverwrite = false) {
@@ -618,7 +743,7 @@ export class SqliteBotDatabase {
     }
   }
 
-  public upsertTrade(trade: any) {
+  public upsertTrade(trade: any, skipBackup = false) {
     try {
       const existing = this.db
         .prepare(`SELECT id, open_date, open_timestamp, close_date, close_timestamp FROM trades WHERE id = ?`)
@@ -813,6 +938,9 @@ export class SqliteBotDatabase {
           trade.trade_id
         );
       }
+      if (!skipBackup) {
+        this.syncTradesBackupFile();
+      }
     } catch (e) {
       console.error('SQLite upsertTrade error:', e);
     }
@@ -828,6 +956,11 @@ export class SqliteBotDatabase {
   }
 
   public loadAllTrades(): any[] {
+    this.restoreTradesFromBackupIfEmpty();
+    return this.loadAllTradesInternal();
+  }
+
+  private loadAllTradesInternal(): any[] {
     try {
       const rows = this.db.prepare(`SELECT * FROM trades ORDER BY id DESC`).all();
       return rows.map((r: any) => {

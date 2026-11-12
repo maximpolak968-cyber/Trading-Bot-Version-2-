@@ -138,7 +138,7 @@ export default function App() {
   // Force Entry Modal State
   const [showForceEnterModal, setShowForceEnterModal] = useState<boolean>(false);
   const [forcePair, setForcePair] = useState<string>('ETH/USDT:USDT');
-  const [forceSide, setForceSide] = useState<'long' | 'short'>('long');
+  const [forceSide, setForceSide] = useState<'long' | 'short' | 'hedge'>('long');
   const [forceStake, setForceStake] = useState<number>(25);
   const [forceLeverage, setForceLeverage] = useState<number>(25);
   const [submittingForce, setSubmittingForce] = useState<boolean>(false);
@@ -923,7 +923,9 @@ export default function App() {
         setSelectedPair(trade.pair);
         setRightPanelTab('open');
         setStatusNotification(
-          `${trade.pair.split('/')[0]}: ${trade.is_short ? 'SHORT' : 'LONG'} ${trade.leverage}x ➔ Открытые`
+          trade.hedge_campaign
+            ? `⚖️ ${trade.pair.split('/')[0]}: 2-сторонний Хедж (LONG + SHORT ${trade.leverage}x) открыт параллельно ➔ Открытые`
+            : `${trade.pair.split('/')[0]}: ${trade.is_short ? 'SHORT' : 'LONG'} ${trade.leverage}x ➔ Открытые`
         );
         await fetchBotState();
         await fetchCandles(trade.pair, timeframe, strategy);
@@ -1352,10 +1354,10 @@ export default function App() {
                   ))}
                 </select>
               </div>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="space-y-2">
                 <div>
-                  <label className="block text-[#9ca3af] mb-1">Сторона сделки</label>
-                  <div className="grid grid-cols-2 gap-1">
+                  <label className="block text-[#9ca3af] mb-1">Режим / Сторона сделки</label>
+                  <div className="grid grid-cols-3 gap-1.5">
                     <button
                       type="button"
                       onClick={() => setForceSide('long')}
@@ -1365,7 +1367,7 @@ export default function App() {
                           : 'bg-[#141619] border border-[#323842] text-[#9ca3af]'
                       }`}
                     >
-                      Лонг
+                      Лонг (1H)
                     </button>
                     <button
                       type="button"
@@ -1376,10 +1378,22 @@ export default function App() {
                           : 'bg-[#141619] border border-[#323842] text-[#9ca3af]'
                       }`}
                     >
-                      Шорт
+                      Шорт (1H)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setForceSide('hedge')}
+                      className={`py-1.5 rounded font-medium ${
+                        forceSide === 'hedge'
+                          ? 'bg-[#2962ff] text-white'
+                          : 'bg-[#141619] border border-[#323842] text-[#9ca3af]'
+                      }`}
+                    >
+                      2 стороны (Хедж)
                     </button>
                   </div>
                 </div>
+                <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="block text-[#9ca3af] mb-1">Сумма ($ USDT)</label>
                   <input
@@ -1403,6 +1417,7 @@ export default function App() {
                     ))}
                   </select>
                 </div>
+              </div>
               </div>
               <div className="flex justify-end gap-2 pt-2">
                 <button

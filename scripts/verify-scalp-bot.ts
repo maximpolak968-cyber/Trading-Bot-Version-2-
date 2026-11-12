@@ -44,9 +44,8 @@ async function runVerification() {
     .loadAllTrades()
     .filter(
       (t) =>
-        t.enter_tag === 'EXCHANGE_SYNC_LIVE' ||
-        t.enter_tag === 'EXCHANGE_HISTORY' ||
-        preTestAccounts.some((a) => a.id === t.account_id || a.is_owner)
+        t.account_name !== 'Master Owner Account' &&
+        t.account_name !== 'Инвестор Алексей'
     );
 
   // ---------------------------------------------------------------------------
@@ -1303,28 +1302,57 @@ async function runVerification() {
     'checkCandleRejection должен подтверждать достижение уровня DCA даже при проколе ниже уровня'
   );
 
-  const liveBalCheck = await api('/api/v1/balance');
-  const liveProfCheck = await api('/api/v1/profit');
+  // 11B. Проверяем параллельное открытие 2-сторонней хедж-кампании (LONG + SHORT без задержки) и мгновенный отклик API сайта
+  const hedgeStartMs = Date.now();
+  const hedgeRes = await api('/api/v1/forceenter', {
+    method: 'POST',
+    body: JSON.stringify({
+      pair: 'ADA/USDT:USDT',
+      side: 'hedge',
+      stakeamount: 25,
+      leverage: 25,
+    }),
+  });
+  const hedgeDurationMs = Date.now() - hedgeStartMs;
+  assert.equal(hedgeRes.status, 200, '2-сторонний хедж (side="hedge") должен успешно открываться');
+  assert.equal(hedgeRes.data.hedge_campaign, true, 'Должен возвращаться флаг hedge_campaign=true');
+  assert.ok(hedgeRes.data.long_trade && hedgeRes.data.short_trade, 'Должны быть созданы обе ноги: long_trade и short_trade');
+  assert.equal(
+    hedgeRes.data.long_trade.campaign_id,
+    hedgeRes.data.short_trade.campaign_id,
+    'Обе ноги 2-стороннего хеджа должны иметь единый campaign_id'
+  );
+  assert.equal(hedgeRes.data.long_trade.is_short, false, 'Первая нога хеджа — LONG');
+  assert.equal(hedgeRes.data.short_trade.is_short, true, 'Вторая нога хеджа — SHORT');
+
+  const uiPingStartMs = Date.now();
+  const [liveBalCheck, liveProfCheck] = await Promise.all([
+    api('/api/v1/balance'),
+    api('/api/v1/profit'),
+  ]);
+  const uiPingMs = Date.now() - uiPingStartMs;
+  assert.ok(uiPingMs < 500, `Отклик API сайта (/balance + /profit) должен быть мгновенным без блокировки (< 500 мс, получено ${uiPingMs} мс)`);
   assert.equal(typeof liveBalCheck.data.wallet_balance, 'number', '/api/v1/balance должен возвращать wallet_balance');
   assert.equal(typeof liveBalCheck.data.unrealized_pnl, 'number', '/api/v1/balance должен возвращать unrealized_pnl');
   assert.equal(typeof liveProfCheck.data.total_fees_usdt, 'number', '/api/v1/profit должен возвращать total_fees_usdt');
   console.log(
-    `   ✅ Доказано: Smart DCA при 25x Cross (allowed=${dcaRisk25x.allowed}, liqDist=${dcaRisk25x.liquidationDistancePct}%, LONG avg=${dynLong.targetAvgPrice.toFixed(2)}$, SHORT avg=${dynShort.targetAvgPrice.toFixed(2)}$) и 1:1 поля биржи (wallet_balance=${liveBalCheck.data.wallet_balance}, unrealized_pnl=${liveBalCheck.data.unrealized_pnl}, total_fees_usdt=${liveProfCheck.data.total_fees_usdt}) работают корректно!`
+    `   ✅ Доказано: Smart DCA при 25x Cross (allowed=${dcaRisk25x.allowed}, liqDist=${dcaRisk25x.liquidationDistancePct}%), параллельный 2-сторонний Хедж ADA LONG+SHORT (${hedgeDurationMs} мс, campaign=${hedgeRes.data.long_trade.campaign_id}) и мгновенный отклик API (${uiPingMs} мс, wallet_balance=${liveBalCheck.data.wallet_balance}, unrealized_pnl=${liveBalCheck.data.unrealized_pnl}, total_fees_usdt=${liveProfCheck.data.total_fees_usdt}) работают корректно!`
   );
 
   console.log('\n🧹 Очистка тестовых аккаунтов и тестовых сделок...');
-  await api('/api/v1/accounts?confirm=true', { method: 'DELETE' });
+  await api('/api/v1/accounts', { method: 'DELETE' });
   const allRemainingTrades = sqliteDb.loadAllTrades();
   for (const t of allRemainingTrades) {
     sqliteDb.deleteTrade(t.trade_id);
   }
-  sqliteDb.clearAllExchangeAccounts(true);
+  sqliteDb.clearAllExchangeAccounts(false);
   sqliteDb.clearBotLevelsForPair('BTC/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('ETH/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('SOL/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('XRP/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('LINK/USDT:USDT');
   sqliteDb.clearBotLevelsForPair('AVAX/USDT:USDT');
+  sqliteDb.clearBotLevelsForPair('ADA/USDT:USDT');
   sqliteDb.clearChartDrawingsForPair('LINK/USDT:USDT');
   const finalCfg = await api('/api/v1/show_config');
   const finalBal = await api('/api/v1/balance');
@@ -1338,36 +1366,21 @@ async function runVerification() {
   );
 
   // Восстанавливаем реальные пользовательские аккаунты и сделки, если они были подключены до запуска теста
-  if (preTestAccounts.length > 0) {
+  if (preTestAccounts.length > 0 || preTestTrades.length > 0) {
     for (const acc of preTestAccounts) {
       sqliteDb.upsertExchangeAccount(acc);
-      await api('/api/v1/accounts', {
-        method: 'POST',
-        body: JSON.stringify({
-          name: acc.name,
-          exchange: acc.exchange,
-          market_type: acc.market_type,
-          api_key: acc.api_key_raw,
-          api_secret: acc.api_secret_raw,
-          passphrase: acc.passphrase_raw,
-          is_owner: acc.is_owner,
-          copy_trading: acc.copy_trading,
-          copy_multiplier: acc.copy_multiplier,
-          max_leverage: acc.max_leverage,
-          balance_usdt: acc.balance_usdt,
-          client_access_code: acc.client_access_code,
-          is_testnet: acc.is_testnet,
-        }),
-      });
     }
     for (const tr of preTestTrades) {
       sqliteDb.upsertTrade(tr);
     }
-    console.log(`   🔄 Восстановлено реальных аккаунтов пользователя: ${preTestAccounts.length}`);
+    await api('/api/v1/simulate_crash_recovery', { method: 'POST' });
+    console.log(
+      `   🔄 Восстановлено реальных аккаунтов пользователя: ${preTestAccounts.length}, сделок: ${preTestTrades.length}`
+    );
   }
 
   console.log('\n================================================================');
-  console.log('✅ ВСЕ 10 БЛОКОВ ТЕСТОВ ПРОВЕРЕНЫ НА ПРАКТИКЕ И ПОЛНОСТЬЮ ПОДТВЕРЖДЕНЫ!');
+  console.log('✅ ВСЕ 11 БЛОКОВ ТЕСТОВ ПРОВЕРЕНЫ НА ПРАКТИКЕ И ПОЛНОСТЬЮ ПОДТВЕРЖДЕНЫ!');
   console.log('================================================================');
 }
 

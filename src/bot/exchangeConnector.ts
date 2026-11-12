@@ -98,6 +98,7 @@ const bybitSymbolMetaByHost = new Map<
 >();
 const bybitHostCache = new Map<string, string>();
 const bybitLeverageCache = new Map<string, number>();
+const bybitHedgeModeCache = new Map<string, boolean>();
 
 const okxDemoCache = new Map<string, boolean>();
 const bitgetDemoCache = new Map<string, boolean>();
@@ -700,6 +701,113 @@ async function getBinanceDualSideMode(
 }
 
 /**
+ * Автоматически включает или проверяет режим хеджирования (Hedge Mode: одновременный LONG + SHORT по одной паре)
+ * на подключенной бирже (Binance dualSidePosition=true, Bybit mode=3 Both Sides).
+ */
+export async function ensureExchangeHedgeMode(
+  creds: ExchangeCredentials,
+  pair: string
+): Promise<{ enabled: boolean; message: string }> {
+  const cleanKey = String(creds.apiKey || '').trim();
+  const cleanSecret = String(creds.apiSecret || '').trim();
+  const symbol = pairToCleanSymbol(pair);
+
+  if (isSimulatedTestApiKey(cleanKey)) {
+    return { enabled: true, message: 'Simulated Hedge Mode enabled' };
+  }
+  if (!cleanKey || !cleanSecret) {
+    return { enabled: false, message: 'Missing API credentials' };
+  }
+
+  if (creds.exchange === 'binance') {
+    const candidateHosts = getBinanceCandidateHosts(cleanKey, creds.isTestnet);
+    for (const baseUrl of candidateHosts) {
+      try {
+        const currentDual = await getBinanceDualSideMode(cleanKey, cleanSecret, false, baseUrl);
+        if (currentDual) {
+          return { enabled: true, message: 'Binance Hedge Mode (dualSidePosition=true) уже активен' };
+        }
+        const ts = await getBinanceTimestamp(false, baseUrl);
+        const query = `dualSidePosition=true&timestamp=${ts}&recvWindow=10000`;
+        const sig = signBinanceFuturesQuery(query, cleanSecret);
+        const res = await makeHttpsRequest(
+          `${baseUrl}/fapi/v1/positionSide/dual?${query}&signature=${sig}`,
+          {
+            method: 'POST',
+            headers: { 'X-MBX-APIKEY': cleanKey },
+            timeoutMs: 4500,
+          }
+        );
+        if (res.statusCode === 200 || res.data.includes('-4059')) {
+          binanceDualSideCache.set(cleanKey, { dualSide: true, updatedAt: Date.now() });
+          return { enabled: true, message: 'Binance Hedge Mode (dualSidePosition=true) включен' };
+        }
+        if (res.data.includes('-2015')) continue;
+      } catch {
+        // try next host
+      }
+    }
+    const fallbackDual = binanceDualSideCache.get(cleanKey)?.dualSide ?? false;
+    return {
+      enabled: fallbackDual,
+      message: fallbackDual
+        ? 'Binance Hedge Mode активен'
+        : 'Binance в режиме One-Way (переключение на Hedge Mode недоступно при открытых позициях)',
+    };
+  }
+
+  if (creds.exchange === 'bybit') {
+    if (bybitHedgeModeCache.get(cleanKey) === true) {
+      return { enabled: true, message: 'Bybit Hedge Mode (mode=3) уже активен' };
+    }
+    const candidateHosts = getBybitCandidateHosts(cleanKey, creds.isTestnet);
+    for (const baseUrl of candidateHosts) {
+      try {
+        const timestamp = await getBybitTimestamp(baseUrl, false);
+        const recvWindow = '10000';
+        const bodyStr = JSON.stringify({
+          category: 'linear',
+          symbol,
+          mode: 3, // 3 = Both Sides (Hedge Mode)
+        });
+        const sig = signBybitV5(timestamp, cleanKey, recvWindow, bodyStr, cleanSecret);
+        const res = await makeHttpsRequest(`${baseUrl}/v5/position/switch-mode`, {
+          method: 'POST',
+          headers: {
+            'X-BAPI-API-KEY': cleanKey,
+            'X-BAPI-TIMESTAMP': timestamp,
+            'X-BAPI-SIGN': sig,
+            'X-BAPI-RECV-WINDOW': recvWindow,
+            'Content-Type': 'application/json',
+          },
+          body: bodyStr,
+          timeoutMs: 4500,
+        });
+        if (res.statusCode === 200) {
+          const json = JSON.parse(res.data);
+          if (json.retCode === 10003 || json.retCode === 10004 || json.retCode === 33004) {
+            continue;
+          }
+          // 0 = switched to Hedge Mode, 110025 = Position mode is not modified (already mode 3)
+          if (json.retCode === 0 || json.retCode === 110025) {
+            bybitHedgeModeCache.set(cleanKey, true);
+            return { enabled: true, message: 'Bybit Hedge Mode (mode=3) активен' };
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return {
+      enabled: bybitHedgeModeCache.get(cleanKey) ?? false,
+      message: 'Bybit One-Way Mode',
+    };
+  }
+
+  return { enabled: true, message: `${creds.exchange.toUpperCase()} поддерживает 2-сторонний вход` };
+}
+
+/**
  * Устанавливает кредитное плечо (25x с авто-фоллбэком до максимального доступного на паре) и тип маржи CROSSED на Binance Futures.
  */
 async function ensureBinanceSymbolLeverage(
@@ -1226,7 +1334,8 @@ export async function executeExchangeFuturesOrder(
           });
         };
 
-        let activePosIdx: 0 | 1 | 2 = 0;
+        const cachedHedge = bybitHedgeModeCache.get(cleanKey) === true;
+        let activePosIdx: 0 | 1 | 2 = cachedHedge ? (params.isShort ? 2 : 1) : 0;
         let res = await sendBybitOrder(activePosIdx, false);
 
         if (res.statusCode === 200) {
@@ -1247,14 +1356,20 @@ export async function executeExchangeFuturesOrder(
             continue;
           }
 
-          // Если на аккаунте Bybit включен Hedge Mode (retCode 10001: position idx not match position mode) — повторяем с positionIdx 1 (Long) или 2 (Short)
+          // Если на аккаунте Bybit включен Hedge Mode или наоборот One-Way Mode (retCode 10001: position idx not match position mode)
           if (
             json.retCode === 10001 &&
             String(json.retMsg || '')
               .toLowerCase()
               .includes('position idx')
           ) {
-            activePosIdx = params.isShort ? 2 : 1;
+            if (activePosIdx === 0) {
+              activePosIdx = params.isShort ? 2 : 1;
+              bybitHedgeModeCache.set(cleanKey, true);
+            } else {
+              activePosIdx = 0;
+              bybitHedgeModeCache.set(cleanKey, false);
+            }
             const retryRes = await sendBybitOrder(activePosIdx, false);
             if (retryRes.statusCode === 200) {
               json = JSON.parse(retryRes.data);
@@ -3112,33 +3227,39 @@ export async function fetchExchangeClosedPnl(
     return { success: false, closed: [] };
   }
 
-  // 2. BINANCE USDT-M FUTURES (/fapi/v1/income + /fapi/v1/userTrades)
+  // 2. BINANCE USDT-M FUTURES (/fapi/v1/income?incomeType=REALIZED_PNL + /fapi/v1/userTrades)
   if (creds.exchange === 'binance') {
     const candidateHosts = getBinanceCandidateHosts(cleanKey, creds.isTestnet);
     for (const baseUrl of candidateHosts) {
       try {
         const ts = await getBinanceTimestamp(false, baseUrl);
-        const incQuery = `limit=200&timestamp=${ts}&recvWindow=10000`;
-        const incSig = signBinanceFuturesQuery(incQuery, cleanSecret);
-        const incRes = await makeHttpsRequest(
-          `${baseUrl}/fapi/v1/income?${incQuery}&signature=${incSig}`,
-          {
+        const pnlQuery = `incomeType=REALIZED_PNL&limit=1000&timestamp=${ts}&recvWindow=10000`;
+        const pnlSig = signBinanceFuturesQuery(pnlQuery, cleanSecret);
+        const commQuery = `incomeType=COMMISSION&limit=1000&timestamp=${ts}&recvWindow=10000`;
+        const commSig = signBinanceFuturesQuery(commQuery, cleanSecret);
+
+        const [incRes, commRes] = await Promise.all([
+          makeHttpsRequest(`${baseUrl}/fapi/v1/income?${pnlQuery}&signature=${pnlSig}`, {
             method: 'GET',
             headers: { 'X-MBX-APIKEY': cleanKey },
             timeoutMs: 6500,
-          }
-        );
+          }),
+          makeHttpsRequest(`${baseUrl}/fapi/v1/income?${commQuery}&signature=${commSig}`, {
+            method: 'GET',
+            headers: { 'X-MBX-APIKEY': cleanKey },
+            timeoutMs: 6500,
+          }).catch(() => ({ statusCode: 0, data: '[]', latencyMs: 0 })),
+        ]);
+
         if (incRes.statusCode !== 200) {
           if (incRes.data.includes('-2015')) continue;
           break;
         }
         binanceHostCache.set(cleanKey, baseUrl);
         const incomeList = JSON.parse(incRes.data);
+        const commList = commRes.statusCode === 200 ? JSON.parse(commRes.data) : [];
+
         const symbolsToQuery = new Set<string>();
-        for (const rawSym of knownSymbols) {
-          const cleanSym = pairToCleanSymbol(rawSym);
-          if (cleanSym.endsWith('USDT')) symbolsToQuery.add(cleanSym);
-        }
         if (Array.isArray(incomeList)) {
           for (const inc of incomeList) {
             const sym = String(inc.symbol || '').trim().toUpperCase();
@@ -3147,138 +3268,210 @@ export async function fetchExchangeClosedPnl(
             }
           }
         }
+        for (const rawSym of knownSymbols) {
+          const cleanSym = pairToCleanSymbol(rawSym);
+          if (cleanSym.endsWith('USDT')) symbolsToQuery.add(cleanSym);
+        }
 
         const closed: ExchangeClosedPnlItem[] = [];
-        const symbolArr = Array.from(symbolsToQuery).slice(0, 12);
+        const coveredSymbolsWithUserTrades = new Set<string>();
+        const symbolArr = Array.from(symbolsToQuery).slice(0, 30);
 
-        for (const sym of symbolArr) {
-          try {
-            const uTs = await getBinanceTimestamp(false, baseUrl);
-            const uQuery = `symbol=${sym}&limit=100&timestamp=${uTs}&recvWindow=10000`;
-            const uSig = signBinanceFuturesQuery(uQuery, cleanSecret);
-            const uRes = await makeHttpsRequest(
-              `${baseUrl}/fapi/v1/userTrades?${uQuery}&signature=${uSig}`,
-              {
-                method: 'GET',
-                headers: { 'X-MBX-APIKEY': cleanKey },
-                timeoutMs: 5000,
-              }
-            );
-            if (uRes.statusCode !== 200) continue;
-            const trades = JSON.parse(uRes.data);
-            if (!Array.isArray(trades) || trades.length === 0) continue;
+        // Запрашиваем /fapi/v1/userTrades параллельными пакетами по 5 символов для быстрого отклика
+        const batchSize = 5;
+        for (let i = 0; i < symbolArr.length; i += batchSize) {
+          const batch = symbolArr.slice(i, i + batchSize);
+          await Promise.all(
+            batch.map(async (sym) => {
+              try {
+                const uTs = await getBinanceTimestamp(false, baseUrl);
+                const uQuery = `symbol=${sym}&limit=200&timestamp=${uTs}&recvWindow=10000`;
+                const uSig = signBinanceFuturesQuery(uQuery, cleanSecret);
+                const uRes = await makeHttpsRequest(
+                  `${baseUrl}/fapi/v1/userTrades?${uQuery}&signature=${uSig}`,
+                  {
+                    method: 'GET',
+                    headers: { 'X-MBX-APIKEY': cleanKey },
+                    timeoutMs: 5000,
+                  }
+                );
+                if (uRes.statusCode !== 200) return;
+                const trades = JSON.parse(uRes.data);
+                if (!Array.isArray(trades) || trades.length === 0) return;
 
-            const sortedTrades = [...trades].sort(
-              (a, b) => Number(a.time || 0) - Number(b.time || 0)
-            );
+                const sortedTrades = [...trades].sort(
+                  (a, b) => Number(a.time || 0) - Number(b.time || 0)
+                );
 
-            // Группируем закрывающие сделки (realizedPnl !== 0) по orderId и суммируем фактическую комиссию входа из предшествующих открывающих сделок
-            const byOrder = new Map<
-              string,
-              {
-                orderId: string;
-                symbol: string;
-                side: string;
-                positionSide: string;
-                qty: number;
-                notional: number;
-                grossPnl: number;
-                openFee: number;
-                closeFee: number;
-                openTime: number;
-                time: number;
-              }
-            >();
+                // Группируем закрывающие сделки (realizedPnl !== 0) по orderId и суммируем фактическую комиссию входа
+                const byOrder = new Map<
+                  string,
+                  {
+                    orderId: string;
+                    symbol: string;
+                    side: string;
+                    positionSide: string;
+                    qty: number;
+                    notional: number;
+                    grossPnl: number;
+                    openFee: number;
+                    closeFee: number;
+                    openTime: number;
+                    time: number;
+                  }
+                >();
 
-            let pendingOpenFee = 0;
-            let pendingOpenTime = 0;
+                let pendingOpenFee = 0;
+                let pendingOpenTime = 0;
 
-            for (const t of sortedTrades) {
-              const rPnl = Number(t.realizedPnl || 0);
-              const qty = Math.abs(Number(t.qty || 0));
-              const price = Number(t.price || 0);
-              const fee = Math.abs(Number(t.commission || 0));
-              const time = Number(t.time || Date.now());
+                for (const t of sortedTrades) {
+                  const rPnl = Number(t.realizedPnl || 0);
+                  const qty = Math.abs(Number(t.qty || 0));
+                  const price = Number(t.price || 0);
+                  const fee = Math.abs(Number(t.commission || 0));
+                  const time = Number(t.time || Date.now());
 
-              if (Math.abs(rPnl) < 1e-8) {
-                pendingOpenFee += fee;
-                if (!pendingOpenTime || time < pendingOpenTime) {
-                  pendingOpenTime = time;
+                  if (Math.abs(rPnl) < 1e-8) {
+                    pendingOpenFee += fee;
+                    if (!pendingOpenTime || time < pendingOpenTime) {
+                      pendingOpenTime = time;
+                    }
+                    continue;
+                  }
+
+                  const ordId = String(t.orderId || t.id || `${sym}-${time}`);
+                  const existing = byOrder.get(ordId);
+                  if (existing) {
+                    existing.qty += qty;
+                    existing.notional += qty * price;
+                    existing.grossPnl += rPnl;
+                    existing.closeFee += fee;
+                    if (time > existing.time) existing.time = time;
+                  } else {
+                    byOrder.set(ordId, {
+                      orderId: ordId,
+                      symbol: sym,
+                      side: String(t.side || '').toUpperCase(),
+                      positionSide: String(t.positionSide || '').toUpperCase(),
+                      qty,
+                      notional: qty * price,
+                      grossPnl: rPnl,
+                      openFee: pendingOpenFee,
+                      closeFee: fee,
+                      openTime: pendingOpenTime > 0 ? pendingOpenTime : time - 60_000,
+                      time,
+                    });
+                    pendingOpenFee = 0;
+                    pendingOpenTime = 0;
+                  }
                 }
-                continue;
-              }
 
-              const ordId = String(t.orderId || t.id || `${sym}-${time}`);
-              const existing = byOrder.get(ordId);
-              if (existing) {
-                existing.qty += qty;
-                existing.notional += qty * price;
-                existing.grossPnl += rPnl;
-                existing.closeFee += fee;
-                if (time > existing.time) existing.time = time;
-              } else {
-                byOrder.set(ordId, {
-                  orderId: ordId,
-                  symbol: sym,
-                  side: String(t.side || '').toUpperCase(),
-                  positionSide: String(t.positionSide || '').toUpperCase(),
-                  qty,
-                  notional: qty * price,
-                  grossPnl: rPnl,
-                  openFee: pendingOpenFee,
-                  closeFee: fee,
-                  openTime: pendingOpenTime > 0 ? pendingOpenTime : time - 60_000,
-                  time,
-                });
-                pendingOpenFee = 0;
-                pendingOpenTime = 0;
+                for (const grp of byOrder.values()) {
+                  if (!(grp.qty > 0) || !(grp.notional > 0)) continue;
+                  coveredSymbolsWithUserTrades.add(sym);
+                  const exitPrice = grp.notional / grp.qty;
+                  const isShort =
+                    grp.positionSide === 'SHORT'
+                      ? true
+                      : grp.positionSide === 'LONG'
+                      ? false
+                      : grp.side === 'BUY';
+                  const rawEntryPrice = isShort
+                    ? exitPrice + grp.grossPnl / grp.qty
+                    : exitPrice - grp.grossPnl / grp.qty;
+                  const entryPrice = rawEntryPrice > 0 ? rawEntryPrice : exitPrice;
+                  const openFee = Number(
+                    (grp.openFee > 0 ? grp.openFee : entryPrice * grp.qty * 0.0005).toFixed(4)
+                  );
+                  const closeFee = Number(
+                    (grp.closeFee > 0 ? grp.closeFee : exitPrice * grp.qty * 0.0005).toFixed(4)
+                  );
+                  const netClosedPnl = grp.grossPnl - openFee - closeFee;
+                  closed.push({
+                    order_id: grp.orderId,
+                    pair: symbolToFreqtradePair(sym),
+                    symbol: sym,
+                    is_short: isShort,
+                    qty: Number(grp.qty.toFixed(6)),
+                    entry_price: Number(entryPrice.toPrecision(8)),
+                    exit_price: Number(exitPrice.toPrecision(8)),
+                    leverage: 25,
+                    closed_pnl: Number(netClosedPnl.toFixed(4)),
+                    open_fee: openFee,
+                    close_fee: closeFee,
+                    created_time: grp.openTime,
+                    updated_time: grp.time,
+                  });
+                }
+              } catch {
+                // ignore symbol error
               }
+            })
+          );
+        }
+
+        // Резервное восстановление из /fapi/v1/income (REALIZED_PNL), если по каким-то символам userTrades не вернул детали
+        if (Array.isArray(incomeList)) {
+          const commByKey = new Map<string, number>();
+          if (Array.isArray(commList)) {
+            for (const c of commList) {
+              const cSym = String(c.symbol || '').toUpperCase();
+              const cBucket = Math.floor(Number(c.time || 0) / 5000);
+              const k = `${cSym}:${cBucket}`;
+              commByKey.set(k, (commByKey.get(k) || 0) + Math.abs(Number(c.income || 0)));
             }
+          }
 
-            for (const grp of byOrder.values()) {
-              if (!(grp.qty > 0) || !(grp.notional > 0)) continue;
-              const exitPrice = grp.notional / grp.qty;
-              const isShort =
-                grp.positionSide === 'SHORT'
-                  ? true
-                  : grp.positionSide === 'LONG'
-                  ? false
-                  : grp.side === 'BUY';
-              const rawEntryPrice = isShort
-                ? exitPrice + grp.grossPnl / grp.qty
-                : exitPrice - grp.grossPnl / grp.qty;
-              const entryPrice = rawEntryPrice > 0 ? rawEntryPrice : exitPrice;
-              const openFee = Number(
-                (grp.openFee > 0 ? grp.openFee : entryPrice * grp.qty * 0.0005).toFixed(4)
-              );
-              const closeFee = Number(
-                (grp.closeFee > 0 ? grp.closeFee : exitPrice * grp.qty * 0.0005).toFixed(4)
-              );
-              // В Binance realizedPnl — это gross PnL до вычета комиссий; чистый реализованный PnL на кошельке = grossPnl - openFee - closeFee
-              const netClosedPnl = grp.grossPnl - openFee - closeFee;
-              closed.push({
-                order_id: grp.orderId,
-                pair: symbolToFreqtradePair(sym),
-                symbol: sym,
-                is_short: isShort,
-                qty: Number(grp.qty.toFixed(6)),
-                entry_price: Number(entryPrice.toPrecision(8)),
-                exit_price: Number(exitPrice.toPrecision(8)),
-                leverage: 25,
-                closed_pnl: Number(netClosedPnl.toFixed(4)),
-                open_fee: openFee,
-                close_fee: closeFee,
-                created_time: grp.openTime,
-                updated_time: grp.time,
+          const incGroups = new Map<
+            string,
+            { sym: string; grossPnl: number; time: number; tranId: string }
+          >();
+          for (const inc of incomeList) {
+            const sym = String(inc.symbol || '').trim().toUpperCase();
+            const gross = Number(inc.income || 0);
+            const time = Number(inc.time || 0);
+            if (!sym || !sym.endsWith('USDT') || Math.abs(gross) < 1e-8) continue;
+            if (coveredSymbolsWithUserTrades.has(sym)) continue;
+            const bucket = Math.floor(time / 5000);
+            const gKey = `${sym}:${bucket}`;
+            const ex = incGroups.get(gKey);
+            if (ex) {
+              ex.grossPnl += gross;
+              if (time > ex.time) ex.time = time;
+            } else {
+              incGroups.set(gKey, {
+                sym,
+                grossPnl: gross,
+                time,
+                tranId: String(inc.tranId || inc.tradeId || `${sym}-${time}`),
               });
             }
-          } catch {
-            // ignore symbol error
+          }
+
+          for (const [gKey, grp] of incGroups.entries()) {
+            const closeFee = Number((commByKey.get(gKey) || Math.abs(grp.grossPnl) * 0.04).toFixed(4));
+            const openFee = closeFee;
+            const netClosedPnl = grp.grossPnl - openFee - closeFee;
+            closed.push({
+              order_id: `inc-${grp.tranId}`,
+              pair: symbolToFreqtradePair(grp.sym),
+              symbol: grp.sym,
+              is_short: false,
+              qty: 1,
+              entry_price: 100,
+              exit_price: Number((100 + grp.grossPnl).toFixed(4)),
+              leverage: 25,
+              closed_pnl: Number(netClosedPnl.toFixed(4)),
+              open_fee: openFee,
+              close_fee: closeFee,
+              created_time: grp.time - 60_000,
+              updated_time: grp.time,
+            });
           }
         }
 
         closed.sort((a, b) => b.updated_time - a.updated_time);
-        return { success: true, closed: closed.slice(0, limit) };
+        return { success: true, closed: closed.slice(0, Math.max(limit, 100)) };
       } catch {
         // try next host
       }
