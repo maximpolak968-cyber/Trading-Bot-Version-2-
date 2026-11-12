@@ -85,6 +85,10 @@ export interface ExchangeAccount {
   copy_multiplier: number;
   max_leverage: number;
   balance_usdt: number;
+  wallet_balance_usdt?: number;
+  equity_usdt?: number;
+  available_balance_usdt?: number;
+  used_margin_usdt?: number;
   unrealized_pnl: number;
   open_trades_count: number;
   status: 'connected' | 'paused' | 'error';
@@ -150,6 +154,8 @@ export interface FreqtradeTrade {
   profit_ratio: number;
   profit_pct: number;
   profit_abs: number;
+  exchange_unrealized_pnl?: number;
+  exchange_realized_pnl?: number;
   take_profit_abs?: number;
   take_profit_pct?: number;
   tp_manual_override?: boolean;
@@ -187,6 +193,7 @@ export interface ProfitSummary {
   profit_all_fiat: number;
   profit_open_coin: number;
   profit_open_percent?: number;
+  total_fees_usdt?: number;
   trade_count: number;
   closed_trade_count: number;
   open_trade_count: number;
@@ -200,6 +207,9 @@ export interface ProfitSummary {
   best_rate: number;
   starting_balance: number;
   current_balance: number;
+  wallet_balance?: number;
+  equity_balance?: number;
+  unrealized_pnl?: number;
 }
 
 export interface DailyRecord {
@@ -223,6 +233,11 @@ export interface BalanceCurrency {
 export interface BalanceResponse {
   currencies: BalanceCurrency[];
   total: number;
+  wallet_balance?: number;
+  equity_balance?: number;
+  unrealized_pnl?: number;
+  available_balance?: number;
+  used_margin?: number;
   symbol: number | string;
   value: number;
   starting_capital: number;

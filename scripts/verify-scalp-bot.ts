@@ -10,6 +10,11 @@ import {
   formatBybitFuturesQuantity,
   isPairTradableOnExchange,
 } from '../src/bot/exchangeConnector';
+import {
+  canExecuteDca,
+  calculateDynamicDcaAmount,
+  checkCandleRejection,
+} from '../src/bot/scalpBotEngine';
 
 const sqliteDb = new SqliteBotDatabase();
 const BASE_URL = 'http://127.0.0.1:3000';
@@ -1222,6 +1227,89 @@ async function runVerification() {
   }
   console.log(
     '   ✅ Доказано: реальные комиссии всех 5 бирж (Bybit 0.055%, Binance/OKX/BingX 0.05%, Bitget 0.06%), маппинг позиций и защита .exchange_accounts.backup.json работают безотказно!'
+  );
+
+  // ---------------------------------------------------------------------------
+  // ТЕСТ 11: ПРОВЕРКА УСРЕДНЕНИЯ (SMART DCA ПРИ 25X CROSS) И 1:1 БАЛАНСА БИРЖИ
+  // ---------------------------------------------------------------------------
+  console.log('\n1️⃣1️⃣ Проверка Smart DCA при плече 25x Cross и 1:1 синхронизации баланса/PnL/комиссий...');
+  const dcaRisk25x = canExecuteDca({
+    pair: 'ETH/USDT:USDT',
+    dcaCount: 0,
+    initialAmount: 6.25,
+    currentAmount: 6.25,
+    currentPrice: 98.5,
+    openRate: 100,
+    isShort: false,
+    leverage: 25,
+    totalBalanceUsdt: 5000,
+    usedMarginUsdt: 25,
+  });
+  assert.equal(
+    dcaRisk25x.allowed,
+    true,
+    `canExecuteDca при 25x Cross должен разрешать усреднение (получено: allowed=${dcaRisk25x.allowed}, reason=${dcaRisk25x.reason})`
+  );
+
+  const dynLong = calculateDynamicDcaAmount({
+    currentAmount: 6.25,
+    openRate: 100,
+    currentPrice: 98.5,
+    isShort: false,
+    leverage: 25,
+    totalBalanceUsdt: 5000,
+    usedMarginUsdt: 25,
+    otherActiveCoinsCount: 2,
+  });
+  assert.ok(
+    dynLong.addStake >= 25,
+    `Динамический объем DCA для LONG должен рассчитываться корректно (addStake=${dynLong.addStake}$, targetAvgPrice=${dynLong.targetAvgPrice}$)`
+  );
+  assert.ok(
+    dynLong.targetAvgPrice < 100 && dynLong.targetAvgPrice > 98.5,
+    `Новая средняя цена входа LONG после DCA (${dynLong.targetAvgPrice}$) должна смещаться ближе к текущей цене (98.5$)`
+  );
+
+  const dynShort = calculateDynamicDcaAmount({
+    currentAmount: 6.25,
+    openRate: 100,
+    currentPrice: 101.5,
+    isShort: true,
+    leverage: 25,
+    totalBalanceUsdt: 5000,
+    usedMarginUsdt: 25,
+    otherActiveCoinsCount: 2,
+  });
+  assert.ok(
+    dynShort.addStake >= 25,
+    `Динамический объем DCA для SHORT должен рассчитываться корректно (addStake=${dynShort.addStake}$, targetAvgPrice=${dynShort.targetAvgPrice}$)`
+  );
+  assert.ok(
+    dynShort.targetAvgPrice > 100 && dynShort.targetAvgPrice < 101.5,
+    `Новая средняя цена входа SHORT после DCA (${dynShort.targetAvgPrice}$) должна смещаться ближе к текущей цене (101.5$)`
+  );
+
+  const rejCheck = checkCandleRejection(
+    [
+      { timestamp: 1, open: 99.0, high: 99.1, low: 98.6, close: 98.7, volume: 100 },
+      { timestamp: 2, open: 98.7, high: 98.8, low: 98.1, close: 98.2, volume: 150 },
+    ],
+    98.5,
+    false
+  );
+  assert.equal(
+    rejCheck.confirmed,
+    true,
+    'checkCandleRejection должен подтверждать достижение уровня DCA даже при проколе ниже уровня'
+  );
+
+  const liveBalCheck = await api('/api/v1/balance');
+  const liveProfCheck = await api('/api/v1/profit');
+  assert.equal(typeof liveBalCheck.data.wallet_balance, 'number', '/api/v1/balance должен возвращать wallet_balance');
+  assert.equal(typeof liveBalCheck.data.unrealized_pnl, 'number', '/api/v1/balance должен возвращать unrealized_pnl');
+  assert.equal(typeof liveProfCheck.data.total_fees_usdt, 'number', '/api/v1/profit должен возвращать total_fees_usdt');
+  console.log(
+    `   ✅ Доказано: Smart DCA при 25x Cross (allowed=${dcaRisk25x.allowed}, liqDist=${dcaRisk25x.liquidationDistancePct}%, LONG avg=${dynLong.targetAvgPrice.toFixed(2)}$, SHORT avg=${dynShort.targetAvgPrice.toFixed(2)}$) и 1:1 поля биржи (wallet_balance=${liveBalCheck.data.wallet_balance}, unrealized_pnl=${liveBalCheck.data.unrealized_pnl}, total_fees_usdt=${liveProfCheck.data.total_fees_usdt}) работают корректно!`
   );
 
   console.log('\n🧹 Очистка тестовых аккаунтов и тестовых сделок...');

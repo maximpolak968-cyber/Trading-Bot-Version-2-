@@ -834,7 +834,8 @@ export function checkCandleRejection(
   const body = Math.abs(closeP - openP);
 
   if (!isShort) {
-    const nearLevel = lowP <= level * (1 + tolerancePct / 100.0);
+    const nearLevel =
+      lowP <= level * (1 + tolerancePct / 100.0) || closeP <= level * (1 + tolerancePct / 100.0);
     if (!nearLevel) {
       return { confirmed: false, reason: `Price ${lowP} not testing support ${level}` };
     }
@@ -842,19 +843,20 @@ export function checkCandleRejection(
       return { confirmed: false, reason: 'Knife drop detected (no lower wick, strong dump candle)' };
     }
     const lowerWick = Math.min(openP, closeP) - lowP;
-    const hasRejectionWick = lowerWick / candleRange >= 0.35 || lowerWick >= body * 0.8;
-    const closedAboveLevel = closeP >= level * 0.998;
+    const hasRejectionWick = lowerWick / candleRange >= 0.2 || lowerWick >= body * 0.5;
+    const reachedLevelZone = closeP <= level * 1.002 || lowP <= level;
     const isGreen = closeP > openP;
     const bullishEngulfing = isGreen && closeP > prevRow.open && prevRow.close < prevRow.open;
-    const confirmed = closedAboveLevel && (hasRejectionWick || isGreen || bullishEngulfing);
+    const confirmed = reachedLevelZone && (hasRejectionWick || isGreen || bullishEngulfing || closeP <= level);
     return {
       confirmed,
       reason: confirmed
-        ? 'Support bounce confirmed by price action'
+        ? 'Support / DCA level reached and confirmed by price action'
         : 'Waiting for support bounce confirmation',
     };
   } else {
-    const nearLevel = highP >= level * (1 - tolerancePct / 100.0);
+    const nearLevel =
+      highP >= level * (1 - tolerancePct / 100.0) || closeP >= level * (1 - tolerancePct / 100.0);
     if (!nearLevel) {
       return { confirmed: false, reason: `Price ${highP} not testing resistance ${level}` };
     }
@@ -862,15 +864,15 @@ export function checkCandleRejection(
       return { confirmed: false, reason: 'Rocket pump detected (no upper wick, strong pump candle)' };
     }
     const upperWick = highP - Math.max(openP, closeP);
-    const hasRejectionWick = upperWick / candleRange >= 0.35 || upperWick >= body * 0.8;
-    const closedBelowLevel = closeP <= level * 1.002;
+    const hasRejectionWick = upperWick / candleRange >= 0.2 || upperWick >= body * 0.5;
+    const reachedLevelZone = closeP >= level * 0.998 || highP >= level;
     const isRed = closeP < openP;
     const bearishEngulfing = isRed && closeP < prevRow.open && prevRow.close > prevRow.open;
-    const confirmed = closedBelowLevel && (hasRejectionWick || isRed || bearishEngulfing);
+    const confirmed = reachedLevelZone && (hasRejectionWick || isRed || bearishEngulfing || closeP >= level);
     return {
       confirmed,
       reason: confirmed
-        ? 'Resistance rejection confirmed by price action'
+        ? 'Resistance / DCA level reached and confirmed by price action'
         : 'Waiting for resistance rejection confirmation',
     };
   }
@@ -1396,19 +1398,27 @@ export function canExecuteDca(
     };
   }
 
-  // 6. Liquidation distance check
+  // 6. Liquidation distance check (Cross-Margin aware + scaled for high leverage like 25x)
+  const crossMarginBuffer = Math.min(
+    0.85,
+    Math.max(
+      0.92 / lev,
+      (currentPairMargin + availableBalance * 0.35) / Math.max(1, currentPairNotional)
+    )
+  );
   const approxLiqPrice = params.isShort
-    ? params.openRate * (1 + 0.92 / lev)
-    : params.openRate * (1 - 0.92 / lev);
+    ? params.openRate * (1 + crossMarginBuffer)
+    : params.openRate * (1 - crossMarginBuffer);
   const liqDistancePct =
     params.currentPrice > 0
       ? (Math.abs(params.currentPrice - approxLiqPrice) / params.currentPrice) * 100.0
       : 100;
+  const effectiveMinLiqPct = Math.min(minLiqDistPct, Number((25.0 / lev).toFixed(2)));
 
-  if (liqDistancePct < minLiqDistPct) {
+  if (liqDistancePct < effectiveMinLiqPct) {
     return {
       allowed: false,
-      reason: `Слишком близко к ликвидации: ${liqDistancePct.toFixed(1)}% (лимит ${minLiqDistPct}%)`,
+      reason: `Слишком близко к ликвидации: ${liqDistancePct.toFixed(1)}% (лимит ${effectiveMinLiqPct}%)`,
       multiplier: currentMultiplier,
       liquidationDistancePct: Number(liqDistancePct.toFixed(2)),
     };
@@ -1458,18 +1468,20 @@ export function calculateDynamicDcaAmount(params: {
     Math.max(25, Math.min(freeMargin * 0.5, fairShareMargin * 1.5))
   );
 
-  // Desired average entry price: pull within 0.8% of current reversal price
+  // Desired average entry price: pull within 0.8% towards current reversal price
+  // For LONG (openRate > currentPrice): targetAvgPrice is slightly above currentPrice (currentPrice * 1.008)
+  // For SHORT (openRate < currentPrice): targetAvgPrice is slightly below currentPrice (currentPrice * 0.992)
   const targetAvgPrice = params.isShort
-    ? params.currentPrice * 1.008
-    : params.currentPrice * 0.992;
+    ? Math.max(params.openRate, params.currentPrice * 0.992)
+    : Math.min(params.openRate, params.currentPrice * 1.008);
 
-  // Q_add = Q_old * (P_old - P_target) / (P_target - P_current)
+  // Q_add = Q_old * |P_old - P_target| / |P_target - P_current|
   const priceDiffOld = Math.abs(params.openRate - targetAvgPrice);
   const priceDiffNew = Math.abs(targetAvgPrice - params.currentPrice);
 
   let desiredAddAmount = params.currentAmount;
-  if (priceDiffNew > 1e-8) {
-    desiredAddAmount = params.currentAmount * (priceDiffOld / priceDiffNew);
+  if (priceDiffNew > 1e-8 && priceDiffOld > 1e-8) {
+    desiredAddAmount = Math.min(params.currentAmount * 2.5, params.currentAmount * (priceDiffOld / priceDiffNew));
   }
 
   // Convert desired amount to margin

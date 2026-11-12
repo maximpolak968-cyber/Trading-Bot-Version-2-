@@ -17,7 +17,11 @@ export interface ConnectionTestResult {
   message: string;
   latency_ms: number;
   balance_usdt?: number;
+  wallet_balance_usdt?: number;
+  unrealized_pnl_usdt?: number;
+  equity_usdt?: number;
   available_balance_usdt?: number;
+  used_margin_usdt?: number;
   can_trade: boolean;
   account_type?: string;
   dual_side_position?: boolean;
@@ -37,6 +41,7 @@ export interface PlacedOrderResult {
   status: 'FILLED' | 'NEW' | 'PARTIALLY_FILLED' | 'REJECTED';
   exchange_time: number;
   commission_usdt?: number;
+  realized_pnl_usdt?: number;
   error?: string;
   error_code?: string | number;
   is_simulated_test?: boolean;
@@ -1066,21 +1071,80 @@ export async function executeExchangeFuturesOrder(
         if (res.statusCode === 200) {
           binanceHostCache.set(cleanKey, baseUrl);
           const data = JSON.parse(res.data);
-          const avgPrice =
+          const orderIdStr = String(data.orderId || `bn-${Date.now()}`);
+          let avgPrice =
             Number(data.avgPrice || 0) > 0 ? Number(data.avgPrice) : params.referencePrice;
-          const executedQty =
+          let executedQty =
             Number(data.executedQty || 0) > 0 ? Number(data.executedQty) : Number(formattedQtyStr);
+          let commissionUsdt = Number((avgPrice * executedQty * 0.0005).toFixed(4));
+          let realizedPnlUsdt: number | undefined;
+          let exchangeTime = Number(data.updateTime || Date.now());
+
+          // Запрашиваем фактические сделки ордера из /fapi/v1/userTrades для точной цены, комиссии и realizedPnl
+          if (data.orderId) {
+            try {
+              await new Promise((r) => setTimeout(r, 120));
+              const tTs = await getBinanceTimestamp(false, baseUrl);
+              const tQuery = `symbol=${symbol}&orderId=${encodeURIComponent(orderIdStr)}&timestamp=${tTs}&recvWindow=10000`;
+              const tSig = signBinanceFuturesQuery(tQuery, cleanSecret);
+              const tRes = await makeHttpsRequest(
+                `${baseUrl}/fapi/v1/userTrades?${tQuery}&signature=${tSig}`,
+                {
+                  method: 'GET',
+                  headers: { 'X-MBX-APIKEY': cleanKey },
+                  timeoutMs: 4000,
+                }
+              );
+              if (tRes.statusCode === 200) {
+                const fills = JSON.parse(tRes.data);
+                if (Array.isArray(fills) && fills.length > 0) {
+                  let totalQty = 0;
+                  let totalNotional = 0;
+                  let totalFee = 0;
+                  let totalRealized = 0;
+                  let latestTime = exchangeTime;
+                  for (const f of fills) {
+                    const fQty = Math.abs(Number(f.qty || 0));
+                    const fPrice = Number(f.price || 0);
+                    if (fQty > 0 && fPrice > 0) {
+                      totalQty += fQty;
+                      totalNotional += fQty * fPrice;
+                    }
+                    totalFee += Math.abs(Number(f.commission || 0));
+                    totalRealized += Number(f.realizedPnl || 0);
+                    if (Number(f.time || 0) > latestTime) {
+                      latestTime = Number(f.time);
+                    }
+                  }
+                  if (totalQty > 0 && totalNotional > 0) {
+                    avgPrice = Number((totalNotional / totalQty).toPrecision(8));
+                    executedQty = Number(totalQty.toFixed(6));
+                  }
+                  if (totalFee > 0) {
+                    commissionUsdt = Number(totalFee.toFixed(4));
+                  }
+                  if (isClose || Math.abs(totalRealized) > 0) {
+                    realizedPnlUsdt = Number(totalRealized.toFixed(4));
+                  }
+                  exchangeTime = latestTime;
+                }
+              }
+            } catch {
+              // ignore userTrades lookup failure and use order response
+            }
+          }
 
           return {
             success: true,
-            order_id: String(data.orderId || `bn-${Date.now()}`),
+            order_id: orderIdStr,
             symbol,
             side,
             price: avgPrice,
             qty: executedQty,
             status: 'FILLED',
-            exchange_time: Number(data.updateTime || Date.now()),
-            commission_usdt: Number((avgPrice * executedQty * 0.0005).toFixed(4)),
+            exchange_time: exchangeTime,
+            commission_usdt: commissionUsdt,
+            realized_pnl_usdt: realizedPnlUsdt,
             network_label: baseUrl.includes('testnet') ? 'Binance Testnet' : 'Binance Mainnet',
           };
         }
@@ -1811,16 +1875,29 @@ export async function testExchangeConnection(
           const walletBalance = usdtAsset
             ? Number(usdtAsset.walletBalance || json.totalWalletBalance || 0)
             : Number(json.totalWalletBalance || 0);
+          const unrealizedPnl = usdtAsset
+            ? Number(usdtAsset.unrealizedProfit ?? json.totalUnrealizedProfit ?? 0)
+            : Number(json.totalUnrealizedProfit || 0);
+          const marginBalance = usdtAsset
+            ? Number(usdtAsset.marginBalance || walletBalance + unrealizedPnl)
+            : Number(json.totalMarginBalance || walletBalance + unrealizedPnl);
           const availableBalance = usdtAsset
             ? Number(usdtAsset.availableBalance || json.availableBalance || walletBalance)
-            : walletBalance;
+            : Number(json.availableBalance || walletBalance);
+          const usedMargin = usdtAsset
+            ? Number(
+                usdtAsset.initialMargin ||
+                  json.totalInitialMargin ||
+                  Math.max(0, walletBalance - availableBalance)
+              )
+            : Number(json.totalInitialMargin || Math.max(0, walletBalance - availableBalance));
           const openPositions = Array.isArray(json.positions)
             ? json.positions.filter((p: any) => Math.abs(Number(p.positionAmt || 0)) > 0).length
             : 0;
           const dualSide = await getBinanceDualSideMode(cleanKey, cleanSecret, true, baseUrl);
           const canTrade = Boolean(json.canTrade);
 
-          let statusMsg = `Успешно подключено к ${netLabel} (Пинг: ${res.latencyMs} мс | Баланс: ${walletBalance.toFixed(2)} USDT | Доступно: ${availableBalance.toFixed(2)} USDT | Режим: ${dualSide ? 'Hedge Mode' : 'One-Way'} | Открытых позиций: ${openPositions})`;
+          let statusMsg = `Успешно подключено к ${netLabel} (Пинг: ${res.latencyMs} мс | Баланс: ${walletBalance.toFixed(2)} USDT | Плавающий PnL: ${unrealizedPnl >= 0 ? '+' : ''}${unrealizedPnl.toFixed(2)} USDT | Доступно: ${availableBalance.toFixed(2)} USDT | Режим: ${dualSide ? 'Hedge Mode' : 'One-Way'} | Открытых позиций: ${openPositions})`;
           if (walletBalance <= 0) {
             statusMsg +=
               ' ⚠️ На фьючерсном кошельке USDⓈ-M сейчас 0 USDT! Переведите USDT со Спотового кошелька на Фьючерсный (USDⓈ-M Futures).';
@@ -1832,7 +1909,11 @@ export async function testExchangeConnection(
             message: statusMsg,
             latency_ms: res.latencyMs,
             balance_usdt: walletBalance,
+            wallet_balance_usdt: walletBalance,
+            unrealized_pnl_usdt: unrealizedPnl,
+            equity_usdt: marginBalance,
             available_balance_usdt: availableBalance,
+            used_margin_usdt: usedMargin,
             can_trade: canTrade,
             dual_side_position: dualSide,
             open_positions_count: openPositions,
@@ -1958,35 +2039,58 @@ export async function testExchangeConnection(
           }
 
           let resolvedBalance = 0;
+          let resolvedEquity = 0;
+          let resolvedUnrealizedPnl = 0;
           let resolvedAvailable = 0;
+          let resolvedUsedMargin = 0;
           let walletTypeLabel = 'Unified Trading (UTA)';
 
-          const extractBybitWalletBalance = (payload: any): { bal: number; avail: number } => {
+          const extractBybitWalletBalance = (
+            payload: any
+          ): {
+            walletBal: number;
+            equity: number;
+            unrealizedPnl: number;
+            avail: number;
+            usedMargin: number;
+          } => {
             const acc = payload?.result?.list?.[0];
-            if (!acc) return { bal: 0, avail: 0 };
+            if (!acc) {
+              return { walletBal: 0, equity: 0, unrealizedPnl: 0, avail: 0, usedMargin: 0 };
+            }
             const coins = Array.isArray(acc.coin) ? acc.coin : [];
             const usdt = coins.find((c: any) => c.coin === 'USDT');
-            const usdtEquity = Number(usdt?.equity || usdt?.walletBalance || 0);
-            const usdtWallet = Number(usdt?.walletBalance || usdt?.equity || 0);
+            const usdtWallet = Number(
+              usdt?.walletBalance || acc.totalWalletBalance || usdt?.equity || acc.totalEquity || 0
+            );
+            const usdtUnrealized = Number(usdt?.unrealisedPnl ?? acc.totalPerpUPL ?? 0);
+            const usdtEquity = Number(
+              usdt?.equity || acc.totalEquity || usdtWallet + usdtUnrealized
+            );
+            const usdtUsedMargin = Number(
+              usdt?.totalPositionIM || acc.totalInitialMargin || 0
+            );
             const usdtAvail = Number(
               usdt?.availableToWithdraw ||
-                usdt?.walletBalance ||
-                usdt?.equity ||
                 acc.totalAvailableBalance ||
-                0
+                Math.max(0, usdtWallet - usdtUsedMargin)
             );
-            const totalEq = Number(acc.totalEquity || acc.totalWalletBalance || 0);
-            const bestBal = Math.max(usdtEquity, usdtWallet, totalEq);
             return {
-              bal: Number.isFinite(bestBal) ? bestBal : 0,
-              avail: Number.isFinite(usdtAvail) && usdtAvail > 0 ? usdtAvail : bestBal,
+              walletBal: Number.isFinite(usdtWallet) ? usdtWallet : 0,
+              equity: Number.isFinite(usdtEquity) ? usdtEquity : 0,
+              unrealizedPnl: Number.isFinite(usdtUnrealized) ? usdtUnrealized : 0,
+              avail: Number.isFinite(usdtAvail) && usdtAvail > 0 ? usdtAvail : usdtWallet,
+              usedMargin: Number.isFinite(usdtUsedMargin) ? usdtUsedMargin : 0,
             };
           };
 
           if (json.retCode === 0) {
             const extracted = extractBybitWalletBalance(json);
-            resolvedBalance = extracted.bal;
+            resolvedBalance = extracted.walletBal;
+            resolvedEquity = extracted.equity;
+            resolvedUnrealizedPnl = extracted.unrealizedPnl;
             resolvedAvailable = extracted.avail;
+            resolvedUsedMargin = extracted.usedMargin;
           }
 
           // Если на UNIFIED балансе 0 или аккаунт классический (CONTRACT), проверяем также accountType=CONTRACT
@@ -2001,9 +2105,12 @@ export async function testExchangeConnection(
                 const contractJson = JSON.parse(contractRes.data);
                 if (contractJson.retCode === 0) {
                   const extractedContract = extractBybitWalletBalance(contractJson);
-                  if (extractedContract.bal > resolvedBalance) {
-                    resolvedBalance = extractedContract.bal;
+                  if (extractedContract.walletBal > resolvedBalance) {
+                    resolvedBalance = extractedContract.walletBal;
+                    resolvedEquity = extractedContract.equity;
+                    resolvedUnrealizedPnl = extractedContract.unrealizedPnl;
                     resolvedAvailable = extractedContract.avail;
+                    resolvedUsedMargin = extractedContract.usedMargin;
                     walletTypeLabel = 'Contract (Derivatives)';
                   }
                 }
@@ -2035,8 +2142,10 @@ export async function testExchangeConnection(
           if (json.retCode === 0 || resolvedBalance > 0) {
             bybitHostCache.set(cleanKey, baseUrl);
 
-            // Проверяем количество открытых фьючерсных позиций на Bybit
+            // Проверяем количество открытых фьючерсных позиций на Bybit и их суммарный Unrealized PnL
             let openPositions = 0;
+            let posUnrealizedSum = 0;
+            let posMarginSum = 0;
             try {
               const posRes = await queryBybitEndpoint(
                 baseUrl,
@@ -2046,16 +2155,30 @@ export async function testExchangeConnection(
               if (posRes.statusCode === 200) {
                 const posJson = JSON.parse(posRes.data);
                 if (posJson.retCode === 0 && Array.isArray(posJson.result?.list)) {
-                  openPositions = posJson.result.list.filter(
+                  const activeList = posJson.result.list.filter(
                     (p: any) => Math.abs(Number(p.size || 0)) > 0
-                  ).length;
+                  );
+                  openPositions = activeList.length;
+                  for (const p of activeList) {
+                    posUnrealizedSum += Number(p.unrealisedPnl || 0);
+                    posMarginSum += Number(p.positionIM || p.positionBalance || 0);
+                  }
                 }
               }
             } catch {
               // ignore
             }
 
-            let msg = `Успешно подключено к ${netLabel} [${walletTypeLabel}] (Пинг: ${res.latencyMs} мс | Баланс: ${resolvedBalance.toFixed(2)} USDT | Открытых позиций: ${openPositions})`;
+            if (openPositions > 0 && Math.abs(posUnrealizedSum) > 0) {
+              resolvedUnrealizedPnl = posUnrealizedSum;
+              resolvedEquity = resolvedBalance + resolvedUnrealizedPnl;
+            }
+            if (openPositions > 0 && posMarginSum > 0 && resolvedUsedMargin <= 0) {
+              resolvedUsedMargin = posMarginSum;
+            }
+
+            const finalWalletBal = resolvedBalance > 0 ? resolvedBalance : fundBalance;
+            let msg = `Успешно подключено к ${netLabel} [${walletTypeLabel}] (Пинг: ${res.latencyMs} мс | Баланс: ${finalWalletBal.toFixed(2)} USDT | Плавающий PnL: ${resolvedUnrealizedPnl >= 0 ? '+' : ''}${resolvedUnrealizedPnl.toFixed(2)} USDT | Открытых позиций: ${openPositions})`;
             if (resolvedBalance <= 0 && fundBalance > 0) {
               msg += ` ⚠️ На торговом кошельке 0 USDT, но на кошельке Финансирования (Funding) найдено ${fundBalance.toFixed(2)} USDT — переведите их на Unified Trading (Единый торговый аккаунт) в Bybit!`;
             } else if (resolvedBalance <= 0) {
@@ -2067,8 +2190,15 @@ export async function testExchangeConnection(
               exchange: 'bybit',
               message: msg,
               latency_ms: res.latencyMs,
-              balance_usdt: resolvedBalance > 0 ? resolvedBalance : fundBalance,
-              available_balance_usdt: resolvedAvailable > 0 ? resolvedAvailable : resolvedBalance,
+              balance_usdt: finalWalletBal,
+              wallet_balance_usdt: finalWalletBal,
+              unrealized_pnl_usdt: resolvedUnrealizedPnl,
+              equity_usdt: resolvedEquity > 0 ? resolvedEquity : finalWalletBal + resolvedUnrealizedPnl,
+              available_balance_usdt:
+                resolvedAvailable > 0
+                  ? resolvedAvailable
+                  : Math.max(0, finalWalletBal - resolvedUsedMargin),
+              used_margin_usdt: resolvedUsedMargin,
               can_trade: true,
               open_positions_count: openPositions,
               account_type: `${netLabel} (${walletTypeLabel})`,
@@ -2177,13 +2307,22 @@ export async function testExchangeConnection(
             const netLabel = isDemo ? 'OKX Demo Trading' : 'OKX V5 Mainnet';
             const details = json.data?.[0]?.details || [];
             const usdt = details.find((d: any) => d.ccy === 'USDT');
-            const totalEq = Number(usdt?.eq || usdt?.cashBal || json.data?.[0]?.totalEq || 0);
+            const walletBal = Number(usdt?.cashBal || usdt?.eq || json.data?.[0]?.totalEq || 0);
+            const unrealizedPnl = Number(usdt?.upl || json.data?.[0]?.upl || 0);
+            const totalEq = Number(usdt?.eq || json.data?.[0]?.totalEq || walletBal + unrealizedPnl);
+            const availBal = Number(usdt?.availEq || usdt?.availBal || walletBal);
+            const usedMargin = Number(usdt?.frozenBal || usdt?.imr || Math.max(0, walletBal - availBal));
             return {
               success: true,
               exchange: 'okx',
-              message: `Успешно подключено к ${netLabel} (Пинг: ${res.latencyMs} мс | Баланс: ${totalEq.toFixed(2)} USDT)`,
+              message: `Успешно подключено к ${netLabel} (Пинг: ${res.latencyMs} мс | Баланс: ${walletBal.toFixed(2)} USDT | Плавающий PnL: ${unrealizedPnl >= 0 ? '+' : ''}${unrealizedPnl.toFixed(2)} USDT)`,
               latency_ms: res.latencyMs,
-              balance_usdt: totalEq,
+              balance_usdt: walletBal,
+              wallet_balance_usdt: walletBal,
+              unrealized_pnl_usdt: unrealizedPnl,
+              equity_usdt: totalEq,
+              available_balance_usdt: availBal,
+              used_margin_usdt: usedMargin,
               can_trade: true,
               account_type: netLabel,
               is_testnet: isDemo,
@@ -2283,13 +2422,26 @@ export async function testExchangeConnection(
             const list = Array.isArray(json.data) ? json.data : [];
             const usdtAcc =
               list.find((a: any) => a.marginCoin === 'USDT' || a.marginCoin === 'SUSDT') || list[0];
-            const balance = Number(usdtAcc?.usdtEquity || usdtAcc?.available || 0);
+            const walletBal = Number(
+              usdtAcc?.accountBalance || usdtAcc?.usdtEquity || usdtAcc?.available || 0
+            );
+            const unrealizedPnl = Number(usdtAcc?.unrealizedPL || 0);
+            const equity = Number(usdtAcc?.usdtEquity || walletBal + unrealizedPnl);
+            const availBal = Number(
+              usdtAcc?.available || usdtAcc?.crossedMaxAvailable || walletBal
+            );
+            const usedMargin = Number(usdtAcc?.locked || Math.max(0, walletBal - availBal));
             return {
               success: true,
               exchange: 'bitget',
-              message: `Успешно подключено к ${netLabel} (Пинг: ${res.latencyMs} мс | Баланс: ${balance.toFixed(2)} USDT)`,
+              message: `Успешно подключено к ${netLabel} (Пинг: ${res.latencyMs} мс | Баланс: ${walletBal.toFixed(2)} USDT | Плавающий PnL: ${unrealizedPnl >= 0 ? '+' : ''}${unrealizedPnl.toFixed(2)} USDT)`,
               latency_ms: res.latencyMs,
-              balance_usdt: balance,
+              balance_usdt: walletBal,
+              wallet_balance_usdt: walletBal,
+              unrealized_pnl_usdt: unrealizedPnl,
+              equity_usdt: equity,
+              available_balance_usdt: availBal,
+              used_margin_usdt: usedMargin,
               can_trade: true,
               account_type: netLabel,
               is_testnet: isDemo,
@@ -2357,13 +2509,22 @@ export async function testExchangeConnection(
       const json = JSON.parse(res.data);
       if (json.code === 0) {
         const balanceObj = json.data?.balance;
-        const balance = Number(balanceObj?.equity || balanceObj?.balance || 0);
+        const walletBal = Number(balanceObj?.balance || balanceObj?.equity || 0);
+        const unrealizedPnl = Number(balanceObj?.unrealizedProfit || 0);
+        const equity = Number(balanceObj?.equity || walletBal + unrealizedPnl);
+        const availBal = Number(balanceObj?.availableMargin || walletBal);
+        const usedMargin = Number(balanceObj?.usedMargin || Math.max(0, walletBal - availBal));
         return {
           success: true,
           exchange: 'bingx',
-          message: `Успешно подключено к BingX Perpetual Swap (Пинг: ${res.latencyMs} мс | Баланс: ${balance.toFixed(2)} USDT)`,
+          message: `Успешно подключено к BingX Perpetual Swap (Пинг: ${res.latencyMs} мс | Баланс: ${walletBal.toFixed(2)} USDT | Плавающий PnL: ${unrealizedPnl >= 0 ? '+' : ''}${unrealizedPnl.toFixed(2)} USDT)`,
           latency_ms: res.latencyMs,
-          balance_usdt: balance,
+          balance_usdt: walletBal,
+          wallet_balance_usdt: walletBal,
+          unrealized_pnl_usdt: unrealizedPnl,
+          equity_usdt: equity,
+          available_balance_usdt: availBal,
+          used_margin_usdt: usedMargin,
           can_trade: true,
           account_type: 'BingX Swap Futures',
           is_testnet: Boolean(creds.isTestnet),
@@ -2860,12 +3021,15 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
 }
 
 /**
- * Запрашивает реальную историю закрытых сделок (Closed PnL) с биржи (Bybit V5 /v5/position/closed-pnl, Binance Futures).
- * Используется для точной синхронизации цены закрытия, комиссий, времени закрытия и истории доходности в Дашборде.
+ * Запрашивает реальную историю закрытых сделок (Closed PnL) и комиссий со всех 5 бирж:
+ * Bybit V5 (/v5/position/closed-pnl), Binance Futures (/fapi/v1/income + /fapi/v1/userTrades),
+ * OKX V5 (/api/v5/account/positions-history), Bitget V2 (/api/v2/mix/position/history-position),
+ * BingX V2 (/openApi/swap/v2/trade/allOrders).
  */
 export async function fetchExchangeClosedPnl(
   creds: ExchangeCredentials,
-  limit = 50
+  limit = 50,
+  knownSymbols: string[] = []
 ): Promise<{
   success: boolean;
   closed: ExchangeClosedPnlItem[];
@@ -2876,6 +3040,7 @@ export async function fetchExchangeClosedPnl(
     return { success: false, closed: [] };
   }
 
+  // 1. BYBIT V5 (/v5/position/closed-pnl)
   if (creds.exchange === 'bybit') {
     const candidateHosts = getBybitCandidateHosts(cleanKey, creds.isTestnet);
     for (const baseUrl of candidateHosts) {
@@ -2909,9 +3074,6 @@ export async function fetchExchangeClosedPnl(
               const entryPrice = Number(item.avgEntryPrice || item.orderPrice || 0);
               const exitPrice = Number(item.avgExitPrice || item.execPrice || 0);
               if (!sym || !(qty > 0) || !(entryPrice > 0) || !(exitPrice > 0)) continue;
-              // В Bybit closed-pnl поле side означает сторону закрывающего ордера:
-              // Если закрывающий ордер 'Sell', значит закрыта позиция LONG (is_short = false).
-              // Если закрывающий ордер 'Buy', значит закрыта позиция SHORT (is_short = true).
               const closingSide = String(item.side || '').toLowerCase();
               const isShort = closingSide === 'buy';
               const lev = Math.max(1, Math.round(Number(item.leverage || 25)));
@@ -2950,6 +3112,371 @@ export async function fetchExchangeClosedPnl(
     return { success: false, closed: [] };
   }
 
+  // 2. BINANCE USDT-M FUTURES (/fapi/v1/income + /fapi/v1/userTrades)
+  if (creds.exchange === 'binance') {
+    const candidateHosts = getBinanceCandidateHosts(cleanKey, creds.isTestnet);
+    for (const baseUrl of candidateHosts) {
+      try {
+        const ts = await getBinanceTimestamp(false, baseUrl);
+        const incQuery = `limit=200&timestamp=${ts}&recvWindow=10000`;
+        const incSig = signBinanceFuturesQuery(incQuery, cleanSecret);
+        const incRes = await makeHttpsRequest(
+          `${baseUrl}/fapi/v1/income?${incQuery}&signature=${incSig}`,
+          {
+            method: 'GET',
+            headers: { 'X-MBX-APIKEY': cleanKey },
+            timeoutMs: 6500,
+          }
+        );
+        if (incRes.statusCode !== 200) {
+          if (incRes.data.includes('-2015')) continue;
+          break;
+        }
+        binanceHostCache.set(cleanKey, baseUrl);
+        const incomeList = JSON.parse(incRes.data);
+        const symbolsToQuery = new Set<string>();
+        for (const rawSym of knownSymbols) {
+          const cleanSym = pairToCleanSymbol(rawSym);
+          if (cleanSym.endsWith('USDT')) symbolsToQuery.add(cleanSym);
+        }
+        if (Array.isArray(incomeList)) {
+          for (const inc of incomeList) {
+            const sym = String(inc.symbol || '').trim().toUpperCase();
+            if (sym && sym.endsWith('USDT')) {
+              symbolsToQuery.add(sym);
+            }
+          }
+        }
+
+        const closed: ExchangeClosedPnlItem[] = [];
+        const symbolArr = Array.from(symbolsToQuery).slice(0, 12);
+
+        for (const sym of symbolArr) {
+          try {
+            const uTs = await getBinanceTimestamp(false, baseUrl);
+            const uQuery = `symbol=${sym}&limit=100&timestamp=${uTs}&recvWindow=10000`;
+            const uSig = signBinanceFuturesQuery(uQuery, cleanSecret);
+            const uRes = await makeHttpsRequest(
+              `${baseUrl}/fapi/v1/userTrades?${uQuery}&signature=${uSig}`,
+              {
+                method: 'GET',
+                headers: { 'X-MBX-APIKEY': cleanKey },
+                timeoutMs: 5000,
+              }
+            );
+            if (uRes.statusCode !== 200) continue;
+            const trades = JSON.parse(uRes.data);
+            if (!Array.isArray(trades) || trades.length === 0) continue;
+
+            const sortedTrades = [...trades].sort(
+              (a, b) => Number(a.time || 0) - Number(b.time || 0)
+            );
+
+            // Группируем закрывающие сделки (realizedPnl !== 0) по orderId и суммируем фактическую комиссию входа из предшествующих открывающих сделок
+            const byOrder = new Map<
+              string,
+              {
+                orderId: string;
+                symbol: string;
+                side: string;
+                positionSide: string;
+                qty: number;
+                notional: number;
+                grossPnl: number;
+                openFee: number;
+                closeFee: number;
+                openTime: number;
+                time: number;
+              }
+            >();
+
+            let pendingOpenFee = 0;
+            let pendingOpenTime = 0;
+
+            for (const t of sortedTrades) {
+              const rPnl = Number(t.realizedPnl || 0);
+              const qty = Math.abs(Number(t.qty || 0));
+              const price = Number(t.price || 0);
+              const fee = Math.abs(Number(t.commission || 0));
+              const time = Number(t.time || Date.now());
+
+              if (Math.abs(rPnl) < 1e-8) {
+                pendingOpenFee += fee;
+                if (!pendingOpenTime || time < pendingOpenTime) {
+                  pendingOpenTime = time;
+                }
+                continue;
+              }
+
+              const ordId = String(t.orderId || t.id || `${sym}-${time}`);
+              const existing = byOrder.get(ordId);
+              if (existing) {
+                existing.qty += qty;
+                existing.notional += qty * price;
+                existing.grossPnl += rPnl;
+                existing.closeFee += fee;
+                if (time > existing.time) existing.time = time;
+              } else {
+                byOrder.set(ordId, {
+                  orderId: ordId,
+                  symbol: sym,
+                  side: String(t.side || '').toUpperCase(),
+                  positionSide: String(t.positionSide || '').toUpperCase(),
+                  qty,
+                  notional: qty * price,
+                  grossPnl: rPnl,
+                  openFee: pendingOpenFee,
+                  closeFee: fee,
+                  openTime: pendingOpenTime > 0 ? pendingOpenTime : time - 60_000,
+                  time,
+                });
+                pendingOpenFee = 0;
+                pendingOpenTime = 0;
+              }
+            }
+
+            for (const grp of byOrder.values()) {
+              if (!(grp.qty > 0) || !(grp.notional > 0)) continue;
+              const exitPrice = grp.notional / grp.qty;
+              const isShort =
+                grp.positionSide === 'SHORT'
+                  ? true
+                  : grp.positionSide === 'LONG'
+                  ? false
+                  : grp.side === 'BUY';
+              const rawEntryPrice = isShort
+                ? exitPrice + grp.grossPnl / grp.qty
+                : exitPrice - grp.grossPnl / grp.qty;
+              const entryPrice = rawEntryPrice > 0 ? rawEntryPrice : exitPrice;
+              const openFee = Number(
+                (grp.openFee > 0 ? grp.openFee : entryPrice * grp.qty * 0.0005).toFixed(4)
+              );
+              const closeFee = Number(
+                (grp.closeFee > 0 ? grp.closeFee : exitPrice * grp.qty * 0.0005).toFixed(4)
+              );
+              // В Binance realizedPnl — это gross PnL до вычета комиссий; чистый реализованный PnL на кошельке = grossPnl - openFee - closeFee
+              const netClosedPnl = grp.grossPnl - openFee - closeFee;
+              closed.push({
+                order_id: grp.orderId,
+                pair: symbolToFreqtradePair(sym),
+                symbol: sym,
+                is_short: isShort,
+                qty: Number(grp.qty.toFixed(6)),
+                entry_price: Number(entryPrice.toPrecision(8)),
+                exit_price: Number(exitPrice.toPrecision(8)),
+                leverage: 25,
+                closed_pnl: Number(netClosedPnl.toFixed(4)),
+                open_fee: openFee,
+                close_fee: closeFee,
+                created_time: grp.openTime,
+                updated_time: grp.time,
+              });
+            }
+          } catch {
+            // ignore symbol error
+          }
+        }
+
+        closed.sort((a, b) => b.updated_time - a.updated_time);
+        return { success: true, closed: closed.slice(0, limit) };
+      } catch {
+        // try next host
+      }
+    }
+    return { success: false, closed: [] };
+  }
+
+  // 3. OKX V5 (/api/v5/account/positions-history?instType=SWAP)
+  if (creds.exchange === 'okx') {
+    const cleanPass = String(creds.passphrase || '').trim();
+    if (!cleanPass) return { success: false, closed: [] };
+    const isDemo = creds.isTestnet ?? okxDemoCache.get(cleanKey) ?? false;
+    try {
+      const isoTimestamp = new Date().toISOString();
+      const requestPath = `/api/v5/account/positions-history?instType=SWAP&limit=${Math.min(100, Math.max(10, limit))}`;
+      const preHash = `${isoTimestamp}GET${requestPath}`;
+      const signature = crypto.createHmac('sha256', cleanSecret).update(preHash).digest('base64');
+      const headers: Record<string, string> = {
+        'OK-ACCESS-KEY': cleanKey,
+        'OK-ACCESS-SIGN': signature,
+        'OK-ACCESS-TIMESTAMP': isoTimestamp,
+        'OK-ACCESS-PASSPHRASE': cleanPass,
+        'Content-Type': 'application/json',
+      };
+      if (isDemo) headers['x-simulated-trading'] = '1';
+      const res = await makeHttpsRequest(`https://www.okx.com${requestPath}`, {
+        method: 'GET',
+        headers,
+        timeoutMs: 6500,
+      });
+      if (res.statusCode === 200) {
+        const json = JSON.parse(res.data);
+        if (json.code === '0' && Array.isArray(json.data)) {
+          const closed: ExchangeClosedPnlItem[] = [];
+          for (const item of json.data) {
+            const instId = String(item.instId || '');
+            const qty = Math.abs(Number(item.closeTotalPos || item.openMaxPos || 0));
+            const entryPrice = Number(item.openAvgPx || 0);
+            const exitPrice = Number(item.closeAvgPx || 0);
+            if (!instId || !(qty > 0) || !(entryPrice > 0) || !(exitPrice > 0)) continue;
+            const isShort = String(item.direction || '').toLowerCase() === 'short';
+            const lev = Math.max(1, Math.round(Number(item.lever || 25)));
+            const closedPnl = Number(item.realizedPnl || item.pnl || 0);
+            const totalFee = Math.abs(Number(item.fee || (entryPrice + exitPrice) * qty * 0.0005));
+            const cTime = Number(item.cTime || Date.now());
+            const uTime = Number(item.uTime || cTime);
+            closed.push({
+              order_id: String(item.posId || `${instId}-${uTime}`),
+              pair: symbolToFreqtradePair(instId),
+              symbol: instId,
+              is_short: isShort,
+              qty,
+              entry_price: entryPrice,
+              exit_price: exitPrice,
+              leverage: lev,
+              closed_pnl: Number(closedPnl.toFixed(4)),
+              open_fee: Number((totalFee / 2).toFixed(4)),
+              close_fee: Number((totalFee / 2).toFixed(4)),
+              created_time: cTime,
+              updated_time: uTime,
+            });
+          }
+          return { success: true, closed };
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return { success: false, closed: [] };
+  }
+
+  // 4. BITGET V2 (/api/v2/mix/position/history-position?productType=USDT-FUTURES)
+  if (creds.exchange === 'bitget') {
+    const cleanPass = String(creds.passphrase || '').trim();
+    if (!cleanPass) return { success: false, closed: [] };
+    const isDemo = creds.isTestnet ?? bitgetDemoCache.get(cleanKey) ?? false;
+    try {
+      const timestamp = Date.now().toString();
+      const requestPath = `/api/v2/mix/position/history-position?productType=USDT-FUTURES&limit=${Math.min(100, Math.max(10, limit))}`;
+      const preHash = `${timestamp}GET${requestPath}`;
+      const signature = crypto.createHmac('sha256', cleanSecret).update(preHash).digest('base64');
+      const headers: Record<string, string> = {
+        'ACCESS-KEY': cleanKey,
+        'ACCESS-SIGN': signature,
+        'ACCESS-TIMESTAMP': timestamp,
+        'ACCESS-PASSPHRASE': cleanPass,
+        'Content-Type': 'application/json',
+        locale: 'en-US',
+      };
+      if (isDemo) headers.paptrading = '1';
+      const res = await makeHttpsRequest(`https://api.bitget.com${requestPath}`, {
+        method: 'GET',
+        headers,
+        timeoutMs: 6500,
+      });
+      if (res.statusCode === 200) {
+        const json = JSON.parse(res.data);
+        const list = json.data?.list || json.data;
+        if (json.code === '00000' && Array.isArray(list)) {
+          const closed: ExchangeClosedPnlItem[] = [];
+          for (const item of list) {
+            const sym = String(item.symbol || '');
+            const qty = Math.abs(Number(item.closeTotalPos || item.openTotalPos || 0));
+            const entryPrice = Number(item.openAvgPrice || 0);
+            const exitPrice = Number(item.closeAvgPrice || 0);
+            if (!sym || !(qty > 0) || !(entryPrice > 0) || !(exitPrice > 0)) continue;
+            const isShort = String(item.holdSide || '').toLowerCase() === 'short';
+            const closedPnl = Number(item.netProfit || item.pnl || 0);
+            const openFee = Math.abs(Number(item.openFee || entryPrice * qty * 0.0006));
+            const closeFee = Math.abs(Number(item.closeFee || exitPrice * qty * 0.0006));
+            const cTime = Number(item.ctime || item.cTime || Date.now());
+            const uTime = Number(item.utime || item.uTime || cTime);
+            closed.push({
+              order_id: String(item.positionId || `${sym}-${uTime}`),
+              pair: symbolToFreqtradePair(sym),
+              symbol: sym,
+              is_short: isShort,
+              qty,
+              entry_price: entryPrice,
+              exit_price: exitPrice,
+              leverage: 25,
+              closed_pnl: Number(closedPnl.toFixed(4)),
+              open_fee: Number(openFee.toFixed(4)),
+              close_fee: Number(closeFee.toFixed(4)),
+              created_time: cTime,
+              updated_time: uTime,
+            });
+          }
+          return { success: true, closed };
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return { success: false, closed: [] };
+  }
+
+  // 5. BINGX SWAP V2 (/openApi/swap/v2/trade/allOrders)
+  if (creds.exchange === 'bingx') {
+    try {
+      const timestamp = Date.now();
+      const query = `limit=${Math.min(100, Math.max(10, limit))}&timestamp=${timestamp}`;
+      const signature = crypto.createHmac('sha256', cleanSecret).update(query).digest('hex');
+      const res = await makeHttpsRequest(
+        `https://open-api.bingx.com/openApi/swap/v2/trade/allOrders?${query}&signature=${signature}`,
+        {
+          method: 'GET',
+          headers: { 'X-BX-APIKEY': cleanKey },
+          timeoutMs: 6500,
+        }
+      );
+      if (res.statusCode === 200) {
+        const json = JSON.parse(res.data);
+        const orders = json.data?.orders || json.data;
+        if (json.code === 0 && Array.isArray(orders)) {
+          const closed: ExchangeClosedPnlItem[] = [];
+          for (const o of orders) {
+            const profit = Number(o.profit || 0);
+            if (Math.abs(profit) < 1e-8) continue;
+            const sym = String(o.symbol || '');
+            const qty = Math.abs(Number(o.executedQty || o.origQty || 0));
+            const exitPrice = Number(o.avgPrice || o.price || 0);
+            if (!sym || !(qty > 0) || !(exitPrice > 0)) continue;
+            const posSide = String(o.positionSide || '').toUpperCase();
+            const side = String(o.side || '').toUpperCase();
+            const isShort = posSide === 'SHORT' ? true : posSide === 'LONG' ? false : side === 'BUY';
+            const rawEntry = isShort ? exitPrice + profit / qty : exitPrice - profit / qty;
+            const entryPrice = rawEntry > 0 ? rawEntry : exitPrice;
+            const closeFee = Math.abs(Number(o.commission || exitPrice * qty * 0.0005));
+            const openFee = Number((entryPrice * qty * 0.0005).toFixed(4));
+            const netClosed = profit - openFee - closeFee;
+            const uTime = Number(o.updateTime || o.time || Date.now());
+            closed.push({
+              order_id: String(o.orderId || `${sym}-${uTime}`),
+              pair: symbolToFreqtradePair(sym),
+              symbol: sym,
+              is_short: isShort,
+              qty,
+              entry_price: Number(entryPrice.toPrecision(8)),
+              exit_price: Number(exitPrice.toPrecision(8)),
+              leverage: Math.max(1, Math.round(Number(o.leverage || 25))),
+              closed_pnl: Number(netClosed.toFixed(4)),
+              open_fee: openFee,
+              close_fee: Number(closeFee.toFixed(4)),
+              created_time: Number(o.time || uTime - 60_000),
+              updated_time: uTime,
+            });
+          }
+          return { success: true, closed };
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return { success: false, closed: [] };
+  }
+
   return { success: false, closed: [] };
 }
+
 

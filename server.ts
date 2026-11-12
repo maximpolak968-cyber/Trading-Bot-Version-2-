@@ -452,10 +452,30 @@ async function fetchRealCandles(
   }
 
   const allProviders: KlineProvider[] = [
+    ...(exchangeAccountsStore.some((a) => a.enabled && a.exchange === 'binance' && a.is_testnet)
+      ? [
+          {
+            id: 'binance' as SupportedExchange,
+            name: `Binance Testnet (${interval})`,
+            url: `https://testnet.binancefuture.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
+            parse: (raw: any) =>
+              Array.isArray(raw)
+                ? raw.map((k: any[]) => ({
+                    timestamp: Number(k[0]),
+                    open: parseFloat(k[1]),
+                    high: parseFloat(k[2]),
+                    low: parseFloat(k[3]),
+                    close: parseFloat(k[4]),
+                    volume: parseFloat(k[5]),
+                  }))
+                : [],
+          },
+        ]
+      : []),
     {
       id: 'binance',
-      name: `Binance (${interval})`,
-      url: `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
+      name: `Binance Futures (${interval})`,
+      url: `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
       parse: (raw: any) =>
         Array.isArray(raw)
           ? raw.map((k: any[]) => ({
@@ -470,8 +490,8 @@ async function fetchRealCandles(
     },
     {
       id: 'binance',
-      name: `Binance Futures (${interval})`,
-      url: `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
+      name: `Binance (${interval})`,
+      url: `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
       parse: (raw: any) =>
         Array.isArray(raw)
           ? raw.map((k: any[]) => ({
@@ -878,6 +898,10 @@ interface FreqtradeTrade {
   net_profit_percent?: number;
   breakeven_price?: number;
   min_profitable_tp?: number;
+  exchange_unrealized_pnl?: number;
+  exchange_mark_price?: number;
+  exchange_synced_at?: number;
+  exchange_realized_pnl?: number;
   dca_history?: any[];
   orders: TradeOrderEntry[];
   planned_dca_levels: PlannedDcaLevel[];
@@ -931,25 +955,55 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
   }
 
   const exitNotional = refRate * totalAmount;
-  trade.fee_open = Number(openFeeSum.toFixed(4));
+  if (trade.is_open || !trade.fee_open || trade.fee_open <= 0) {
+    trade.fee_open = Number(openFeeSum.toFixed(4));
+  }
   // Если сделка уже закрыта и биржа вернула точную комиссию закрытия, сохраняем её
   if (trade.is_open || !trade.fee_close || trade.fee_close <= 0) {
     trade.fee_close = Number((exitNotional * exchangeFeeRate).toFixed(4));
   }
   trade.fee_total = Number((trade.fee_open + trade.fee_close).toFixed(4));
 
-  const grossProfit = (trade.is_short ? openRate - refRate : refRate - openRate) * totalAmount;
-  const netProfit = grossProfit - trade.fee_total;
-  trade.gross_profit = Number(grossProfit.toFixed(4));
-  trade.net_profit = Number(netProfit.toFixed(4));
-  trade.net_profit_percent = Number(
-    ((netProfit / Math.max(1e-8, trade.stake_amount)) * 100).toFixed(2)
-  );
+  const hasFreshExchangeUnrealized =
+    trade.is_open &&
+    typeof trade.exchange_unrealized_pnl === 'number' &&
+    Number.isFinite(trade.exchange_unrealized_pnl) &&
+    trade.exchange_synced_at &&
+    Date.now() - trade.exchange_synced_at < 60_000;
 
-  // Вся статистика и условия выхода опираются строго на ЧИСТЫЙ профит (после вычета fee_open + всех DCA + fee_close)
-  trade.profit_ratio = Number((trade.net_profit_percent / 100).toFixed(4));
-  trade.profit_pct = trade.net_profit_percent;
-  trade.profit_abs = Number(netProfit.toFixed(3));
+  if (!trade.is_open && typeof trade.exchange_realized_pnl === 'number' && Number.isFinite(trade.exchange_realized_pnl)) {
+    const exactNet = Number(trade.exchange_realized_pnl.toFixed(4));
+    trade.net_profit = exactNet;
+    trade.gross_profit = Number((exactNet + trade.fee_total).toFixed(4));
+    trade.net_profit_percent = Number(
+      ((exactNet / Math.max(1e-8, trade.stake_amount)) * 100).toFixed(2)
+    );
+    trade.profit_ratio = Number((trade.net_profit_percent / 100).toFixed(4));
+    trade.profit_pct = trade.net_profit_percent;
+    trade.profit_abs = Number(exactNet.toFixed(4));
+  } else if (hasFreshExchangeUnrealized) {
+    const exactUnrealized = Number(trade.exchange_unrealized_pnl!.toFixed(4));
+    const netAfterFees = exactUnrealized - trade.fee_total;
+    trade.gross_profit = exactUnrealized;
+    trade.net_profit = Number(netAfterFees.toFixed(4));
+    trade.net_profit_percent = Number(
+      ((exactUnrealized / Math.max(1e-8, trade.stake_amount)) * 100).toFixed(2)
+    );
+    trade.profit_ratio = Number((trade.net_profit_percent / 100).toFixed(4));
+    trade.profit_pct = trade.net_profit_percent;
+    trade.profit_abs = exactUnrealized;
+  } else {
+    const grossProfit = (trade.is_short ? openRate - refRate : refRate - openRate) * totalAmount;
+    const netProfit = grossProfit - trade.fee_total;
+    trade.gross_profit = Number(grossProfit.toFixed(4));
+    trade.net_profit = Number(netProfit.toFixed(4));
+    trade.net_profit_percent = Number(
+      ((netProfit / Math.max(1e-8, trade.stake_amount)) * 100).toFixed(2)
+    );
+    trade.profit_ratio = Number((trade.net_profit_percent / 100).toFixed(4));
+    trade.profit_pct = trade.net_profit_percent;
+    trade.profit_abs = Number(netProfit.toFixed(3));
+  }
 
   const feeOpenPerCoin = trade.fee_open / totalAmount;
   const exactBreakeven = trade.is_short
@@ -1208,6 +1262,11 @@ interface ExchangeAccountRecord {
   copy_multiplier: number;
   max_leverage: number;
   balance_usdt: number;
+  wallet_balance_usdt?: number;
+  equity_usdt?: number;
+  available_balance_usdt?: number;
+  used_margin_usdt?: number;
+  initial_deposit_usdt?: number;
   unrealized_pnl: number;
   open_trades_count: number;
   status: 'connected' | 'paused' | 'error';
@@ -1225,9 +1284,28 @@ function hasConnectedExchangeAccount(): boolean {
 }
 
 /**
+ * Определяет чистый стартовый депозит для реального счёта биржи:
+ * если `rawBalance - closedNetProfit` находится вблизи круглого стартового депозита (например, 5000 USDT на Testnet),
+ * фиксирует его, чтобы стартовый капитал не искажался при расчётах.
+ */
+function inferInitialDeposit(acc: ExchangeAccountRecord | undefined, rawBalance: number, closedNetProfit: number): number {
+  if (acc?.initial_deposit_usdt && acc.initial_deposit_usdt > 0) {
+    return acc.initial_deposit_usdt;
+  }
+  const diff = rawBalance - closedNetProfit;
+  const roundBenchmarks = [100, 250, 500, 1000, 2000, 3000, 5000, 10000, 25000, 50000, 100000];
+  for (const b of roundBenchmarks) {
+    if (Math.abs(diff - b) <= b * 0.015 || (acc?.is_testnet && Math.abs(rawBalance - b) <= b * 0.03)) {
+      return b;
+    }
+  }
+  return Number(Math.max(10, diff).toFixed(2));
+}
+
+/**
  * Возвращает актуальный баланс аккаунта:
  * - Для реальных биржевых ключей (Bybit / Binance / OKX / Bitget / BingX): `acc.balance_usdt` синхронизируется напрямую с API биржи
- *   и УЖЕ включает в себя все закрытые сделки и списанные комиссии (1 в 1 как на счету Bybit).
+ *   и УЖЕ включает в себя все закрытые сделки и списанные комиссии (1 в 1 как на счету биржи).
  * - Для тестовых симуляционных ключей (`test_...`): складывает стартовый депозит + накопленный чистый профит.
  */
 function getCompoundedAccountBalance(accountId = 'master'): {
@@ -1242,7 +1320,9 @@ function getCompoundedAccountBalance(accountId = 'master'): {
     const ownerAcc =
       exchangeAccountsStore.find((a) => a.enabled && a.is_owner) ||
       exchangeAccountsStore.find((a) => a.enabled);
-    const rawBalance = Number(ownerAcc?.balance_usdt || botConfig.starting_balance || 5000);
+    const rawBalance = Number(
+      ownerAcc?.wallet_balance_usdt ?? ownerAcc?.balance_usdt ?? botConfig.starting_balance ?? 5000
+    );
     const closedNetProfit = tradesStore
       .filter((t) => !t.is_open && (!t.account_id || t.account_id === 'master'))
       .reduce((sum, t) => sum + (t.net_profit ?? t.profit_abs ?? 0), 0);
@@ -1250,8 +1330,9 @@ function getCompoundedAccountBalance(accountId = 'master'): {
       ownerAcc?.api_key_raw && !isSimulatedTestApiKey(ownerAcc.api_key_raw)
     );
     if (isRealExchangeAcc) {
+      const baseDep = inferInitialDeposit(ownerAcc, rawBalance, closedNetProfit);
       return {
-        baseDeposit: Number(Math.max(10, rawBalance - closedNetProfit).toFixed(2)),
+        baseDeposit: baseDep,
         closedNetProfit: Number(closedNetProfit.toFixed(2)),
         compoundedBalance: Number(Math.max(0, rawBalance).toFixed(2)),
       };
@@ -1263,7 +1344,7 @@ function getCompoundedAccountBalance(accountId = 'master'): {
     };
   }
   const clientAcc = exchangeAccountsStore.find((a) => a.id === accountId);
-  const rawBalance = Number(clientAcc?.balance_usdt || 1000);
+  const rawBalance = Number(clientAcc?.wallet_balance_usdt ?? clientAcc?.balance_usdt ?? 1000);
   const closedNetProfit = tradesStore
     .filter((t) => !t.is_open && t.account_id === accountId)
     .reduce((sum, t) => sum + (t.net_profit ?? t.profit_abs ?? 0), 0);
@@ -1271,8 +1352,9 @@ function getCompoundedAccountBalance(accountId = 'master'): {
     clientAcc?.api_key_raw && !isSimulatedTestApiKey(clientAcc.api_key_raw)
   );
   if (isRealClientAcc) {
+    const baseDep = inferInitialDeposit(clientAcc, rawBalance, closedNetProfit);
     return {
-      baseDeposit: Number(Math.max(10, rawBalance - closedNetProfit).toFixed(2)),
+      baseDeposit: baseDep,
       closedNetProfit: Number(closedNetProfit.toFixed(2)),
       compoundedBalance: Number(Math.max(0, rawBalance).toFixed(2)),
     };
@@ -1592,16 +1674,21 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
 
   const targetAccountId = acc.is_owner ? 'master' : acc.id;
   const targetAccountName = acc.is_owner ? 'Master' : acc.name;
+  const knownPairs = Array.from(new Set(tradesStore.map((t) => t.pair)));
 
   try {
     const [openPosRes, closedPnlRes] = await Promise.all([
       fetchExchangeOpenPositions(creds),
-      fetchExchangeClosedPnl(creds, 50),
+      fetchExchangeClosedPnl(creds, 50, knownPairs),
     ]);
 
     // 1. Синхронизация всех открытых позиций, которые уже есть на биржевом аккаунте
     if (openPosRes.success) {
+      let totalPosUnrealized = 0;
+      let totalPosMargin = 0;
       for (const pos of openPosRes.positions) {
+        totalPosUnrealized += Number(pos.unrealized_pnl || 0);
+        totalPosMargin += Number(pos.margin_usdt || 0);
         const syncKey = `open:${targetAccountId}:${pos.pair}:${pos.is_short ? 'S' : 'L'}:${pos.entry_price}`;
         if (dismissedExchangeSyncKeys.has(syncKey)) continue;
         const existingOpen = tradesStore.find(
@@ -1615,11 +1702,12 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
         );
 
         if (existingOpen) {
-          let updated = false;
-          if (pos.mark_price > 0 && Math.abs(existingOpen.current_rate - pos.mark_price) > 1e-8) {
+          if (pos.mark_price > 0) {
             existingOpen.current_rate = roundPrice(pos.mark_price);
-            updated = true;
+            existingOpen.exchange_mark_price = pos.mark_price;
           }
+          existingOpen.exchange_unrealized_pnl = Number(pos.unrealized_pnl || 0);
+          existingOpen.exchange_synced_at = Date.now();
           if (
             Math.abs(existingOpen.amount - pos.size) > 1e-5 ||
             Math.abs(existingOpen.open_rate - pos.entry_price) / Math.max(1e-8, pos.entry_price) > 0.0005
@@ -1628,14 +1716,11 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
             existingOpen.amount = Number(pos.size.toFixed(4));
             existingOpen.stake_amount = Number(pos.margin_usdt.toFixed(2));
             existingOpen.leverage = pos.leverage || existingOpen.leverage;
-            updated = true;
           }
-          if (updated) {
-            recalculateTradeMetrics(existingOpen, false);
-            sqliteDb.upsertTrade(existingOpen);
-          }
+          recalculateTradeMetrics(existingOpen, false);
+          sqliteDb.upsertTrade(existingOpen);
         } else {
-          // На бирже уже есть открытая позиция, которой еще нет на сайте — импортируем её, чтобы бот видел её и управлял ей (без дублирования входов!)
+          // На бирже уже есть открытая позиция, которой еще нет на сайте — импортируем её со стандартной сеткой DCA 1 и DCA 2
           const id = nextTradeId++;
           const openTs = pos.created_time > 0 ? pos.created_time : Date.now();
           const openDateStr = new Date(openTs).toISOString().replace('T', ' ').slice(0, 19);
@@ -1650,7 +1735,7 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
             posTp > 0
               ? roundPrice(posTp)
               : roundPrice(pos.is_short ? entryRate * (1 - 0.012) : entryRate * (1 + 0.012));
-          const initialDcaPrice = roundPrice(pos.is_short ? entryRate * 1.028 : entryRate * 0.972);
+          const initialDcaPrice = roundPrice(pos.is_short ? entryRate * 1.015 : entryRate * 0.985);
           const feeRate = getExchangeTakerFeeRate(acc.exchange);
 
           const importedTrade: FreqtradeTrade = {
@@ -1682,6 +1767,9 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
             close_timestamp: null,
             close_rate: null,
             current_rate: markRate,
+            exchange_mark_price: pos.mark_price,
+            exchange_unrealized_pnl: Number(pos.unrealized_pnl || 0),
+            exchange_synced_at: Date.now(),
             profit_ratio: 0,
             profit_pct: 0,
             profit_abs: 0,
@@ -1707,16 +1795,7 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
                 date: openDateStr,
               },
             ],
-            planned_dca_levels: [
-              {
-                step: 1,
-                label: 'DCA #1 (4H S/R Zone)',
-                price: initialDcaPrice,
-                stake_amount: stakeUsdt,
-                amount: Number(((stakeUsdt * lev) / Math.max(1e-8, initialDcaPrice)).toFixed(4)),
-                distance_pct: pos.is_short ? 2.8 : -2.8,
-              },
-            ],
+            planned_dca_levels: [],
             support_level: pos.is_short ? initialTp : initialDcaPrice,
             resistance_level: pos.is_short ? initialDcaPrice : initialTp,
             plan_notes: `Позиция синхронизирована напрямую с биржи ${acc.exchange.toUpperCase()} (${acc.name})`,
@@ -1727,15 +1806,21 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
             dca_manual_override: false,
           };
 
-          recalculateTradeMetrics(importedTrade, false);
+          recalculateTradeMetrics(importedTrade, true);
           tradesStore.unshift(importedTrade);
           sqliteDb.upsertTrade(importedTrade);
           appendLog(
             `freqtrade.exchange.${acc.exchange}`,
             'INFO',
-            `🔄 [EXCHANGE POSITION SYNC] Подтянута действующая позиция с биржи ${acc.exchange.toUpperCase()} (${acc.name}): #${id} [${pos.pair}] ${pos.is_short ? 'SHORT' : 'LONG'} ${lev}x | Объем: ${pos.size} @ ${entryRate}$ (Маржа: $${stakeUsdt})`
+            `🔄 [EXCHANGE POSITION SYNC] Подтянута действующая позиция с биржи ${acc.exchange.toUpperCase()} (${acc.name}): #${id} [${pos.pair}] ${pos.is_short ? 'SHORT' : 'LONG'} ${lev}x | Объем: ${pos.size} @ ${entryRate}$ (Маржа: $${stakeUsdt} | Unrealized PnL: ${pos.unrealized_pnl.toFixed(2)}$)`
           );
         }
+      }
+
+      acc.open_trades_count = openPosRes.positions.length;
+      acc.unrealized_pnl = Number(totalPosUnrealized.toFixed(4));
+      if (totalPosMargin > 0) {
+        acc.used_margin_usdt = Number(totalPosMargin.toFixed(2));
       }
 
       // 2. Если сделка числится открытой на сайте (старше 20 сек), но на бирже она уже закрыта — закрываем её и подтягиваем реальную цену и PnL с биржи
@@ -1779,41 +1864,68 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
           localTrade.exit_reason = 'exchange_closed_sync';
           localTrade.trade_state = 'CLOSED';
           localTrade.planned_dca_levels = [];
-          recalculateTradeMetrics(localTrade, false);
-
-          if (matchedClosed && Number.isFinite(matchedClosed.closed_pnl)) {
-            localTrade.net_profit = Number(matchedClosed.closed_pnl.toFixed(4));
-            localTrade.profit_abs = Number(matchedClosed.closed_pnl.toFixed(3));
-            localTrade.net_profit_percent = Number(
-              ((localTrade.net_profit / Math.max(1e-8, localTrade.stake_amount)) * 100).toFixed(2)
-            );
-            localTrade.profit_pct = localTrade.net_profit_percent;
-            localTrade.profit_ratio = Number((localTrade.net_profit_percent / 100).toFixed(4));
+          if (matchedClosed) {
+            localTrade.fee_open = matchedClosed.open_fee;
+            localTrade.fee_close = matchedClosed.close_fee;
+            localTrade.fee_total = Number((matchedClosed.open_fee + matchedClosed.close_fee).toFixed(4));
+            localTrade.exchange_realized_pnl = matchedClosed.closed_pnl;
+            if (matchedClosed.order_id) {
+              localTrade.plan_notes = `Синхронизировано с биржей ${acc.exchange.toUpperCase()} (OrderID: ${matchedClosed.order_id})`;
+            }
           }
+          recalculateTradeMetrics(localTrade, false);
 
           sqliteDb.upsertTrade(localTrade);
           appendLog(
             `freqtrade.exchange.${acc.exchange}`,
             'INFO',
-            `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] была закрыта на бирже ${acc.exchange.toUpperCase()} @ ${closePrice}$ | Реальный PnL: ${localTrade.profit_abs}$`
+            `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] была закрыта на бирже ${acc.exchange.toUpperCase()} @ ${closePrice}$ | Реальный PnL: ${localTrade.profit_abs}$ (Комиссия: ${localTrade.fee_total}$)`
           );
         }
       }
     }
 
-    // 3. Импорт истории закрытых сделок с биржи (чтобы Дашборд и Закрытые сделки отражали реальную историю счета)
+    // 3. Полная сверка и синхронизация истории закрытых сделок и комиссий с биржи
     if (closedPnlRes.success && closedPnlRes.closed.length > 0) {
-      for (const c of closedPnlRes.closed.slice(0, 25)) {
+      const matchedLocalIds = new Set<number>();
+
+      for (const c of closedPnlRes.closed.slice(0, 35)) {
         const histKey = `closed:${targetAccountId}:${c.pair}:${c.order_id || c.updated_time}`;
         if (dismissedExchangeSyncKeys.has(histKey)) continue;
-        const alreadyRecorded = tradesStore.some(
+
+        const existingClosed = tradesStore.find(
           (t) =>
             !t.is_open &&
+            !matchedLocalIds.has(t.trade_id) &&
+            (targetAccountId === 'master'
+              ? !t.account_id || t.account_id === 'master'
+              : t.account_id === targetAccountId) &&
             t.pair === c.pair &&
             ((c.order_id && t.plan_notes && t.plan_notes.includes(c.order_id)) ||
-              Math.abs((t.close_timestamp || 0) - c.updated_time) < 90_000)
+              Math.abs((t.close_timestamp || 0) - c.updated_time) < 600_000)
         );
-        if (alreadyRecorded) continue;
+
+        if (existingClosed) {
+          matchedLocalIds.add(existingClosed.trade_id);
+          existingClosed.open_rate = roundPrice(c.entry_price);
+          existingClosed.close_rate = roundPrice(c.exit_price);
+          existingClosed.current_rate = roundPrice(c.exit_price);
+          existingClosed.amount = Number(c.qty.toFixed(4));
+          existingClosed.fee_open = Number(c.open_fee.toFixed(4));
+          existingClosed.fee_close = Number(c.close_fee.toFixed(4));
+          existingClosed.fee_total = Number((c.open_fee + c.close_fee).toFixed(4));
+          existingClosed.exchange_realized_pnl = Number(c.closed_pnl.toFixed(4));
+          if (c.updated_time > 0) {
+            existingClosed.close_timestamp = c.updated_time;
+            existingClosed.close_date = new Date(c.updated_time).toISOString().replace('T', ' ').slice(0, 19);
+          }
+          if (c.order_id && (!existingClosed.plan_notes || !existingClosed.plan_notes.includes(c.order_id))) {
+            existingClosed.plan_notes = `Синхронизировано с биржей ${acc.exchange.toUpperCase()} (OrderID: ${c.order_id})`;
+          }
+          recalculateTradeMetrics(existingClosed, false);
+          sqliteDb.upsertTrade(existingClosed);
+          continue;
+        }
 
         const id = nextTradeId++;
         const [base, quote] = c.pair.split(':')[0].split('/');
@@ -1824,9 +1936,8 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
         const lev = c.leverage || acc.max_leverage || 25;
         const notional = c.entry_price * c.qty;
         const stakeUsdt = Math.max(0.5, Number((notional / Math.max(1, lev)).toFixed(2)));
-        const feeRate = getExchangeTakerFeeRate(acc.exchange);
-        const feeOpen = Number((c.entry_price * c.qty * feeRate).toFixed(4));
-        const feeClose = Number((c.exit_price * c.qty * feeRate).toFixed(4));
+        const feeOpen = Number(c.open_fee.toFixed(4));
+        const feeClose = Number(c.close_fee.toFixed(4));
         const feeTotal = Number((feeOpen + feeClose).toFixed(4));
         const netPnl = Number(c.closed_pnl.toFixed(4));
         const netPct = Number(((netPnl / Math.max(1e-8, stakeUsdt)) * 100).toFixed(2));
@@ -1861,12 +1972,13 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
           close_timestamp: closeTs,
           close_rate: roundPrice(c.exit_price),
           current_rate: roundPrice(c.exit_price),
+          exchange_realized_pnl: netPnl,
           gross_profit: Number((netPnl + feeTotal).toFixed(4)),
           net_profit: netPnl,
           net_profit_percent: netPct,
           profit_ratio: Number((netPct / 100).toFixed(4)),
           profit_pct: netPct,
-          profit_abs: Number(netPnl.toFixed(3)),
+          profit_abs: Number(netPnl.toFixed(4)),
           stop_loss_abs: 0,
           stop_loss_pct: 0,
           initial_stop_loss_abs: 0,
@@ -1894,8 +2006,27 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
           trade_state: 'CLOSED',
         };
 
+        matchedLocalIds.add(id);
         tradesStore.push(closedTrade);
         sqliteDb.upsertTrade(closedTrade);
+      }
+
+      // Удаляем фантомные локальные закрытые записи этого реального аккаунта, которых нет в истории биржи
+      const staleLocalClosed = tradesStore.filter(
+        (t) =>
+          !t.is_open &&
+          t.exchange === acc.exchange &&
+          (targetAccountId === 'master'
+            ? !t.account_id || t.account_id === 'master'
+            : t.account_id === targetAccountId) &&
+          !matchedLocalIds.has(t.trade_id)
+      );
+      if (staleLocalClosed.length > 0) {
+        for (const stale of staleLocalClosed) {
+          sqliteDb.deleteTrade(stale.trade_id);
+        }
+        const staleSet = new Set(staleLocalClosed.map((s) => s.trade_id));
+        tradesStore = tradesStore.filter((t) => !staleSet.has(t.trade_id));
       }
     }
   } catch {
@@ -1904,7 +2035,7 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
 }
 
 async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
-  if (!force && Date.now() - lastExchangeBalanceSyncTs < 20_000) return;
+  if (!force && Date.now() - lastExchangeBalanceSyncTs < 12_000) return;
   lastExchangeBalanceSyncTs = Date.now();
   const enabledAccs = exchangeAccountsStore.filter((a) => a.enabled);
   for (const acc of enabledAccs) {
@@ -1922,11 +2053,25 @@ async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
           acc.network_label = check.network_label;
           changed = true;
         }
-        if (typeof check.balance_usdt === 'number' && check.balance_usdt > 0) {
-          if (Math.abs(acc.balance_usdt - check.balance_usdt) >= 0.01) {
-            acc.balance_usdt = Number(check.balance_usdt.toFixed(2));
+        const exactWallet = check.wallet_balance_usdt ?? check.balance_usdt;
+        if (typeof exactWallet === 'number' && exactWallet > 0) {
+          if (Math.abs((acc.balance_usdt || 0) - exactWallet) >= 0.001) {
+            acc.balance_usdt = Number(exactWallet.toFixed(4));
             changed = true;
           }
+          acc.wallet_balance_usdt = Number(exactWallet.toFixed(4));
+        }
+        if (typeof check.unrealized_pnl_usdt === 'number') {
+          acc.unrealized_pnl = Number(check.unrealized_pnl_usdt.toFixed(4));
+        }
+        if (typeof check.equity_usdt === 'number') {
+          acc.equity_usdt = Number(check.equity_usdt.toFixed(4));
+        }
+        if (typeof check.available_balance_usdt === 'number') {
+          acc.available_balance_usdt = Number(check.available_balance_usdt.toFixed(2));
+        }
+        if (typeof check.used_margin_usdt === 'number') {
+          acc.used_margin_usdt = Number(check.used_margin_usdt.toFixed(2));
         }
         acc.status = 'connected';
         acc.last_sync = new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -1935,7 +2080,7 @@ async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
           appendLog(
             'freqtrade.exchange.sync',
             'INFO',
-            `🔄 Синхронизирован баланс биржи ${check.network_label || acc.exchange.toUpperCase()} (${acc.name}): ${acc.balance_usdt.toFixed(2)} USDT | Пинг: ${check.latency_ms} мс`
+            `🔄 Синхронизирован счёт биржи ${check.network_label || acc.exchange.toUpperCase()} (${acc.name}): Баланс=${acc.balance_usdt.toFixed(2)} USDT | Плавающий PnL=${acc.unrealized_pnl >= 0 ? '+' : ''}${acc.unrealized_pnl.toFixed(2)} USDT | Пинг: ${check.latency_ms} мс`
           );
         }
       } else {
@@ -2063,15 +2208,42 @@ async function runScalpBotCycle(waitForActive = false) {
 
     const activeAccounts = exchangeAccountsStore.filter((a) => a.enabled);
     const ownerAcc = activeAccounts.find((a) => a.is_owner) || activeAccounts[0];
+    const isRealOwnerAcc = Boolean(
+      ownerAcc?.api_key_raw && !isSimulatedTestApiKey(ownerAcc.api_key_raw)
+    );
 
-    // Always refresh live prices on any open client trades first
+    // Если основной аккаунт подключен к реальной бирже (или Testnet/Demo), всегда синхронизируем позиции перед проверкой TP и DCA
+    let liveExchangePosMap = new Map<string, { mark_price: number; unrealized_pnl: number; size: number }>();
+    if (ownerAcc && isRealOwnerAcc) {
+      const creds = getAccountCredentialsFromStore(ownerAcc);
+      if (creds) {
+        const livePosRes = await fetchExchangeOpenPositions(creds);
+        if (livePosRes.success) {
+          for (const p of livePosRes.positions) {
+            liveExchangePosMap.set(`${p.pair}:${p.is_short ? 'S' : 'L'}`, {
+              mark_price: p.mark_price,
+              unrealized_pnl: p.unrealized_pnl,
+              size: p.size,
+            });
+          }
+        }
+      }
+    }
+
+    // Always refresh live prices on any open client trades first (preserve live exchange mark_price if synced)
     for (const ct of tradesStore) {
       if (ct.is_open && ct.account_id && ct.account_id !== 'master') {
-        const liveTicker = tickerCache.get(ct.pair);
-        if (liveTicker && liveTicker.price > 0) {
-          ct.current_rate = liveTicker.price;
-          recalculateTradeMetrics(ct, false);
+        const hasFreshExchangeMark =
+          ct.exchange_mark_price &&
+          ct.exchange_synced_at &&
+          Date.now() - ct.exchange_synced_at < 30_000;
+        if (!hasFreshExchangeMark) {
+          const liveTicker = tickerCache.get(ct.pair);
+          if (liveTicker && liveTicker.price > 0) {
+            ct.current_rate = liveTicker.price;
+          }
         }
+        recalculateTradeMetrics(ct, false);
       }
     }
 
@@ -2083,24 +2255,47 @@ async function runScalpBotCycle(waitForActive = false) {
     for (const trade of openTrades) {
       const { candles: candles1h } = await fetchRealCandles(trade.pair, trade.timeframe || botConfig.timeframe, 60);
       if (!candles1h || candles1h.length === 0) continue;
-      const currentPrice = candles1h[candles1h.length - 1].close;
+
+      const liveExPos = liveExchangePosMap.get(`${trade.pair}:${trade.is_short ? 'S' : 'L'}`);
+      const currentPrice =
+        liveExPos && liveExPos.mark_price > 0
+          ? roundPrice(liveExPos.mark_price)
+          : candles1h[candles1h.length - 1].close;
+
       trade.current_rate = currentPrice;
+      if (liveExPos) {
+        trade.exchange_mark_price = liveExPos.mark_price;
+        trade.exchange_unrealized_pnl = liveExPos.unrealized_pnl;
+        trade.exchange_synced_at = Date.now();
+      }
       recalculateTradeMetrics(trade, false);
 
       // Sync current_rate to any open client copies for this pair
       for (const ct of tradesStore) {
         if (ct.is_open && ct.account_id && ct.account_id !== 'master' && ct.pair === trade.pair) {
-          ct.current_rate = currentPrice;
+          if (!ct.exchange_synced_at || Date.now() - ct.exchange_synced_at >= 30_000) {
+            ct.current_rate = currentPrice;
+          }
           recalculateTradeMetrics(ct, false);
         }
       }
 
-      // 1A. Target TP check (respects user-dragged TP on chart, strictly enforces Zero-Loss Guard net_profit > 0)
+      // ZERO-LOSS EXCHANGE GUARD: проверяем, что сделка гарантированно в чистом плюсе и по расчёту, и по фактическому Unrealized PnL биржи
+      const feeRate = getExchangeTakerFeeRate(trade.exchange || ownerAcc?.exchange || 'binance');
+      const estClosingFee = currentPrice * trade.amount * feeRate;
+      const isExchangePositionProfitable = liveExPos
+        ? liveExPos.unrealized_pnl > estClosingFee + 0.05 &&
+          (trade.is_short
+            ? liveExPos.mark_price <= (trade.min_profitable_tp || trade.open_rate)
+            : liveExPos.mark_price >= (trade.min_profitable_tp || trade.open_rate))
+        : (trade.net_profit ?? trade.profit_abs) > 0;
+
+      // 1A. Target TP check (respects user-dragged TP on chart, strictly enforces Zero-Loss Exchange Guard)
       if (trade.take_profit_abs > 0) {
         const isTpHit = trade.is_short
           ? currentPrice <= trade.take_profit_abs
           : currentPrice >= trade.take_profit_abs;
-        if (isTpHit && (trade.net_profit ?? trade.profit_abs) > 0) {
+        if (isTpHit && (trade.net_profit ?? trade.profit_abs) > 0 && isExchangePositionProfitable) {
           const closeOrderRes = await dispatchOrderToExchangeAccount(ownerAcc, {
             pair: trade.pair,
             action: 'CLOSE',
@@ -2130,6 +2325,12 @@ async function runScalpBotCycle(waitForActive = false) {
             trade.close_timestamp = now;
             if (closeOrderRes?.commission_usdt && closeOrderRes.commission_usdt > 0) {
               trade.fee_close = Number(closeOrderRes.commission_usdt.toFixed(4));
+            }
+            if (typeof closeOrderRes?.realized_pnl_usdt === 'number') {
+              const totalFees = (trade.fee_open || 0) + (trade.fee_close || 0);
+              trade.exchange_realized_pnl = Number(
+                (closeOrderRes.realized_pnl_usdt - totalFees).toFixed(4)
+              );
             }
             trade.exit_reason = 'roi_target_tp';
             trade.trade_state = 'CLOSED';
@@ -2182,7 +2383,7 @@ async function runScalpBotCycle(waitForActive = false) {
           continue;
         } else if (
           isTpHit &&
-          (trade.net_profit ?? trade.profit_abs) <= 0 &&
+          (!isExchangePositionProfitable || (trade.net_profit ?? trade.profit_abs) <= 0) &&
           trade.min_profitable_tp &&
           !trade.tp_manual_override
         ) {
@@ -2194,7 +2395,7 @@ async function runScalpBotCycle(waitForActive = false) {
 
       // 1C. 4H Hedge Campaign Second Leg Check — СТРОГО БЕЗ ЗАКРЫТИЯ В МИНУС!
       if (trade.campaign_banked_profit !== undefined && trade.campaign_banked_profit !== null) {
-        if ((trade.net_profit ?? trade.profit_abs) > 0 && currentPrice && trade.min_profitable_tp) {
+        if ((trade.net_profit ?? trade.profit_abs) > 0 && isExchangePositionProfitable && currentPrice && trade.min_profitable_tp) {
           const reachedMinProfit = trade.is_short
             ? currentPrice <= trade.min_profitable_tp
             : currentPrice >= trade.min_profitable_tp;
@@ -2228,6 +2429,12 @@ async function runScalpBotCycle(waitForActive = false) {
               trade.close_timestamp = now;
               if (closeOrderRes?.commission_usdt && closeOrderRes.commission_usdt > 0) {
                 trade.fee_close = Number(closeOrderRes.commission_usdt.toFixed(4));
+              }
+              if (typeof closeOrderRes?.realized_pnl_usdt === 'number') {
+                const totalFees = (trade.fee_open || 0) + (trade.fee_close || 0);
+                trade.exchange_realized_pnl = Number(
+                  (closeOrderRes.realized_pnl_usdt - totalFees).toFixed(4)
+                );
               }
               trade.exit_reason = 'hedge_breakeven_profit';
               trade.trade_state = 'CLOSED';
@@ -2289,21 +2496,12 @@ async function runScalpBotCycle(waitForActive = false) {
           );
 
           if (riskCheck.allowed) {
-            const candleRej = checkCandleRejection(candles1h, nextDcaTarget, trade.is_short, 0.8);
-            const rsiCheck = checkRsiCondition(candles1h, trade.is_short, 14);
-            const { wt1, wt2 } = calculateWaveTrend(candles1h);
-            const idx = candles1h.length - 1;
-            const waveReversal = !trade.is_short
-              ? wt1[idx] > wt2[idx] && wt2[idx] <= -20
-              : wt1[idx] < wt2[idx] && wt2[idx] >= 20;
-
             const noKnifeOrPump = !trade.is_short
               ? !isKnifeDrop(candles1h)
               : !isPumpExhaustion(candles1h);
 
-            // If user manually dragged the DCA level onto current price, or reversal is confirmed at the level:
-            const isManualDcaTrigger = Boolean(trade.planned_dca_levels?.[0]?.manual_override);
-            if (noKnifeOrPump && (isManualDcaTrigger || candleRej.confirmed || rsiCheck.confirmed || waveReversal)) {
+            // Как только цена достигла или пробила целевой уровень DCA 1 (установленный вручную или рассчитанный ботом) и нет вертикального ножа — выполняем усреднение
+            if (noKnifeOrPump) {
               // Find next strongest 4H/1D DCA level first
               const [{ candles: c4h }, { candles: c1d }] = await Promise.all([
                 fetchRealCandles(trade.pair, '4h', 250),
@@ -3810,13 +4008,20 @@ async function startServer() {
 
   app.get('/api/v1/status', async (req, res) => {
     await initializeBotTrades();
+    await syncRealExchangeBalancesIfNeeded(false);
     const scope = resolveRequestAccountScope(req);
     const scopedTrades = filterTradesForScope(scope.accountId);
     for (const t of scopedTrades) {
       if (t.is_open) {
-        const liveTicker = tickerCache.get(t.pair);
-        if (liveTicker && liveTicker.price > 0) {
-          t.current_rate = liveTicker.price;
+        const hasFreshExchangeMark =
+          t.exchange_mark_price &&
+          t.exchange_synced_at &&
+          Date.now() - t.exchange_synced_at < 60_000;
+        if (!hasFreshExchangeMark) {
+          const liveTicker = tickerCache.get(t.pair);
+          if (liveTicker && liveTicker.price > 0) {
+            t.current_rate = liveTicker.price;
+          }
         }
         recalculateTradeMetrics(t);
       }
@@ -3833,6 +4038,7 @@ async function startServer() {
 
   app.get('/api/v1/trades', async (req, res) => {
     await initializeBotTrades();
+    await syncRealExchangeBalancesIfNeeded(false);
     const scope = resolveRequestAccountScope(req);
     const scopedTrades = filterTradesForScope(scope.accountId);
     const closed = scopedTrades.filter((t) => !t.is_open);
@@ -3845,23 +4051,42 @@ async function startServer() {
 
   app.get('/api/v1/profit', async (req, res) => {
     await initializeBotTrades();
+    await syncRealExchangeBalancesIfNeeded(false);
     const scope = resolveRequestAccountScope(req);
     const scopedTrades = filterTradesForScope(scope.accountId);
     const open = scopedTrades.filter((t) => t.is_open);
     const closed = scopedTrades.filter((t) => !t.is_open);
     const closedProfitAbs = Number(
-      closed.reduce((acc, t) => acc + t.profit_abs, 0).toFixed(3)
+      closed.reduce((acc, t) => acc + (t.net_profit ?? t.profit_abs ?? 0), 0).toFixed(4)
     );
-    const openProfitAbs = Number(
-      open.reduce((acc, t) => acc + t.profit_abs, 0).toFixed(3)
+    const isRealAcc = Boolean(
+      scope.account?.api_key_raw && !isSimulatedTestApiKey(scope.account.api_key_raw)
     );
-    const allProfitAbs = Number((closedProfitAbs + openProfitAbs).toFixed(3));
-    const wins = closed.filter((t) => t.profit_abs >= 0).length;
-    const losses = closed.filter((t) => t.profit_abs < 0).length;
+    const openProfitAbs =
+      isRealAcc && typeof scope.account?.unrealized_pnl === 'number' && open.length > 0
+        ? Number(scope.account.unrealized_pnl.toFixed(4))
+        : Number(open.reduce((acc, t) => acc + t.profit_abs, 0).toFixed(4));
+    const allProfitAbs = Number((closedProfitAbs + openProfitAbs).toFixed(4));
+    const totalFeesUsdt = Number(
+      scopedTrades
+        .reduce((acc, t) => acc + (t.fee_total ?? (t.fee_open || 0) + (t.fee_close || 0)), 0)
+        .toFixed(4)
+    );
+    const closedFeesUsdt = Number(
+      closed
+        .reduce((acc, t) => acc + (t.fee_total ?? (t.fee_open || 0) + (t.fee_close || 0)), 0)
+        .toFixed(4)
+    );
+    const wins = closed.filter((t) => (t.net_profit ?? t.profit_abs) >= 0).length;
+    const losses = closed.filter((t) => (t.net_profit ?? t.profit_abs) < 0).length;
     const winrate = closed.length > 0 ? Number(((wins / closed.length) * 100).toFixed(1)) : 0;
 
     const compounded = getCompoundedAccountBalance(scope.accountId);
     const baseDeposit = compounded.baseDeposit > 0 ? compounded.baseDeposit : scope.baseDeposit;
+    const exactWalletBalance = isRealAcc
+      ? Number((scope.account?.wallet_balance_usdt ?? scope.account?.balance_usdt ?? compounded.compoundedBalance).toFixed(4))
+      : Number(compounded.compoundedBalance.toFixed(2));
+    const exactEquity = Number((exactWalletBalance + openProfitAbs).toFixed(4));
 
     res.json({
       profit_closed_coin: closedProfitAbs,
@@ -3872,6 +4097,8 @@ async function startServer() {
       profit_all_fiat: allProfitAbs,
       profit_open_coin: openProfitAbs,
       profit_open_percent: baseDeposit > 0 ? Number(((openProfitAbs / baseDeposit) * 100).toFixed(2)) : 0,
+      total_fees_usdt: totalFeesUsdt,
+      closed_fees_usdt: closedFeesUsdt,
       trade_count: scopedTrades.length,
       closed_trade_count: closed.length,
       open_trade_count: open.length,
@@ -3884,7 +4111,10 @@ async function startServer() {
       best_pair: closed[0]?.pair || open[0]?.pair || 'ETH/USDT:USDT',
       best_rate: 0,
       starting_balance: baseDeposit,
-      current_balance: Number(compounded.compoundedBalance.toFixed(2)),
+      current_balance: exactWalletBalance,
+      wallet_balance: exactWalletBalance,
+      equity_balance: exactEquity,
+      unrealized_pnl: openProfitAbs,
     });
   });
 
@@ -3912,7 +4142,10 @@ async function startServer() {
     await syncRealExchangeBalancesIfNeeded(false);
     const scope = resolveRequestAccountScope(req);
     const scopedTrades = filterTradesForScope(scope.accountId);
-    const usedStake = Number(
+    const isRealAcc = Boolean(
+      scope.account?.api_key_raw && !isSimulatedTestApiKey(scope.account.api_key_raw)
+    );
+    const localUsedStake = Number(
       scopedTrades
         .filter((t) => t.is_open)
         .reduce((acc, t) => acc + t.stake_amount, 0)
@@ -3920,8 +4153,27 @@ async function startServer() {
     );
     const compounded = getCompoundedAccountBalance(scope.accountId);
     const baseStartingBalance = compounded.baseDeposit > 0 ? compounded.baseDeposit : scope.baseDeposit;
-    const totalBalance = Number(compounded.compoundedBalance.toFixed(2));
-    const freeBalance = Number(Math.max(0, totalBalance - usedStake).toFixed(2));
+    const totalBalance = isRealAcc
+      ? Number((scope.account?.wallet_balance_usdt ?? scope.account?.balance_usdt ?? compounded.compoundedBalance).toFixed(4))
+      : Number(compounded.compoundedBalance.toFixed(2));
+    const unrealizedPnl =
+      isRealAcc && typeof scope.account?.unrealized_pnl === 'number'
+        ? Number(scope.account.unrealized_pnl.toFixed(4))
+        : Number(
+            scopedTrades
+              .filter((t) => t.is_open)
+              .reduce((acc, t) => acc + t.profit_abs, 0)
+              .toFixed(4)
+          );
+    const equityBalance = Number((totalBalance + unrealizedPnl).toFixed(4));
+    const usedStake =
+      isRealAcc && scope.account?.used_margin_usdt && scope.account.used_margin_usdt > 0
+        ? Number(scope.account.used_margin_usdt.toFixed(2))
+        : localUsedStake;
+    const freeBalance =
+      isRealAcc && scope.account?.available_balance_usdt && scope.account.available_balance_usdt > 0
+        ? Number(scope.account.available_balance_usdt.toFixed(2))
+        : Number(Math.max(0, totalBalance - usedStake).toFixed(2));
     res.json({
       currencies: [
         {
@@ -3929,11 +4181,17 @@ async function startServer() {
           free: freeBalance,
           used: usedStake,
           balance: totalBalance,
-          est_stake: totalBalance,
+          est_stake: equityBalance,
           stake: 'USDT',
         },
       ],
       total: totalBalance,
+      wallet_balance: totalBalance,
+      unrealized_pnl: unrealizedPnl,
+      equity: equityBalance,
+      equity_balance: equityBalance,
+      available_balance: freeBalance,
+      used_margin: usedStake,
       symbol: 'USDT',
       value: totalBalance,
       starting_capital: baseStartingBalance,
@@ -4034,12 +4292,18 @@ async function startServer() {
 
     const { candles, source } = await fetchRealCandles(pair, timeframe, limit, endTime);
 
-    // Update current rate for open trades on this pair without mutating entry price across timeframes
+    // Update current rate for open trades on this pair without overwriting live exchange mark_price
     if (!endTime && candles.length > 0) {
       const cLatest = candles[candles.length - 1];
       for (const t of tradesStore) {
         if (t.is_open && t.pair === pair && cLatest) {
-          t.current_rate = cLatest.close;
+          const hasFreshExchangeMark =
+            t.exchange_mark_price &&
+            t.exchange_synced_at &&
+            Date.now() - t.exchange_synced_at < 60_000;
+          if (!hasFreshExchangeMark) {
+            t.current_rate = cLatest.close;
+          }
           recalculateTradeMetrics(t);
         }
       }
@@ -4953,19 +5217,27 @@ async function startServer() {
         };
       }
       if (acc.is_owner) {
+        const liveUnrealized =
+          typeof acc.unrealized_pnl === 'number' && Number.isFinite(acc.unrealized_pnl) && acc.unrealized_pnl !== 0
+            ? acc.unrealized_pnl
+            : masterOpenPnl;
         return {
           ...acc,
           open_trades_count: masterOpen.length,
-          unrealized_pnl: Number(masterOpenPnl.toFixed(2)),
+          unrealized_pnl: Number(liveUnrealized.toFixed(4)),
           status: 'connected' as const,
         };
       }
       const clientOpen = tradesStore.filter((t) => t.is_open && t.account_id === acc.id);
       const clientPnl = clientOpen.reduce((sum, t) => sum + t.profit_abs, 0);
+      const liveClientUnrealized =
+        typeof acc.unrealized_pnl === 'number' && Number.isFinite(acc.unrealized_pnl) && acc.unrealized_pnl !== 0
+          ? acc.unrealized_pnl
+          : clientPnl;
       return {
         ...acc,
-        open_trades_count: acc.copy_trading ? clientOpen.length : 0,
-        unrealized_pnl: acc.copy_trading ? Number(clientPnl.toFixed(2)) : 0,
+        open_trades_count: clientOpen.length,
+        unrealized_pnl: Number(liveClientUnrealized.toFixed(4)),
         status: 'connected' as const,
       };
     });
