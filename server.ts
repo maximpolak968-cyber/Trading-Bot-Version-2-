@@ -2925,20 +2925,33 @@ async function runScalpBotCycle(waitForActive = false) {
       const customRes = manualResLvl?.price || mtf.key_4h_resistance;
       const sig = evaluateScalpingStrategy(c1h, customSup, customRes);
 
+      const last1hCandle = c1h[c1h.length - 1];
+      const isRed1h = Boolean(last1hCandle && last1hCandle.close < last1hCandle.open);
+      const isGreen1h = Boolean(last1hCandle && last1hCandle.close > last1hCandle.open);
+      const effectiveTrend = mtf.market_trend || 'NEUTRAL';
+
       // Record multi-coin market scan in signals table so user sees full market analysis across volatile coins
       sqliteDb.recordSignal({
         pair,
         signal_type: 'MTF_SCAN',
-        direction: sig.enter_long ? 'long' : sig.enter_short ? 'short' : mtf.d1_trend.toLowerCase(),
-        confidence: sig.enter_long || sig.enter_short ? 0.85 : 0.55,
+        direction: sig.enter_short
+          ? 'short'
+          : sig.enter_long
+          ? 'long'
+          : effectiveTrend === 'BEARISH'
+          ? 'short'
+          : effectiveTrend === 'BULLISH'
+          ? 'long'
+          : mtf.d1_trend.toLowerCase(),
+        confidence: sig.enter_long || sig.enter_short ? 0.85 : 0.65,
         price: livePrice,
-        reason: `MTF Scan [${pair}]: 1D=${mtf.d1_trend} (RSI 1D=${mtf.rsi_1d}, 4H=${mtf.rsi_4h}, 1H=${mtf.rsi_1h}) | 4H Sup=${roundPrice(customSup)} Res=${roundPrice(customRes)} | Signal=${sig.enter_tag || 'WAIT_LEVEL'}`,
+        reason: `MTF Scan [${pair}]: Trend=${effectiveTrend} (1D=${mtf.d1_trend} RSI=${mtf.rsi_1d}, 4H=${mtf.h4_trend} RSI=${mtf.rsi_4h}, 1H=${mtf.h1_trend} RSI=${mtf.rsi_1h}) | 4H Sup=${roundPrice(customSup)} Res=${roundPrice(customRes)} | Signal=${sig.enter_tag || (effectiveTrend === 'BEARISH' && mtf.allow_short ? 'BEARISH_TREND_SHORT' : effectiveTrend === 'BULLISH' && mtf.allow_long ? 'BULLISH_TREND_LONG' : 'WAIT_LEVEL')}`,
       });
 
-      // CASE A: Master does NOT have this pair open yet -> Strict MTF-filtered Entry:
-      // 1. Primary 1H Scalping Signal (Mode A Level Bounce / Mode B Trend Pullback) strictly obeying MTF RSI (Long: 1D<=68, 4H<=60, 1H<=45; Short: 1D>=32, 4H>=40, 1H>=55)
-      // 2. Secondary MTF Level + RSI Oversold/Overbought 1H Scalp Entry
-      // 3. 2-Way Long-Term 4H Channel Hedge Entry (simultaneous LONG + SHORT in a wide >=2.2% 4H channel when price is in the 35%-65% middle zone)
+      // CASE A: Master does NOT have this pair open yet -> Trend-Aligned & Level-Filtered Entry:
+      // 1. In BEARISH trend (or when BTC is in BEARISH trend): prioritize SHORT signals (ScalpingStrategy Short or MTF Bearish Trend Continuation Short). Never open unconfirmed counter-trend Longs!
+      // 2. In BULLISH trend (when BTC is not dumping/bearish): prioritize LONG signals (ScalpingStrategy Long or MTF Bullish Trend Continuation Long).
+      // 3. In a 4H channel (>= 2.2% width, price in 25%-75% middle zone): open 2-Way 4H Hedge (LONG + SHORT).
       if (!masterHasPair && currentMasterOpen.length < botConfig.max_open_trades) {
         const { compoundedBalance: totalDeposit } = getCompoundedAccountBalance('master');
         const usedMargin = currentMasterOpen.reduce((acc, t) => acc + t.stake_amount, 0);
@@ -2951,71 +2964,152 @@ async function runScalpBotCycle(waitForActive = false) {
           btcGuard.isSafe &&
           currentMasterOpen.length + 2 <= botConfig.max_open_trades &&
           channel4hWidthPct >= 2.2 &&
-          mtf.pos_4h_pct >= 35.0 &&
-          mtf.pos_4h_pct <= 65.0 &&
-          mtf.rsi_1h >= 38.0 &&
-          mtf.rsi_1h <= 62.0 &&
-          mtf.rsi_4h >= 35.0 &&
-          mtf.rsi_4h <= 65.0 &&
+          mtf.pos_4h_pct >= 25.0 &&
+          mtf.pos_4h_pct <= 75.0 &&
+          mtf.rsi_1h >= 30.0 &&
+          mtf.rsi_1h <= 68.0 &&
           !isKnifeDrop(c1h) &&
           !isPumpExhaustion(c1h);
 
+        // Safe check for LONG: BTC must not be flash dumping AND if BTC is in a bearish trend, only allow Long if the coin itself is strongly bullish or bouncing right off 4H support
+        const btcAllowsLong =
+          btcGuard.isSafe &&
+          (btcGuard.btcTrend !== 'BEARISH' || effectiveTrend === 'BULLISH' || mtf.dist_to_4h_sup_pct <= 1.2);
+
         if (masterMarginOk) {
           try {
-            if (sig.enter_long && btcGuard.isSafe && mtf.allow_long) {
-              await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag);
-              openedInThisCycle++;
-              if (openedInThisCycle >= 3) break;
-              continue;
-            } else if (sig.enter_short && mtf.allow_short) {
-              await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag);
-              openedInThisCycle++;
-              if (openedInThisCycle >= 3) break;
-              continue;
-            } else if (
-              btcGuard.isSafe &&
-              mtf.allow_long &&
-              mtf.rsi_1d <= 68 &&
-              mtf.rsi_4h <= 60 &&
-              mtf.rsi_1h <= 45 &&
-              mtf.pos_4h_pct <= 45
-            ) {
-              await createScalpBotPosition(
-                pair,
-                'long',
-                livePrice,
-                mtf,
-                c4h,
-                c1d,
-                'MTF_Oversold_Scalp_Long'
-              );
-              openedInThisCycle++;
-              if (openedInThisCycle >= 3) break;
-              continue;
-            } else if (
-              mtf.allow_short &&
-              mtf.rsi_1d >= 32 &&
-              mtf.rsi_4h >= 40 &&
-              mtf.rsi_1h >= 55 &&
-              mtf.pos_4h_pct >= 55
-            ) {
-              await createScalpBotPosition(
-                pair,
-                'short',
-                livePrice,
-                mtf,
-                c4h,
-                c1d,
-                'MTF_Overbought_Scalp_Short'
-              );
-              openedInThisCycle++;
-              if (openedInThisCycle >= 3) break;
-              continue;
-            } else if (is4hHedgeCandidate) {
-              await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d);
-              openedInThisCycle += 2;
-              if (openedInThisCycle >= 3) break;
-              continue;
+            if (effectiveTrend === 'BEARISH') {
+              // Market trend for this coin is BEARISH -> prioritize SHORT entries along the trend
+              if (sig.enter_short && mtf.allow_short) {
+                await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag);
+                openedInThisCycle++;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              } else if (
+                mtf.allow_short &&
+                mtf.rsi_1h >= 24.0 &&
+                mtf.rsi_1h <= 62.0 &&
+                (isRed1h || livePrice <= sig.ema_slow * 1.003)
+              ) {
+                await createScalpBotPosition(
+                  pair,
+                  'short',
+                  livePrice,
+                  mtf,
+                  c4h,
+                  c1d,
+                  'MTF_Trend_Scalp_Short'
+                );
+                openedInThisCycle++;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              } else if (is4hHedgeCandidate) {
+                await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d);
+                openedInThisCycle += 2;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              } else if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
+                await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag);
+                openedInThisCycle++;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              }
+            } else if (effectiveTrend === 'BULLISH') {
+              // Market trend for this coin is BULLISH -> prioritize LONG entries along the trend
+              if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
+                await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag);
+                openedInThisCycle++;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              } else if (
+                btcAllowsLong &&
+                mtf.allow_long &&
+                mtf.rsi_1h >= 38.0 &&
+                mtf.rsi_1h <= 62.0 &&
+                (isGreen1h || livePrice >= sig.ema_slow * 0.997)
+              ) {
+                await createScalpBotPosition(
+                  pair,
+                  'long',
+                  livePrice,
+                  mtf,
+                  c4h,
+                  c1d,
+                  'MTF_Trend_Scalp_Long'
+                );
+                openedInThisCycle++;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              } else if (is4hHedgeCandidate) {
+                await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d);
+                openedInThisCycle += 2;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              } else if (sig.enter_short && mtf.allow_short) {
+                await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag);
+                openedInThisCycle++;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              }
+            } else {
+              // NEUTRAL / RANGING market -> check strategy signals, 2-Way Hedge in channel, or confirmed range bounce/rejection
+              if (sig.enter_short && mtf.allow_short) {
+                await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag);
+                openedInThisCycle++;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              } else if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
+                await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag);
+                openedInThisCycle++;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              } else if (is4hHedgeCandidate) {
+                await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d);
+                openedInThisCycle += 2;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              } else if (
+                mtf.allow_short &&
+                mtf.rsi_1d >= 32 &&
+                mtf.rsi_4h >= 40 &&
+                mtf.rsi_1h >= 55 &&
+                mtf.pos_4h_pct >= 55 &&
+                isRed1h
+              ) {
+                await createScalpBotPosition(
+                  pair,
+                  'short',
+                  livePrice,
+                  mtf,
+                  c4h,
+                  c1d,
+                  'MTF_Overbought_Scalp_Short'
+                );
+                openedInThisCycle++;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              } else if (
+                btcAllowsLong &&
+                mtf.allow_long &&
+                mtf.rsi_1d <= 68 &&
+                mtf.rsi_4h <= 60 &&
+                mtf.rsi_1h <= 45 &&
+                mtf.pos_4h_pct <= 45 &&
+                isGreen1h
+              ) {
+                await createScalpBotPosition(
+                  pair,
+                  'long',
+                  livePrice,
+                  mtf,
+                  c4h,
+                  c1d,
+                  'MTF_Oversold_Scalp_Long'
+                );
+                openedInThisCycle++;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              }
             }
           } catch (entryErr: any) {
             cooldownPairs.set(pair, Date.now());
@@ -3033,10 +3127,14 @@ async function runScalpBotCycle(waitForActive = false) {
       if (masterHasPair && clientsMissingPair.length > 0) {
         const masterTradeOnPair = currentMasterOpen.find((t) => t.pair === pair);
         const entrySide: 'long' | 'short' | null =
-          sig.enter_long && btcGuard.isSafe && mtf.allow_long
-            ? 'long'
-            : sig.enter_short && mtf.allow_short
+          sig.enter_short && mtf.allow_short
             ? 'short'
+            : sig.enter_long && btcGuard.isSafe && mtf.allow_long
+            ? 'long'
+            : effectiveTrend === 'BEARISH' && mtf.allow_short && isRed1h
+            ? 'short'
+            : effectiveTrend === 'BULLISH' && btcGuard.isSafe && mtf.allow_long && isGreen1h
+            ? 'long'
             : null;
 
         if (entrySide) {
@@ -3964,6 +4062,11 @@ async function startServer() {
           change24h_pct: ticker?.change24h || 0,
           swing24h_pct: swing24h,
           d1_trend: mtf.d1_trend,
+          h4_trend: mtf.h4_trend,
+          h1_trend: mtf.h1_trend,
+          market_trend: mtf.market_trend,
+          allow_long: mtf.allow_long,
+          allow_short: mtf.allow_short,
           key_4h_support: roundPrice(mtf.key_4h_support),
           key_4h_resistance: roundPrice(mtf.key_4h_resistance),
           recommended_tp_long: roundPrice(mtf.recommended_tp_long),
