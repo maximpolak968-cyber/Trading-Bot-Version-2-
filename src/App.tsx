@@ -966,7 +966,12 @@ export default function App() {
       await fetchBotState();
       return data;
     }
-    return undefined;
+    try {
+      const errData = await res.json();
+      return { error: errData?.error || errData?.message || 'Ошибка подключения API-ключа', connection_check: errData?.connection_check };
+    } catch {
+      return { error: 'Ошибка подключения API-ключа' };
+    }
   };
 
   const handleToggleAccount = async (id: string, enabled: boolean) => {

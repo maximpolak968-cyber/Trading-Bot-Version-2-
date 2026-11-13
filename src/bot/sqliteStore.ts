@@ -400,6 +400,12 @@ export class SqliteBotDatabase {
     ) {
       return false;
     }
+    if (
+      Array.isArray(tradeObj.orders) &&
+      tradeObj.orders.some((o: any) => String(o?.id || '').startsWith('sim-'))
+    ) {
+      return false;
+    }
     return true;
   }
 
@@ -950,6 +956,7 @@ export class SqliteBotDatabase {
     try {
       this.db.prepare(`DELETE FROM orders WHERE trade_id = ?`).run(tradeId);
       this.db.prepare(`DELETE FROM trades WHERE id = ?`).run(tradeId);
+      this.syncTradesBackupFile(true);
     } catch (e) {
       console.error('SQLite deleteTrade error:', e);
     }

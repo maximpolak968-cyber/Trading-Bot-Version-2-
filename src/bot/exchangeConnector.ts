@@ -2060,14 +2060,15 @@ export async function executeExchangeFuturesOrder(
   }
 
   return {
-    success: true,
-    order_id: `ext-${creds.exchange}-${Date.now()}`,
+    success: false,
+    order_id: '',
     symbol,
-    side,
+    side: params.isShort ? 'SELL' : 'BUY',
     price: params.referencePrice,
     qty: params.quantity,
-    status: 'FILLED',
+    status: 'REJECTED',
     exchange_time: Date.now(),
+    error: `Биржа ${String(creds.exchange || '').toUpperCase()} не поддерживается для отправки реальных фьючерсных ордеров`,
   };
 }
 
@@ -3838,7 +3839,8 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
 export async function fetchExchangeClosedPnl(
   creds: ExchangeCredentials,
   limit = 50,
-  knownSymbols: string[] = []
+  knownSymbols: string[] = [],
+  forceRefresh = false
 ): Promise<{
   success: boolean;
   closed: ExchangeClosedPnlItem[];
@@ -3927,7 +3929,7 @@ export async function fetchExchangeClosedPnl(
   // 2. BINANCE USDT-M FUTURES (WebSocket ORDER_TRADE_UPDATE + кэш 10 мин, чтобы не вызывать /fapi/v1/income каждые 30 сек)
   if (creds.exchange === 'binance') {
     const liveWsState = getWsAccountLiveState(cleanKey, 600_000);
-    const cachedClosed = binanceClosedPnlCache.get(cleanKey);
+    const cachedClosed = !forceRefresh ? binanceClosedPnlCache.get(cleanKey) : undefined;
     if (cachedClosed && Date.now() - cachedClosed.timestamp < 600_000) {
       const merged = [
         ...(liveWsState?.closedPnl || []),
@@ -3937,7 +3939,7 @@ export async function fetchExchangeClosedPnl(
       ];
       return { success: true, closed: merged };
     }
-    if (liveWsState && liveWsState.closedPnl.length > 0) {
+    if (!forceRefresh && liveWsState && liveWsState.closedPnl.length > 0) {
       return { success: true, closed: liveWsState.closedPnl };
     }
 

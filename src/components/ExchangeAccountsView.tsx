@@ -166,8 +166,16 @@ export const ExchangeAccountsView: React.FC<ExchangeAccountsViewProps> = ({
         passphrase: passphrase.trim() || undefined,
         is_testnet: isTestnet,
       });
+      if (result?.error) {
+        setNotice({
+          text: String(result.error),
+          isError: true,
+        });
+        return;
+      }
       const check = result?.connection_check;
       const addedAcc = result?.account;
+      const submittedName = personName.trim();
       setPersonName('');
       setApiKey('');
       setApiSecret('');
@@ -188,7 +196,7 @@ export const ExchangeAccountsView: React.FC<ExchangeAccountsViewProps> = ({
         }
       } else {
         setNotice({
-          text: `Аккаунт «${personName.trim()}» (${EXCHANGE_META[exchange].label}) передан в работу боту`,
+          text: `Аккаунт «${submittedName}» (${EXCHANGE_META[exchange].label}) передан в работу боту`,
           isError: false,
         });
       }

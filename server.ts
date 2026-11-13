@@ -1775,9 +1775,23 @@ async function initializeBotTrades() {
   const cleanTrades: FreqtradeTrade[] = [];
   // Sort ascending by trade_id so we keep the original trade #1 first
   const sortedAsc = [...rawTrades].sort((a, b) => a.trade_id - b.trade_id);
+  const activeExchangeSet = new Set(exchangeAccountsStore.map((a) => a.exchange));
   for (const t of sortedAsc) {
     const accId = t.account_id || 'master';
     const isOrphanClient = accId !== 'master' && exchangeAccountsStore.length > 0 && !validAccIds.has(accId);
+    const matchingOwnerOrAcc =
+      accId === 'master'
+        ? exchangeAccountsStore.find((a) => a.is_owner) || exchangeAccountsStore[0]
+        : exchangeAccountsStore.find((a) => a.id === accId);
+    const isSimOrderTrade =
+      Array.isArray(t.orders) &&
+      t.orders.some((o: any) => String(o?.id || '').startsWith('sim-'));
+    const hasSimOwner = Boolean(
+      matchingOwnerOrAcc && isSimulatedTestApiKey(matchingOwnerOrAcc.api_key_raw)
+    );
+    const isStaleSimTrade = isSimOrderTrade && !hasSimOwner;
+    const isOrphanExchangeTrade =
+      exchangeAccountsStore.length > 0 && !activeExchangeSet.has(t.exchange);
     const isFakeTestRate =
       t.pair === 'ETH/USDT:USDT' && t.open_rate === 2500 && exchangeAccountsStore.length === 0;
     const accConnTs = accId === 'master' ? ownerConnectedAt : accConnectedById.get(accId) || 0;
@@ -1792,7 +1806,7 @@ async function initializeBotTrades() {
       (t.enter_tag === 'EXCHANGE_HISTORY' ||
         t.exit_reason === 'exchange_closed_pnl' ||
         isBeforeApiConnection);
-    if (isOrphanClient || isFakeTestRate || isForeignHistoricalTrade) {
+    if (isOrphanClient || isStaleSimTrade || isOrphanExchangeTrade || isFakeTestRate || isForeignHistoricalTrade) {
       sqliteDb.deleteTrade(t.trade_id);
       continue;
     }
@@ -2292,8 +2306,36 @@ async function syncPositionsAndHistoryFromExchanges(
         acc.available_balance_usdt = Number(Math.max(0, walletRef - acc.used_margin_usdt).toFixed(2));
       }
 
-      // 2. ТОЛЬКО для уже отслеженных ботом открытых сделок, которые исчезли из списка открытых на бирже (закрылись по TP/вручную),
-      // точечно дотягиваем цену закрытия и PnL ПОСЛЕ connected_at!
+      // 2. Удаляем старые симулированные (sim-*) или чужие межбиржевые фантомы, которых нет ни на одной подключённой бирже
+      const enabledExchangesSet = new Set<string>(
+        exchangeAccountsStore.filter((a) => a.enabled).map((a) => a.exchange)
+      );
+      const stalePhantomIds = new Set<number>();
+      for (const localT of tradesStore) {
+        if (!localT.is_open) continue;
+        const belongsToAcc =
+          targetAccountId === 'master'
+            ? !localT.account_id || localT.account_id === 'master'
+            : localT.account_id === targetAccountId;
+        if (!belongsToAcc) continue;
+        const hasSimOrder =
+          Array.isArray(localT.orders) &&
+          localT.orders.some((o: any) => String(o?.id || '').startsWith('sim-'));
+        const noEnabledAccountForExchange = !enabledExchangesSet.has(localT.exchange);
+        const wrongExchangeForClient = targetAccountId !== 'master' && localT.exchange !== acc.exchange;
+        if (hasSimOrder || noEnabledAccountForExchange || wrongExchangeForClient) {
+          stalePhantomIds.add(localT.trade_id);
+        }
+      }
+      if (stalePhantomIds.size > 0) {
+        for (const pid of stalePhantomIds) {
+          sqliteDb.deleteTrade(pid);
+        }
+        tradesStore = tradesStore.filter((t) => !stalePhantomIds.has(t.trade_id));
+      }
+
+      // 3. ТОЛЬКО для уже отслеженных ботом открытых сделок на ЭТОЙ бирже, которые исчезли из списка открытых на бирже:
+      // если биржа подтверждает реальное закрытие — пишем в историю; если подтверждения закрытия нет (фантом/чужой счёт) — удаляем локальный дубль!
       const localOpenForAcc = tradesStore.filter(
         (t) =>
           t.is_open &&
@@ -2313,30 +2355,40 @@ async function syncPositionsAndHistoryFromExchanges(
 
       if (disappearedTrades.length > 0) {
         const missingPairs = Array.from(new Set(disappearedTrades.map((t) => t.pair)));
-        const closedPnlRes = await fetchExchangeClosedPnl(creds, 50, missingPairs).catch(() => ({
+        const closedPnlRes = await fetchExchangeClosedPnl(creds, 50, missingPairs, true).catch(() => ({
           success: false,
           closed: [],
         }));
         const minValidTs = acc.connected_at || 0;
+        const phantomIdsToDelete = new Set<number>();
 
         for (const localTrade of disappearedTrades) {
-          const matchedClosed = closedPnlRes.success
-            ? closedPnlRes.closed.find(
-                (c) =>
-                  c.pair === localTrade.pair &&
-                  c.is_short === localTrade.is_short &&
-                  c.updated_time >= Math.max(minValidTs, (localTrade.open_timestamp || 0) - 120_000)
-              )
-            : undefined;
+          if (!closedPnlRes.success) {
+            continue;
+          }
+          const matchedClosed = closedPnlRes.closed.find(
+            (c) =>
+              c.pair === localTrade.pair &&
+              (c.is_short === localTrade.is_short || c.order_id.startsWith('inc-')) &&
+              c.updated_time >= Math.max(minValidTs, (localTrade.open_timestamp || 0) - 120_000)
+          );
+
+          if (!matchedClosed) {
+            phantomIdsToDelete.add(localTrade.trade_id);
+            sqliteDb.deleteTrade(localTrade.trade_id);
+            appendLog(
+              `freqtrade.exchange.${acc.exchange}`,
+              'WARNING',
+              `🧹 Удалена фантомная локальная сделка #${localTrade.trade_id} [${localTrade.pair}], отсутствующая и среди открытых, и среди закрытых на бирже ${acc.exchange.toUpperCase()}.`
+            );
+            continue;
+          }
+
           const closePrice = roundPrice(
-            matchedClosed && matchedClosed.exit_price > 0
-              ? matchedClosed.exit_price
-              : localTrade.current_rate
+            matchedClosed.exit_price > 0 ? matchedClosed.exit_price : localTrade.current_rate
           );
           const closeTs =
-            matchedClosed && matchedClosed.updated_time > 0
-              ? matchedClosed.updated_time
-              : Date.now();
+            matchedClosed.updated_time > 0 ? matchedClosed.updated_time : Date.now();
           const closeDateStr = new Date(closeTs).toISOString().replace('T', ' ').slice(0, 19);
 
           localTrade.is_open = false;
@@ -2347,14 +2399,12 @@ async function syncPositionsAndHistoryFromExchanges(
           localTrade.exit_reason = 'exchange_tp_closed_sync';
           localTrade.trade_state = 'CLOSED';
           localTrade.planned_dca_levels = [];
-          if (matchedClosed) {
-            localTrade.fee_open = matchedClosed.open_fee;
-            localTrade.fee_close = matchedClosed.close_fee;
-            localTrade.fee_total = Number((matchedClosed.open_fee + matchedClosed.close_fee).toFixed(4));
-            localTrade.exchange_realized_pnl = matchedClosed.closed_pnl;
-            if (matchedClosed.order_id) {
-              localTrade.plan_notes = `Синхронизировано с биржей ${acc.exchange.toUpperCase()} (OrderID: ${matchedClosed.order_id})`;
-            }
+          localTrade.fee_open = matchedClosed.open_fee;
+          localTrade.fee_close = matchedClosed.close_fee;
+          localTrade.fee_total = Number((matchedClosed.open_fee + matchedClosed.close_fee).toFixed(4));
+          localTrade.exchange_realized_pnl = matchedClosed.closed_pnl;
+          if (matchedClosed.order_id) {
+            localTrade.plan_notes = `Синхронизировано с биржей ${acc.exchange.toUpperCase()} (OrderID: ${matchedClosed.order_id})`;
           }
           recalculateTradeMetrics(localTrade, false);
 
@@ -2364,6 +2414,10 @@ async function syncPositionsAndHistoryFromExchanges(
             'INFO',
             `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] закрыта на бирже ${acc.exchange.toUpperCase()} @ ${closePrice}$ | Реальный PnL биржи: ${localTrade.profit_abs}$ (Комиссия: ${localTrade.fee_total}$)`
           );
+        }
+
+        if (phantomIdsToDelete.size > 0) {
+          tradesStore = tradesStore.filter((t) => !phantomIdsToDelete.has(t.trade_id));
         }
       }
     }
@@ -2457,13 +2511,13 @@ async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
   }
 }
 
-function closeClientCopiesForMasterTrade(
+async function closeClientCopiesForMasterTrade(
   masterTrade: FreqtradeTrade,
   closeRate: number,
   now: number,
   nowStr: string,
   exitReason: string
-) {
+): Promise<void> {
   if (masterTrade.account_id && masterTrade.account_id !== 'master') return;
   const clientCopies = tradesStore.filter(
     (ct) =>
@@ -2491,38 +2545,59 @@ function closeClientCopiesForMasterTrade(
     }
 
     const clientAcc = exchangeAccountsStore.find((a) => a.id === ct.account_id);
+    let clientCloseRes: PlacedOrderResult | null = null;
     if (clientAcc) {
-      dispatchOrderToExchangeAccount(clientAcc, {
+      clientCloseRes = await dispatchOrderToExchangeAccount(clientAcc, {
         pair: ct.pair,
         action: 'CLOSE',
         isShort: ct.is_short,
         quantity: ct.amount,
         referencePrice: closeRate,
         leverage: ct.leverage || 25,
-      }).catch(() => {});
+      });
+      if (!isSimulatedTestApiKey(clientAcc.api_key_raw) && !clientCloseRes?.success) {
+        appendLog(
+          'freqtrade.copytrading',
+          'WARNING',
+          `⚠️ Не удалось закрыть копи-сделку #${ct.trade_id} клиента «${clientAcc.name}» на бирже: ${clientCloseRes?.error || 'Ордер отклонён'}`
+        );
+        continue;
+      }
     }
 
-    ct.is_open = false;
-    ct.close_rate = closeRate;
-    ct.close_date = nowStr;
-    ct.close_timestamp = now;
-    ct.exit_reason = `copy_${exitReason}`;
-    ct.trade_state = 'CLOSED';
-    ct.planned_dca_levels = [];
-    recalculateTradeMetrics(ct, false);
-    sqliteDb.upsertTrade(ct);
-    sqliteDb.recordOrder({
-      trade_id: ct.trade_id,
-      pair: ct.pair,
-      order_type: 'market',
-      side: ct.is_short ? 'buy' : 'sell',
-      price: closeRate,
-      amount: ct.amount,
-      cost: Number((closeRate * ct.amount).toFixed(4)),
-      fee: ct.fee_close || 0,
-      realized_pnl: ct.net_profit || ct.profit_abs,
-      action_type: 'COPY_EXIT',
-      notes: `Copy exit on master closure: ${exitReason} @ ${closeRate}`,
+    const effectiveCloseRate =
+      clientCloseRes?.success && clientCloseRes.price > 0 ? roundPrice(clientCloseRes.price) : closeRate;
+    const effectiveNow =
+      clientCloseRes?.exchange_time && clientCloseRes.exchange_time > 0 ? clientCloseRes.exchange_time : now;
+    const effectiveNowStr = new Date(effectiveNow).toISOString().replace('T', ' ').slice(0, 19);
+
+    sqliteDb.runInTransaction(() => {
+      ct.is_open = false;
+      ct.close_rate = effectiveCloseRate;
+      ct.current_rate = effectiveCloseRate;
+      ct.close_date = effectiveNowStr;
+      ct.close_timestamp = effectiveNow;
+      if (clientCloseRes?.commission_usdt && clientCloseRes.commission_usdt > 0) {
+        ct.fee_close = Number(clientCloseRes.commission_usdt.toFixed(4));
+      }
+      ct.exit_reason = `copy_${exitReason}`;
+      ct.trade_state = 'CLOSED';
+      ct.planned_dca_levels = [];
+      recalculateTradeMetrics(ct, false);
+      sqliteDb.upsertTrade(ct);
+      sqliteDb.recordOrder({
+        trade_id: ct.trade_id,
+        pair: ct.pair,
+        order_type: 'market',
+        side: ct.is_short ? 'buy' : 'sell',
+        price: effectiveCloseRate,
+        amount: ct.amount,
+        cost: Number((effectiveCloseRate * ct.amount).toFixed(4)),
+        fee: ct.fee_close || 0,
+        realized_pnl: ct.net_profit || ct.profit_abs,
+        action_type: 'COPY_EXIT',
+        notes: `Copy exit on master closure: ${exitReason} @ ${effectiveCloseRate}`,
+      });
     });
 
     if (clientAcc) {
@@ -2563,6 +2638,9 @@ async function runScalpBotCycle(waitForActive = false) {
       return;
     }
 
+    if (exchangeSyncInFlight) {
+      await exchangeSyncInFlight.catch(() => {});
+    }
     await syncRealExchangeBalancesIfNeeded(false);
 
     const activeAccounts = exchangeAccountsStore.filter((a) => a.enabled);
@@ -2730,9 +2808,9 @@ async function runScalpBotCycle(waitForActive = false) {
               }
             }
 
-            closeClientCopiesForMasterTrade(trade, actualClosePrice, now, nowStr, 'roi_target_tp');
           });
 
+          await closeClientCopiesForMasterTrade(trade, actualClosePrice, now, nowStr, 'roi_target_tp');
           cooldownPairs.set(trade.pair, Date.now());
           appendLog(
             'freqtrade.bot.exit',
@@ -2813,8 +2891,8 @@ async function runScalpBotCycle(waitForActive = false) {
                 action_type: 'HEDGE_PROFIT_EXIT',
                 notes: `2-я нога хеджа выведена в чистый плюс +${trade.profit_abs} USDT (комиссия: ${trade.fee_total} USDT)`,
               });
-              closeClientCopiesForMasterTrade(trade, actualClosePrice, now, nowStr, 'hedge_breakeven_profit');
             });
+            await closeClientCopiesForMasterTrade(trade, actualClosePrice, now, nowStr, 'hedge_breakeven_profit');
             appendLog(
               'freqtrade.bot.hedge',
               'INFO',
@@ -2938,57 +3016,71 @@ async function runScalpBotCycle(waitForActive = false) {
                 3.0
               );
 
-              sqliteDb.runInTransaction(() => {
-                // 1. If this trade is part of a 2-way hedge campaign, check and close the profitable sibling leg on confirmed reversal
-                if (trade.campaign_id) {
-                  const sibling = tradesStore.find(
-                    (s) =>
-                      s.is_open &&
-                      (!s.account_id || s.account_id === 'master') &&
-                      s.campaign_id === trade.campaign_id &&
-                      s.trade_id !== trade.trade_id
-                  );
-                  if (sibling && (sibling.net_profit ?? sibling.profit_abs) > 0) {
-                    dispatchOrderToExchangeAccount(ownerAcc, {
-                      pair: sibling.pair,
-                      action: 'CLOSE',
-                      isShort: sibling.is_short,
-                      quantity: sibling.amount,
-                      referencePrice: currentPrice,
-                      leverage: sibling.leverage || 25,
-                    }).catch(() => {});
-
-                    sibling.is_open = false;
-                    sibling.close_rate = currentPrice;
-                    sibling.close_date = nowStr;
-                    sibling.close_timestamp = now;
-                    sibling.exit_reason = 'hedge_level_reversal_profit';
-                    sibling.trade_state = 'CLOSED';
-                    sibling.planned_dca_levels = [];
-                    recalculateTradeMetrics(sibling, false);
-                    sqliteDb.upsertTrade(sibling);
-                    sqliteDb.recordOrder({
-                      trade_id: sibling.trade_id,
-                      pair: sibling.pair,
-                      order_type: 'market',
-                      side: sibling.is_short ? 'buy' : 'sell',
-                      price: currentPrice,
-                      amount: sibling.amount,
-                      cost: Number((currentPrice * sibling.amount).toFixed(4)),
-                      fee: sibling.fee_close || 0,
-                      realized_pnl: sibling.net_profit || sibling.profit_abs,
-                      action_type: 'TAKE_PROFIT',
-                      notes: `Hedge Reversal: зафиксирован чистый профит +${sibling.profit_abs} USDT на глобальном развороте ${currentPrice}`,
-                    });
-                    closeClientCopiesForMasterTrade(sibling, currentPrice, now, nowStr, 'hedge_level_reversal_profit');
-                    trade.campaign_banked_profit =
-                      (trade.campaign_banked_profit || 0) + (sibling.net_profit || sibling.profit_abs);
-                    appendLog(
-                      'freqtrade.bot.hedge',
-                      'INFO',
-                      `🏦 Hedge Reversal [${trade.pair}]: зафиксирован чистый профит по ${sibling.is_short ? 'SHORT' : 'LONG'} (+${sibling.profit_abs}$ после комиссии). Вторая нога максимально усредняется для подтягивания цены к рынку!`
-                    );
+              // 1. Before DB transaction: if this trade is part of a 2-way hedge campaign, close profitable sibling leg on exchange first
+              let siblingToClose: FreqtradeTrade | undefined;
+              let siblingCloseRes: PlacedOrderResult | null = null;
+              if (trade.campaign_id) {
+                const candidateSibling = tradesStore.find(
+                  (s) =>
+                    s.is_open &&
+                    (!s.account_id || s.account_id === 'master') &&
+                    s.campaign_id === trade.campaign_id &&
+                    s.trade_id !== trade.trade_id
+                );
+                if (candidateSibling && (candidateSibling.net_profit ?? candidateSibling.profit_abs) > 0) {
+                  siblingCloseRes = await dispatchOrderToExchangeAccount(ownerAcc, {
+                    pair: candidateSibling.pair,
+                    action: 'CLOSE',
+                    isShort: candidateSibling.is_short,
+                    quantity: candidateSibling.amount,
+                    referencePrice: currentPrice,
+                    leverage: candidateSibling.leverage || 25,
+                  });
+                  if (!ownerAcc || isSimulatedTestApiKey(ownerAcc.api_key_raw) || siblingCloseRes?.success) {
+                    siblingToClose = candidateSibling;
                   }
+                }
+              }
+
+              const tpTargetMove = 0.008;
+              sqliteDb.runInTransaction(() => {
+                if (siblingToClose) {
+                  const sibClosePrice =
+                    siblingCloseRes?.success && siblingCloseRes.price > 0
+                      ? roundPrice(siblingCloseRes.price)
+                      : currentPrice;
+                  siblingToClose.is_open = false;
+                  siblingToClose.close_rate = sibClosePrice;
+                  siblingToClose.close_date = nowStr;
+                  siblingToClose.close_timestamp = now;
+                  if (siblingCloseRes?.commission_usdt && siblingCloseRes.commission_usdt > 0) {
+                    siblingToClose.fee_close = Number(siblingCloseRes.commission_usdt.toFixed(4));
+                  }
+                  siblingToClose.exit_reason = 'hedge_level_reversal_profit';
+                  siblingToClose.trade_state = 'CLOSED';
+                  siblingToClose.planned_dca_levels = [];
+                  recalculateTradeMetrics(siblingToClose, false);
+                  sqliteDb.upsertTrade(siblingToClose);
+                  sqliteDb.recordOrder({
+                    trade_id: siblingToClose.trade_id,
+                    pair: siblingToClose.pair,
+                    order_type: 'market',
+                    side: siblingToClose.is_short ? 'buy' : 'sell',
+                    price: sibClosePrice,
+                    amount: siblingToClose.amount,
+                    cost: Number((sibClosePrice * siblingToClose.amount).toFixed(4)),
+                    fee: siblingToClose.fee_close || 0,
+                    realized_pnl: siblingToClose.net_profit || siblingToClose.profit_abs,
+                    action_type: 'TAKE_PROFIT',
+                    notes: `Hedge Reversal: зафиксирован чистый профит +${siblingToClose.profit_abs} USDT на глобальном развороте ${sibClosePrice}`,
+                  });
+                  trade.campaign_banked_profit =
+                    (trade.campaign_banked_profit || 0) + (siblingToClose.net_profit || siblingToClose.profit_abs);
+                  appendLog(
+                    'freqtrade.bot.hedge',
+                    'INFO',
+                    `🏦 Hedge Reversal [${trade.pair}]: зафиксирован чистый профит по ${siblingToClose.is_short ? 'SHORT' : 'LONG'} (+${siblingToClose.profit_abs}$ после комиссии). Вторая нога максимально усредняется для подтягивания цены к рынку!`
+                  );
                 }
 
                 trade.open_rate = newAvgOpenRate;
@@ -3000,7 +3092,6 @@ async function runScalpBotCycle(waitForActive = false) {
                 trade.enter_tag = `${trade.is_short ? 'Short' : 'Long'} (DCA ×${nextStep})`;
 
                 // Fast Scalp TP after DCA (+0.8% from new average entry = +20% gross / ~+17% net ROI on 25x) unless manually fixed by user
-                const tpTargetMove = 0.008;
                 if (!trade.tp_manual_override) {
                   trade.take_profit_abs = roundPrice(
                     trade.is_short ? newAvgOpenRate * (1 - tpTargetMove) : newAvgOpenRate * (1 + tpTargetMove)
@@ -3092,35 +3183,63 @@ async function runScalpBotCycle(waitForActive = false) {
                   action_type: `DCA_STEP_${nextStep}`,
                   notes: `Smart DCA #${nextStep} at ${actualDcaPrice}, New Avg: ${newAvgOpenRate}, TP: ${trade.take_profit_abs}`,
                 });
+              });
 
-                // Synchronously execute proportional DCA on all open client copy-trades linked to this master trade
-                const clientCopies = tradesStore.filter(
-                  (ct) =>
-                    ct.is_open &&
-                    ct.account_id &&
-                    ct.account_id !== 'master' &&
-                    (ct.parent_trade_id === trade.trade_id ||
-                      (ct.pair === trade.pair && ct.is_short === trade.is_short))
+              if (siblingToClose) {
+                await closeClientCopiesForMasterTrade(
+                  siblingToClose,
+                  siblingToClose.close_rate || currentPrice,
+                  now,
+                  nowStr,
+                  'hedge_level_reversal_profit'
                 );
-                for (const ct of clientCopies) {
-                  const clientAcc = exchangeAccountsStore.find((a) => a.id === ct.account_id);
-                  const clientAddStake = Number((ct.stake_amount * dcaMultiplierRatio).toFixed(2));
-                  const clientAddNotional = clientAddStake * (ct.leverage || 25);
-                  const clientAddAmount = Number((clientAddNotional / Math.max(1e-8, actualDcaPrice)).toFixed(4));
-                  if (clientAcc) {
-                    dispatchOrderToExchangeAccount(clientAcc, {
-                      pair: ct.pair,
-                      action: 'DCA',
-                      isShort: ct.is_short,
-                      quantity: clientAddAmount,
-                      referencePrice: actualDcaPrice,
-                      leverage: ct.leverage || 25,
-                    }).catch(() => {});
+              }
+
+              // Execute proportional DCA on all open client copy-trades linked to this master trade (awaiting exchange confirmation!)
+              const clientCopies = tradesStore.filter(
+                (ct) =>
+                  ct.is_open &&
+                  ct.account_id &&
+                  ct.account_id !== 'master' &&
+                  (ct.parent_trade_id === trade.trade_id ||
+                    (ct.pair === trade.pair && ct.is_short === trade.is_short))
+              );
+              for (const ct of clientCopies) {
+                const clientAcc = exchangeAccountsStore.find((a) => a.id === ct.account_id);
+                const clientAddStake = Number((ct.stake_amount * dcaMultiplierRatio).toFixed(2));
+                const clientAddNotional = clientAddStake * (ct.leverage || 25);
+                let clientAddAmount = Number((clientAddNotional / Math.max(1e-8, actualDcaPrice)).toFixed(4));
+                let clientDcaRes: PlacedOrderResult | null = null;
+                if (clientAcc) {
+                  clientDcaRes = await dispatchOrderToExchangeAccount(clientAcc, {
+                    pair: ct.pair,
+                    action: 'DCA',
+                    isShort: ct.is_short,
+                    quantity: clientAddAmount,
+                    referencePrice: actualDcaPrice,
+                    leverage: ct.leverage || 25,
+                  });
+                  if (!isSimulatedTestApiKey(clientAcc.api_key_raw) && !clientDcaRes?.success) {
+                    appendLog(
+                      'freqtrade.copytrading',
+                      'WARNING',
+                      `⚠️ Биржа клиента «${clientAcc.name}» отклонила DCA #${nextStep} по [${ct.pair}]: ${clientDcaRes?.error || 'Ордер отклонён'}`
+                    );
+                    continue;
                   }
+                  if (clientDcaRes?.success && !clientDcaRes.is_simulated_test && clientDcaRes.qty > 0) {
+                    clientAddAmount = clientDcaRes.qty;
+                  }
+                }
+                const effClientDcaPrice =
+                  clientDcaRes?.success && clientDcaRes.price > 0
+                    ? roundPrice(clientDcaRes.price)
+                    : actualDcaPrice;
+                sqliteDb.runInTransaction(() => {
                   const clientPrevRate = ct.open_rate;
                   const clientNewTotalAmount = Number((ct.amount + clientAddAmount).toFixed(4));
                   const clientNewAvgRate = roundPrice(
-                    (clientPrevRate * ct.amount + actualDcaPrice * clientAddAmount) /
+                    (clientPrevRate * ct.amount + effClientDcaPrice * clientAddAmount) /
                       Math.max(1e-8, clientNewTotalAmount)
                   );
                   ct.open_rate = clientNewAvgRate;
@@ -3137,11 +3256,11 @@ async function runScalpBotCycle(waitForActive = false) {
                   }
                   ct.next_dca_price = trade.next_dca_price;
                   ct.orders.push({
-                    id: `ord-${ct.trade_id}-${nextStep}`,
+                    id: clientDcaRes?.order_id || `ord-${ct.trade_id}-${nextStep}`,
                     step: nextStep,
                     label: `Smart DCA #${nextStep} (${nextStrongDca.source})`,
                     side: ct.is_short ? 'short' : 'long',
-                    price: actualDcaPrice,
+                    price: effClientDcaPrice,
                     amount: clientAddAmount,
                     stake_amount: clientAddStake,
                     timestamp: now,
@@ -3154,16 +3273,19 @@ async function runScalpBotCycle(waitForActive = false) {
                     pair: ct.pair,
                     order_type: 'market',
                     side: ct.is_short ? 'sell' : 'buy',
-                    price: actualDcaPrice,
+                    price: effClientDcaPrice,
                     amount: clientAddAmount,
                     cost: clientAddStake,
-                    fee: Number((actualDcaPrice * clientAddAmount * TAKER_FEE_RATE).toFixed(4)),
+                    fee:
+                      clientDcaRes?.commission_usdt && clientDcaRes.commission_usdt > 0
+                        ? Number(clientDcaRes.commission_usdt.toFixed(4))
+                        : Number((effClientDcaPrice * clientAddAmount * TAKER_FEE_RATE).toFixed(4)),
                     realized_pnl: 0,
                     action_type: `CLIENT_DCA_STEP_${nextStep}`,
-                    notes: `Client Smart DCA #${nextStep} at ${actualDcaPrice}, New Avg: ${clientNewAvgRate}`,
+                    notes: `Client Smart DCA #${nextStep} at ${effClientDcaPrice}, New Avg: ${clientNewAvgRate}`,
                   });
-                }
-              });
+                });
+              }
 
               appendLog(
                 'freqtrade.bot.dca',
@@ -4023,9 +4145,114 @@ async function createScalpBotPosition(
     ],
   };
 
-  // Атомарная запись в SQLite: сделка владельца + анализированные входы всех активных клиентов сохраняются в одной транзакции
+  // Атомарная запись в SQLite: предварительно исполняем копи-ордера на биржах клиентов (с проверкой success) и сохраняем всё в одной транзакции
   const liveMarketCandlePrice =
     candles4h.length > 0 ? candles4h[candles4h.length - 1].close : entryRate;
+
+  const preparedClientEntries: Array<{
+    acc: ExchangeAccountRecord;
+    clientLev: number;
+    clientDeposit: number;
+    clientStakeUsdt: number;
+    notionalUsdt: number;
+    coinAmount: number;
+    entryPrice: number;
+    orderId?: string;
+    feeOpen?: number;
+  }> = [];
+
+  if (!customOpts?.isCopyChild && !customOpts?.skipClientSync && targetAccId === 'master') {
+    const priceDeviationPct =
+      liveMarketCandlePrice > 0
+        ? Math.abs(entryRate - liveMarketCandlePrice) / liveMarketCandlePrice
+        : 0;
+    const isLiveMarketEntry = priceDeviationPct <= 0.05;
+
+    if (isLiveMarketEntry) {
+      const copyAccounts = exchangeAccountsStore.filter(
+        (a) => !a.is_owner && a.enabled && a.copy_trading
+      );
+      const seenCodes = new Set<string>();
+
+      for (const acc of copyAccounts) {
+        const codeKey = acc.client_access_code || acc.id;
+        if (seenCodes.has(codeKey)) continue;
+        seenCodes.add(codeKey);
+
+        const alreadyCopied = tradesStore.some(
+          (ct) =>
+            ct.is_open &&
+            ct.account_id === acc.id &&
+            ct.pair === cleanPair &&
+            ct.is_short === isShort
+        );
+        if (alreadyCopied) continue;
+
+        const clientOpenTrades = tradesStore.filter(
+          (ct) => ct.is_open && ct.account_id === acc.id
+        );
+        if (clientOpenTrades.length >= botConfig.max_open_trades) continue;
+        const { compoundedBalance: clientDeposit } = getCompoundedAccountBalance(acc.id);
+        const clientUsedMargin = clientOpenTrades.reduce((s, t) => s + t.stake_amount, 0);
+        if (clientDeposit > 0 && (clientUsedMargin / clientDeposit) * 100 >= 40.0) {
+          appendLog(
+            'freqtrade.copytrading',
+            'WARNING',
+            `⚠️ Пропущен вход [${cleanPair}] для клиента «${acc.name}»: задействовано более 40% маржи ($${clientUsedMargin} из $${clientDeposit})`
+          );
+          continue;
+        }
+
+        const clientLev = acc.max_leverage || leverage || 25;
+        const { clientStakeUsdt, notionalUsdt, coinAmount } = calculateClientProportionalOrder({
+          clientBalanceUsdt: clientDeposit,
+          entryPrice: entryRate,
+          leverage: clientLev,
+          stakePercent: 0.005,
+          minStakeUsdt: 5,
+        });
+
+        const clientOrderRes = await dispatchOrderToExchangeAccount(acc, {
+          pair: cleanPair,
+          action: 'OPEN',
+          isShort,
+          quantity: coinAmount,
+          referencePrice: entryRate,
+          leverage: clientLev,
+        });
+
+        if (!isSimulatedTestApiKey(acc.api_key_raw) && !clientOrderRes?.success) {
+          appendLog(
+            'freqtrade.copytrading',
+            'WARNING',
+            `⚠️ Биржа клиента «${acc.name}» (${acc.exchange.toUpperCase()}) отклонила копи-вход [${cleanPair}]: ${clientOrderRes?.error || 'Ордер отклонён'}`
+          );
+          continue;
+        }
+
+        const effQty =
+          clientOrderRes?.success && !clientOrderRes.is_simulated_test && clientOrderRes.qty > 0
+            ? clientOrderRes.qty
+            : coinAmount;
+        const effPrice =
+          clientOrderRes?.success && !clientOrderRes.is_simulated_test && clientOrderRes.price > 0
+            ? roundPrice(clientOrderRes.price)
+            : entryRate;
+
+        preparedClientEntries.push({
+          acc,
+          clientLev,
+          clientDeposit,
+          clientStakeUsdt,
+          notionalUsdt,
+          coinAmount: effQty,
+          entryPrice: effPrice,
+          orderId: clientOrderRes?.order_id,
+          feeOpen: clientOrderRes?.commission_usdt,
+        });
+      }
+    }
+  }
 
   sqliteDb.runInTransaction(() => {
     recalculateTradeMetrics(newTrade, false);
@@ -4063,130 +4290,72 @@ async function createScalpBotPosition(
       reason: planNotes,
     });
 
-    // Умный анализируемый вход для подключенных клиентских аккаунтов в момент актуального рыночного сигнала:
-    // Проверяет: 1) актуальность рыночной цены (не историческая сделка), 2) лимит маржи клиента (< 40%), 3) расчет 0.5% от депозита клиента с плечом 25x
-    if (!customOpts?.isCopyChild && !customOpts?.skipClientSync && targetAccId === 'master') {
-      const priceDeviationPct =
-        liveMarketCandlePrice > 0
-          ? Math.abs(entryRate - liveMarketCandlePrice) / liveMarketCandlePrice
-          : 0;
-      // Если сделка открывается по устаревшей/исторической цене (отклонение > 5% от текущего рынка), не копируем её клиентам вслепую
-      const isLiveMarketEntry = priceDeviationPct <= 0.05;
+    if (preparedClientEntries.length > 0) {
+      const syncedNames: string[] = [];
+      for (const item of preparedClientEntries) {
+        const { acc, clientLev, clientDeposit, clientStakeUsdt, notionalUsdt, coinAmount, entryPrice: clEntryPrice, orderId, feeOpen } = item;
+        const clientTradeId = nextTradeId++;
+        const clientTrade: FreqtradeTrade = {
+          ...newTrade,
+          trade_id: clientTradeId,
+          parent_trade_id: newTrade.trade_id,
+          account_id: acc.id,
+          account_name: acc.name,
+          exchange: acc.exchange,
+          leverage: clientLev,
+          open_rate: clEntryPrice,
+          initial_open_rate: clEntryPrice,
+          current_rate: clEntryPrice,
+          stake_amount: clientStakeUsdt,
+          initial_stake: clientStakeUsdt,
+          amount: coinAmount,
+          initial_amount: coinAmount,
+          fee_open: feeOpen && feeOpen > 0 ? Number(feeOpen.toFixed(4)) : newTrade.fee_open,
+          synced_accounts: [acc.name],
+          orders: [
+            {
+              id: orderId || `ord-${clientTradeId}-0`,
+              step: 0,
+              label: `Анализ + Вход (${acc.name}): #1 (${isShort ? 'Шорт' : 'Лонг'})`,
+              side: isShort ? 'short' : 'long',
+              price: clEntryPrice,
+              amount: coinAmount,
+              stake_amount: clientStakeUsdt,
+              timestamp: now,
+              date: nowStr,
+            },
+          ],
+          planned_dca_levels: newTrade.planned_dca_levels.map((l) => ({ ...l })),
+        };
 
-      if (isLiveMarketEntry) {
-        const copyAccounts = exchangeAccountsStore.filter(
-          (a) => !a.is_owner && a.enabled && a.copy_trading
+        recalculateTradeMetrics(clientTrade, false);
+        tradesStore.unshift(clientTrade);
+        sqliteDb.upsertTrade(clientTrade);
+        sqliteDb.recordOrder({
+          trade_id: clientTradeId,
+          pair: cleanPair,
+          order_type: 'market',
+          side: isShort ? 'sell' : 'buy',
+          price: clEntryPrice,
+          amount: coinAmount,
+          cost: clientStakeUsdt,
+          fee: Number((clEntryPrice * coinAmount * TAKER_FEE_RATE).toFixed(4)),
+          realized_pnl: 0,
+          action_type: 'CLIENT_INITIAL_ENTRY',
+          notes: `Analyzed entry for ${acc.name} (linked to #${newTrade.trade_id}): ${planNotes}`,
+        });
+        syncedNames.push(acc.name);
+
+        appendLog(
+          'freqtrade.copytrading',
+          'INFO',
+          `📋 Проанализирована и открыта позиция #${clientTradeId} для «${acc.name}» (${acc.exchange.toUpperCase()}): ${cleanPair} ${isShort ? 'SHORT' : 'LONG'} ${clientLev}x | Ставка 0.5%: $${clientStakeUsdt} (депозит $${clientDeposit}) | Объем: ${coinAmount} ($${notionalUsdt})`
         );
-        const seenCodes = new Set<string>();
-        const syncedNames: string[] = [];
+      }
 
-        for (const acc of copyAccounts) {
-          const codeKey = acc.client_access_code || acc.id;
-          if (seenCodes.has(codeKey)) continue;
-          seenCodes.add(codeKey);
-
-          const alreadyCopied = tradesStore.some(
-            (ct) =>
-              ct.is_open &&
-              ct.account_id === acc.id &&
-              ct.pair === cleanPair &&
-              ct.is_short === isShort
-          );
-          if (alreadyCopied) continue;
-
-          // Проверка риска и свободной маржи клиента перед входом
-          const clientOpenTrades = tradesStore.filter(
-            (ct) => ct.is_open && ct.account_id === acc.id
-          );
-          if (clientOpenTrades.length >= botConfig.max_open_trades) continue;
-          const { compoundedBalance: clientDeposit } = getCompoundedAccountBalance(acc.id);
-          const clientUsedMargin = clientOpenTrades.reduce((s, t) => s + t.stake_amount, 0);
-          if (clientDeposit > 0 && (clientUsedMargin / clientDeposit) * 100 >= 40.0) {
-            appendLog(
-              'freqtrade.copytrading',
-              'WARNING',
-              `⚠️ Пропущен вход [${cleanPair}] для клиента «${acc.name}»: задействовано более 40% маржи ($${clientUsedMargin} из $${clientDeposit})`
-            );
-            continue;
-          }
-
-          const clientLev = acc.max_leverage || leverage || 25;
-          const { clientStakeUsdt, notionalUsdt, coinAmount } = calculateClientProportionalOrder({
-            clientBalanceUsdt: clientDeposit,
-            entryPrice: entryRate,
-            leverage: clientLev,
-            stakePercent: 0.005, // Строго 0.5% от текущего реинвест-депозита клиента
-            minStakeUsdt: 5,
-          });
-
-          dispatchOrderToExchangeAccount(acc, {
-            pair: cleanPair,
-            action: 'OPEN',
-            isShort,
-            quantity: coinAmount,
-            referencePrice: entryRate,
-            leverage: clientLev,
-          }).catch(() => {});
-
-          const clientTradeId = nextTradeId++;
-          const clientTrade: FreqtradeTrade = {
-            ...newTrade,
-            trade_id: clientTradeId,
-            parent_trade_id: newTrade.trade_id,
-            account_id: acc.id,
-            account_name: acc.name,
-            exchange: acc.exchange,
-            leverage: clientLev,
-            stake_amount: clientStakeUsdt,
-            initial_stake: clientStakeUsdt,
-            amount: coinAmount,
-            initial_amount: coinAmount,
-            synced_accounts: [acc.name],
-            orders: [
-              {
-                id: `ord-${clientTradeId}-0`,
-                step: 0,
-                label: `Анализ + Вход (${acc.name}): #1 (${isShort ? 'Шорт' : 'Лонг'})`,
-                side: isShort ? 'short' : 'long',
-                price: entryRate,
-                amount: coinAmount,
-                stake_amount: clientStakeUsdt,
-                timestamp: now,
-                date: nowStr,
-              },
-            ],
-            planned_dca_levels: newTrade.planned_dca_levels.map((l) => ({ ...l })),
-          };
-
-          recalculateTradeMetrics(clientTrade, false);
-          tradesStore.unshift(clientTrade);
-          sqliteDb.upsertTrade(clientTrade);
-          sqliteDb.recordOrder({
-            trade_id: clientTradeId,
-            pair: cleanPair,
-            order_type: 'market',
-            side: isShort ? 'sell' : 'buy',
-            price: entryRate,
-            amount: coinAmount,
-            cost: clientStakeUsdt,
-            fee: Number((entryRate * coinAmount * TAKER_FEE_RATE).toFixed(4)),
-            realized_pnl: 0,
-            action_type: 'CLIENT_INITIAL_ENTRY',
-            notes: `Analyzed entry for ${acc.name} (linked to #${newTrade.trade_id}): ${planNotes}`,
-          });
-          syncedNames.push(acc.name);
-
-          appendLog(
-            'freqtrade.copytrading',
-            'INFO',
-            `📋 Проанализирована и открыта позиция #${clientTradeId} для «${acc.name}» (${acc.exchange.toUpperCase()}): ${cleanPair} ${isShort ? 'SHORT' : 'LONG'} ${clientLev}x | Ставка 0.5%: $${clientStakeUsdt} (депозит $${clientDeposit}) | Объем: ${coinAmount} ($${notionalUsdt})`
-          );
-        }
-
-        if (syncedNames.length > 0) {
-          newTrade.synced_accounts = syncedNames;
-          sqliteDb.upsertTrade(newTrade);
-        }
+      if (syncedNames.length > 0) {
+        newTrade.synced_accounts = syncedNames;
+        sqliteDb.upsertTrade(newTrade);
       }
     }
   });
@@ -6260,8 +6429,21 @@ async function startServer() {
             ? `🔗 Успешное подключение к ${resolvedNetworkLabel || cleanExchange.toUpperCase()} (${String(name).trim()}): реальный баланс = ${resolvedBalanceUsdt > 0 ? resolvedBalanceUsdt.toFixed(2) : '0.00'} USDT | Пинг: ${liveCheck.latency_ms} мс`
             : `⚠️ Подключение API ${cleanExchange.toUpperCase()} (${String(name).trim()}): ${liveCheck.message}`
         );
-      } catch {
-        // ignore network timeout
+      } catch (connErr: any) {
+        liveCheckResult = {
+          success: false,
+          exchange: cleanExchange,
+          message: connErr?.message || 'Таймаут или ошибка проверки подключения к бирже',
+        };
+      }
+      if (!liveCheckResult || !liveCheckResult.success) {
+        res.status(400).json({
+          error:
+            liveCheckResult?.message ||
+            `Не удалось подтвердить подключение к бирже ${cleanExchange.toUpperCase()}. Проверьте API Key, Secret Key и права на фьючерсы.`,
+          connection_check: liveCheckResult,
+        });
+        return;
       }
     }
 
@@ -6334,10 +6516,12 @@ async function startServer() {
       existingAcc.last_sync = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
       sqliteDb.upsertExchangeAccount(existingAcc);
-      botConfig.state = 'running';
 
       if (!isSimulatedTestApiKey(cleanKeyInput)) {
         await syncPositionsAndHistoryFromExchanges(existingAcc, true);
+      }
+      botConfig.state = 'running';
+      if (!isSimulatedTestApiKey(cleanKeyInput)) {
         runScalpBotCycle(false).catch(() => {});
       }
 
@@ -6398,7 +6582,6 @@ async function startServer() {
 
     exchangeAccountsStore.push(newAcc);
     sqliteDb.upsertExchangeAccount(newAcc);
-    botConfig.state = 'running';
 
     appendLog(
       'freqtrade.exchange.accounts',
@@ -6408,6 +6591,9 @@ async function startServer() {
 
     if (!isSimulatedTestApiKey(cleanKeyInput)) {
       await syncPositionsAndHistoryFromExchanges(newAcc, true);
+    }
+    botConfig.state = 'running';
+    if (!isSimulatedTestApiKey(cleanKeyInput)) {
       runScalpBotCycle(false).catch(() => {});
     }
 
@@ -6727,12 +6913,14 @@ async function startServer() {
             action_type: 'FORCE_EXIT',
             notes: 'Force exit all profitable trades',
           });
-          if (!t.account_id || t.account_id === 'master') {
-            closeClientCopiesForMasterTrade(t, t.current_rate, now, nowStr, 'force_exit');
-          }
           closedCount++;
         }
       });
+      for (const t of tradesToClose) {
+        if (!t.account_id || t.account_id === 'master') {
+          await closeClientCopiesForMasterTrade(t, t.current_rate, now, nowStr, 'force_exit');
+        }
+      }
       if (closedCount === 0 && skippedNegativeCount > 0) {
         res.status(400).json({
           error: `Защита от закрытия в минус: все открытые сделки (${skippedNegativeCount} шт.) сейчас находятся в минусе с учетом комиссии 0.06%. Бот удерживает их до выхода в чистый плюс через усреднение (DCA).`,
@@ -6831,10 +7019,10 @@ async function startServer() {
         action_type: 'FORCE_EXIT',
         notes: `Manual force exit in net profit (+${trade.profit_abs} USDT after ${trade.fee_total} USDT fees)${closeOrderRes?.order_id ? ` | ExOrderId: ${closeOrderRes.order_id}` : ''}`,
       });
-      if (!trade.account_id || trade.account_id === 'master') {
-        closeClientCopiesForMasterTrade(trade, trade.close_rate, closeTs, closeDateStr, 'force_exit');
-      }
     });
+    if (!trade.account_id || trade.account_id === 'master') {
+      await closeClientCopiesForMasterTrade(trade, trade.close_rate || trade.current_rate, closeTs, closeDateStr, 'force_exit');
+    }
     appendLog(
       'freqtrade.rpc.rpc',
       'INFO',
