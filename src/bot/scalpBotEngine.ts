@@ -312,15 +312,16 @@ export function clusterPivotsIntoLevels(
 export function analyzeLevelInteractions(
   candles: OhlcvCandle[],
   rawLevels: Array<{ price: number; type: 'high' | 'low'; indices: number[] }>,
-  touchTolerancePct = 0.35
+  touchTolerancePct = 0.35,
+  minPivots = 2
 ): ClusteredLevelWithHistory[] {
   const n = candles.length;
   const levels: ClusteredLevelWithHistory[] = [];
   if (n === 0) return levels;
 
   for (const raw of rawLevels) {
-    // Require at least 2 pivots so single random wicks are ignored
-    if (raw.indices.length < 2) continue;
+    // Allow minPivots=1 on global 1D/4H windows so historical peaks and bottoms are preserved
+    if (raw.indices.length < minPivots) continue;
     const price = raw.price;
     if (price <= 0) continue;
 
@@ -377,11 +378,12 @@ export function buildLevelsWithHistory(
   candles: OhlcvCandle[],
   leftBars = 3,
   rightBars = 3,
-  tolerancePct = 0.5
+  tolerancePct = 0.5,
+  minPivots = 2
 ): ClusteredLevelWithHistory[] {
   const pivots = findPivots(candles, leftBars, rightBars);
   const rawLevels = clusterPivotsIntoLevels(pivots, tolerancePct);
-  return analyzeLevelInteractions(candles, rawLevels, tolerancePct);
+  return analyzeLevelInteractions(candles, rawLevels, tolerancePct, minPivots);
 }
 
 // ============================================================================
@@ -390,7 +392,8 @@ export function buildLevelsWithHistory(
 
 export function detectMarketStructure(
   candles: OhlcvCandle[],
-  lookback = 50
+  lookback = 50,
+  globalMode = false
 ): MarketStructureResult {
   if (!candles || candles.length < 15) {
     const cp = candles && candles.length > 0 ? candles[candles.length - 1].close : 100;
@@ -411,12 +414,19 @@ export function detectMarketStructure(
     };
   }
 
+  const isGlobal = globalMode || lookback >= 80;
   const subset = candles.slice(-Math.max(15, lookback));
   const currentPrice = subset[subset.length - 1].close;
 
-  // Use recent active window (up to 48 bars = 8 days on 4H or 48h on 1H) for active range position
-  // so ancient highs/lows from 40 days ago don't pin range_position_pct at 1% or 99%
-  const activeWindow = subset.slice(-Math.min(subset.length, 48));
+  // Global range extremes across the entire subset history + active window for local position
+  let globalHigh = -Infinity;
+  let globalLow = Infinity;
+  for (const c of subset) {
+    if (c.high > globalHigh) globalHigh = c.high;
+    if (c.low < globalLow) globalLow = c.low;
+  }
+
+  const activeWindow = isGlobal ? subset : subset.slice(-Math.min(subset.length, 48));
   let rangeHigh = -Infinity;
   let rangeLow = Infinity;
   for (const c of activeWindow) {
@@ -442,8 +452,14 @@ export function detectMarketStructure(
   }
 
   const minDistPct = 0.8;
-  const maxActiveLevelDistPct = 15.0;
-  const levelsWithHistory = buildLevelsWithHistory(subset, 3, 3, 0.6);
+  const maxActiveLevelDistPct = isGlobal ? 95.0 : 15.0;
+  const levelsWithHistory = buildLevelsWithHistory(
+    subset,
+    3,
+    3,
+    isGlobal ? 0.75 : 0.6,
+    isGlobal ? 1 : 2
+  );
 
   const supportsHistAll = levelsWithHistory.filter(
     (l) => l.type === 'support' && ((currentPrice - l.price) / currentPrice) * 100 >= minDistPct
@@ -464,28 +480,54 @@ export function detectMarketStructure(
 
   const supportHistory =
     supportsPool.length > 0
-      ? supportsPool.reduce((best, cur) => {
-          const distBest = Math.abs(currentPrice - best.price) / Math.max(1e-9, currentPrice) * 100;
-          const distCur = Math.abs(currentPrice - cur.price) / Math.max(1e-9, currentPrice) * 100;
-          const scoreBest = best.strength_score / (1 + distBest * 0.12);
-          const scoreCur = cur.strength_score / (1 + distCur * 0.12);
-          return scoreCur > scoreBest ? cur : best;
-        })
+      ? isGlobal
+        ? (() => {
+            const unbroken = supportsPool.filter((l) => l.bounces >= l.breaks);
+            const pool = unbroken.length > 0 ? unbroken : supportsPool;
+            const multiTouch = pool.filter((l) => l.touches >= 2);
+            const targetPool = multiTouch.length > 0 ? multiTouch : pool;
+            return targetPool.reduce((best, cur) => (cur.price < best.price ? cur : best));
+          })()
+        : supportsPool.reduce((best, cur) => {
+            const distBest = (Math.abs(currentPrice - best.price) / Math.max(1e-9, currentPrice)) * 100;
+            const distCur = (Math.abs(currentPrice - cur.price) / Math.max(1e-9, currentPrice)) * 100;
+            const scoreBest = best.strength_score / (1 + distBest * 0.12);
+            const scoreCur = cur.strength_score / (1 + distCur * 0.12);
+            return scoreCur > scoreBest ? cur : best;
+          })
       : null;
 
   const resistanceHistory =
     resistancesPool.length > 0
-      ? resistancesPool.reduce((best, cur) => {
-          const distBest = Math.abs(cur.price - currentPrice) / Math.max(1e-9, currentPrice) * 100;
-          const distCur = Math.abs(best.price - currentPrice) / Math.max(1e-9, currentPrice) * 100;
-          const scoreBest = best.strength_score / (1 + distCur * 0.12);
-          const scoreCur = cur.strength_score / (1 + distBest * 0.12);
-          return scoreCur > scoreBest ? cur : best;
-        })
+      ? isGlobal
+        ? (() => {
+            const unbroken = resistancesPool.filter((l) => l.bounces >= l.breaks);
+            const pool = unbroken.length > 0 ? unbroken : resistancesPool;
+            const multiTouch = pool.filter((l) => l.touches >= 2);
+            const targetPool = multiTouch.length > 0 ? multiTouch : pool;
+            return targetPool.reduce((best, cur) => (cur.price > best.price ? cur : best));
+          })()
+        : resistancesPool.reduce((best, cur) => {
+            const distBest = (Math.abs(best.price - currentPrice) / Math.max(1e-9, currentPrice)) * 100;
+            const distCur = (Math.abs(cur.price - currentPrice) / Math.max(1e-9, currentPrice)) * 100;
+            const scoreBest = best.strength_score / (1 + distBest * 0.12);
+            const scoreCur = cur.strength_score / (1 + distCur * 0.12);
+            return scoreCur > scoreBest ? cur : best;
+          })
       : null;
 
   let nearestSupport = rangeLow;
-  if (
+  if (isGlobal && globalLow > 0 && ((currentPrice - globalLow) / currentPrice) * 100 >= minDistPct) {
+    // Prefer strongest global structural support, or absolute historical bottom if stronger clusters are absent
+    if (supportHistory) {
+      nearestSupport = supportHistory.price;
+    } else if (swingLows.length > 0) {
+      const below = swingLows.filter((s) => ((currentPrice - s) / currentPrice) * 100 >= minDistPct);
+      nearestSupport = below.length > 0 ? Math.min(...below) : globalLow;
+    } else {
+      nearestSupport = globalLow;
+    }
+  } else if (
     supportHistory &&
     ((currentPrice - supportHistory.price) / currentPrice) * 100 <= maxActiveLevelDistPct
   ) {
@@ -501,7 +543,16 @@ export function detectMarketStructure(
   }
 
   let nearestResistance = rangeHigh;
-  if (
+  if (isGlobal && globalHigh > 0 && ((globalHigh - currentPrice) / currentPrice) * 100 >= minDistPct) {
+    if (resistanceHistory) {
+      nearestResistance = resistanceHistory.price;
+    } else if (swingHighs.length > 0) {
+      const above = swingHighs.filter((r) => ((r - currentPrice) / currentPrice) * 100 >= minDistPct);
+      nearestResistance = above.length > 0 ? Math.max(...above) : globalHigh;
+    } else {
+      nearestResistance = globalHigh;
+    }
+  } else if (
     resistanceHistory &&
     ((resistanceHistory.price - currentPrice) / currentPrice) * 100 <= maxActiveLevelDistPct
   ) {
@@ -633,32 +684,51 @@ export function analyzeMultiTimeframe(
   // STEP 1 (1D FULL HISTORY): Analyze entire 1D history first to establish macro trend and global 1D Support/Resistance
   const structure1d =
     candles1d.length >= 15
-      ? detectMarketStructure(candles1d, candles1d.length)
+      ? detectMarketStructure(candles1d, candles1d.length, true)
       : null;
 
   // STEP 2 (4H FULL HISTORY): Analyze entire 4H history (not just 1 hour!) to place global Support & Resistance levels
   const structure4h =
     candles4h.length >= 15
-      ? detectMarketStructure(candles4h, candles4h.length)
-      : detectMarketStructure(candles1h, candles1h.length);
+      ? detectMarketStructure(candles4h, candles4h.length, true)
+      : detectMarketStructure(candles1h, candles1h.length, true);
 
-  const structure1h = detectMarketStructure(candles1h, Math.min(72, candles1h.length));
+  const structure1h = detectMarketStructure(candles1h, Math.min(72, candles1h.length), false);
 
   const hasCustomSup = Boolean(customLevels?.support && customLevels.support > 0);
   const hasCustomRes = Boolean(customLevels?.resistance && customLevels.resistance > 0);
 
-  // Combine 1D and 4H global support & resistance so levels reflect full historical extremes
-  const globalSupportCandidate =
-    structure4h.nearest_support > 0
-      ? structure4h.nearest_support
-      : structure1d?.nearest_support && structure1d.nearest_support > 0
+  // Combine 1D and 4H global support & resistance: lowest major global support & highest major global resistance
+  const sup1dValid =
+    structure1d?.nearest_support && structure1d.nearest_support > 0 && structure1d.nearest_support < currentPrice * 0.992
       ? structure1d.nearest_support
+      : 0;
+  const sup4hValid =
+    structure4h.nearest_support > 0 && structure4h.nearest_support < currentPrice * 0.992
+      ? structure4h.nearest_support
+      : 0;
+  const globalSupportCandidate =
+    sup1dValid > 0 && sup4hValid > 0
+      ? Math.min(sup1dValid, sup4hValid)
+      : sup1dValid > 0
+      ? sup1dValid
+      : sup4hValid > 0
+      ? sup4hValid
       : currentPrice * 0.965;
-  const globalResistanceCandidate =
-    structure4h.nearest_resistance > 0
-      ? structure4h.nearest_resistance
-      : structure1d?.nearest_resistance && structure1d.nearest_resistance > 0
+
+  const res1dValid =
+    structure1d?.nearest_resistance && structure1d.nearest_resistance > currentPrice * 1.008
       ? structure1d.nearest_resistance
+      : 0;
+  const res4hValid =
+    structure4h.nearest_resistance > currentPrice * 1.008 ? structure4h.nearest_resistance : 0;
+  const globalResistanceCandidate =
+    res1dValid > 0 && res4hValid > 0
+      ? Math.max(res1dValid, res4hValid)
+      : res1dValid > 0
+      ? res1dValid
+      : res4hValid > 0
+      ? res4hValid
       : currentPrice * 1.035;
 
   const key4hSupport = hasCustomSup
@@ -1063,7 +1133,7 @@ export function findStrongestDcaLevel(
   referencePrice: number,
   isShort: boolean,
   minDistPct = 2.8,
-  maxDistPct = 18.0
+  maxDistPct = 95.0
 ): {
   price: number;
   second_price: number;
@@ -1087,10 +1157,52 @@ export function findStrongestDcaLevel(
   }
 
   const allCandidates: ClusteredLevelWithHistory[] = [];
+  let absHighest = -Infinity;
+  let absLowest = Infinity;
 
-  // 1. Кластеризованные глобальные уровни 1D и 4H за всю историю
+  if (candles1d && candles1d.length > 0) {
+    for (const c of candles1d) {
+      if (c.high > absHighest) absHighest = c.high;
+      if (c.low > 0 && c.low < absLowest) absLowest = c.low;
+    }
+  }
+  if (candles4h && candles4h.length > 0) {
+    for (const c of candles4h) {
+      if (c.high > absHighest) absHighest = c.high;
+      if (c.low > 0 && c.low < absLowest) absLowest = c.low;
+    }
+  }
+
+  // 1. Глобальные уровни поддержки/сопротивления 1D и 4H (главный ориентир для DCA 1)
   if (candles1d && candles1d.length >= 15) {
-    const levels1d = buildLevelsWithHistory(candles1d, 2, 2, 0.8);
+    const struct1d = detectMarketStructure(candles1d, candles1d.length, true);
+    if (!isShort && struct1d.nearest_support > 0) {
+      allCandidates.push({
+        price: Number(struct1d.nearest_support.toPrecision(7)),
+        type: 'support',
+        touches: struct1d.support_history?.touches || 3,
+        bounces: struct1d.support_history?.bounces || 3,
+        breaks: struct1d.support_history?.breaks || 0,
+        bounce_rate: 1,
+        last_touch_index: candles1d.length - 1,
+        strength_score: 6.5,
+        source: '1D_GLOBAL_SUP',
+      });
+    } else if (isShort && struct1d.nearest_resistance > 0) {
+      allCandidates.push({
+        price: Number(struct1d.nearest_resistance.toPrecision(7)),
+        type: 'resistance',
+        touches: struct1d.resistance_history?.touches || 3,
+        bounces: struct1d.resistance_history?.bounces || 3,
+        breaks: struct1d.resistance_history?.breaks || 0,
+        bounce_rate: 1,
+        last_touch_index: candles1d.length - 1,
+        strength_score: 6.5,
+        source: '1D_GLOBAL_RES',
+      });
+    }
+
+    const levels1d = buildLevelsWithHistory(candles1d, 2, 2, 0.8, 1);
     for (const lvl of levels1d) {
       allCandidates.push({
         ...lvl,
@@ -1098,7 +1210,6 @@ export function findStrongestDcaLevel(
         source: '1D_EXTREME',
       });
     }
-    // Также добавляем чистые предыдущие дневные максимумы (Swing Highs) и минимумы (Swing Lows)
     const pivots1d = findPivots(candles1d, 2, 2);
     for (const p of pivots1d) {
       if ((isShort && p.type === 'high') || (!isShort && p.type === 'low')) {
@@ -1118,11 +1229,37 @@ export function findStrongestDcaLevel(
   }
 
   if (candles4h && candles4h.length >= 20) {
-    const levels4h = buildLevelsWithHistory(candles4h, 3, 3, 0.6);
+    const struct4h = detectMarketStructure(candles4h, candles4h.length, true);
+    if (!isShort && struct4h.nearest_support > 0) {
+      allCandidates.push({
+        price: Number(struct4h.nearest_support.toPrecision(7)),
+        type: 'support',
+        touches: struct4h.support_history?.touches || 3,
+        bounces: struct4h.support_history?.bounces || 3,
+        breaks: struct4h.support_history?.breaks || 0,
+        bounce_rate: 1,
+        last_touch_index: candles4h.length - 1,
+        strength_score: 5.5,
+        source: '4H_GLOBAL_SUP',
+      });
+    } else if (isShort && struct4h.nearest_resistance > 0) {
+      allCandidates.push({
+        price: Number(struct4h.nearest_resistance.toPrecision(7)),
+        type: 'resistance',
+        touches: struct4h.resistance_history?.touches || 3,
+        bounces: struct4h.resistance_history?.bounces || 3,
+        breaks: struct4h.resistance_history?.breaks || 0,
+        bounce_rate: 1,
+        last_touch_index: candles4h.length - 1,
+        strength_score: 5.5,
+        source: '4H_GLOBAL_RES',
+      });
+    }
+
+    const levels4h = buildLevelsWithHistory(candles4h, 3, 3, 0.6, 1);
     for (const lvl of levels4h) {
       allCandidates.push({ ...lvl, source: '4H_LEVEL' });
     }
-    // Добавляем реальные предыдущие 4H максимумы (для Шорта) и минимумы (для Лонга)
     const pivots4h = findPivots(candles4h, 3, 3);
     for (const p of pivots4h) {
       if ((isShort && p.type === 'high') || (!isShort && p.type === 'low')) {
@@ -1141,9 +1278,7 @@ export function findStrongestDcaLevel(
     }
   }
 
-  // Фильтруем кандидатов:
-  // - Для SHORT: только предыдущие максимумы / сопротивления ВЫШЕ referencePrice минимум на effectiveMinDistPct%
-  // - Для LONG: только предыдущие минимумы / поддержки НИЖЕ referencePrice минимум на effectiveMinDistPct%
+  // Фильтруем кандидатов для DCA 1 по дистанции >= effectiveMinDistPct и <= maxDistPct
   const validLevels = allCandidates.filter((lvl) => {
     if (!isShort) {
       const distPct = ((referencePrice - lvl.price) / referencePrice) * 100.0;
@@ -1154,39 +1289,53 @@ export function findStrongestDcaLevel(
     }
   });
 
-  // Сортируем по удалению от цены входа: сначала ближайший структурный предыдущий максимум/минимум (но не ближе effectiveMinDistPct!),
-  // а при близких ценах — выбираем более сильный уровень 1D/4H
   if (validLevels.length > 0) {
-    const sortedByDistance = [...validLevels].sort((a, b) =>
-      isShort ? a.price - b.price : b.price - a.price
-    );
+    // Для DCA 1 приоритет — сильнейшему глобальному уровню 1D или 4H
+    const globalFirst = validLevels.filter((l) => l.source?.includes('GLOBAL'));
+    const bestFirst =
+      globalFirst.length > 0
+        ? globalFirst.reduce((best, cur) =>
+            cur.strength_score > best.strength_score ? cur : best
+          )
+        : [...validLevels].sort((a, b) => {
+            if (Math.abs(b.strength_score - a.strength_score) > 0.3) {
+              return b.strength_score - a.strength_score;
+            }
+            return isShort ? a.price - b.price : b.price - a.price;
+          })[0];
 
-    // Выбираем первый значимый экстремум (DCA #1) среди ближайшего кластера предыдущих максимумов/минимумов
-    const firstAnchor = sortedByDistance[0];
-    const nearFirstCluster = sortedByDistance.filter(
-      (l) => (Math.abs(l.price - firstAnchor.price) / firstAnchor.price) * 100 <= 1.2
-    );
-    const bestFirst = nearFirstCluster.reduce((prev, cur) =>
-      cur.strength_score > prev.strength_score ? cur : prev
-    );
+    // Для DCA 2 берем АБСОЛЮТНЫЙ исторический пик (для SHORT) или АБСОЛЮТНОЕ дно (для LONG) за всю историю 1D+4H
+    const absExtreme = isShort ? absHighest : absLowest;
+    let secondPrice = 0;
 
-    // Выбираем второй экстремум (DCA #2) строго дальше от bestFirst минимум на effectiveMinDistPct%
-    const secondCandidates = sortedByDistance.filter((l) => {
-      const distFromFirst = isShort
-        ? ((l.price - bestFirst.price) / bestFirst.price) * 100
-        : ((bestFirst.price - l.price) / bestFirst.price) * 100;
-      return distFromFirst >= effectiveMinDistPct;
-    });
+    if (
+      Number.isFinite(absExtreme) &&
+      absExtreme > 0 &&
+      (isShort
+        ? absExtreme > bestFirst.price * 1.005
+        : absExtreme < bestFirst.price * 0.995)
+    ) {
+      secondPrice = Number(absExtreme.toPrecision(7));
+    } else {
+      const furtherCandidates = validLevels
+        .filter((l) => {
+          const distFromFirst = isShort
+            ? ((l.price - bestFirst.price) / bestFirst.price) * 100
+            : ((bestFirst.price - l.price) / bestFirst.price) * 100;
+          return distFromFirst >= effectiveMinDistPct;
+        })
+        .sort((a, b) => (isShort ? b.price - a.price : a.price - b.price));
 
-    const secondPrice =
-      secondCandidates.length > 0
-        ? Number(secondCandidates[0].price.toPrecision(7))
-        : Number(
-            (
-              bestFirst.price *
-              (isShort ? 1 + effectiveMinDistPct / 100 : 1 - effectiveMinDistPct / 100)
-            ).toPrecision(7)
-          );
+      secondPrice =
+        furtherCandidates.length > 0
+          ? Number(furtherCandidates[0].price.toPrecision(7))
+          : Number(
+              (
+                bestFirst.price *
+                (isShort ? 1 + effectiveMinDistPct / 100 : 1 - effectiveMinDistPct / 100)
+              ).toPrecision(7)
+            );
+    }
 
     return {
       price: Number(bestFirst.price.toPrecision(7)),
@@ -1194,19 +1343,25 @@ export function findStrongestDcaLevel(
       strength_score: bestFirst.strength_score,
       bounces: bestFirst.bounces,
       breaks: bestFirst.breaks,
-      source: bestFirst.source || (isShort ? '4H_PREV_HIGH' : '4H_PREV_LOW'),
+      source: bestFirst.source || (isShort ? '1D_GLOBAL_RES' : '1D_GLOBAL_SUP'),
       type: bestFirst.type,
     };
   }
 
-  // Если цена на историческом экстремуме (нет предыдущих свечей выше/ниже в окне) — ставим шаг не ближе 3.5%
+  // Fallback если цена уже на самом историческом экстремуме
   const fallbackStepPct = Math.max(0.035, effectiveMinDistPct / 100);
   const fallbackPrice1 = Number(
     (referencePrice * (isShort ? 1 + fallbackStepPct : 1 - fallbackStepPct)).toPrecision(7)
   );
-  const fallbackPrice2 = Number(
-    (fallbackPrice1 * (isShort ? 1 + fallbackStepPct : 1 - fallbackStepPct)).toPrecision(7)
-  );
+  const absExtreme = isShort ? absHighest : absLowest;
+  const fallbackPrice2 =
+    Number.isFinite(absExtreme) &&
+    absExtreme > 0 &&
+    (isShort ? absExtreme > fallbackPrice1 * 1.005 : absExtreme < fallbackPrice1 * 0.995)
+      ? Number(absExtreme.toPrecision(7))
+      : Number(
+          (fallbackPrice1 * (isShort ? 1 + fallbackStepPct : 1 - fallbackStepPct)).toPrecision(7)
+        );
   return {
     price: fallbackPrice1,
     second_price: fallbackPrice2,

@@ -1578,13 +1578,16 @@ let initializedTrades = false;
  * Respects any manual drags or additions saved by the user in trades.sqlite, while dynamically
  * computing Support & Resistance for the active timeframe (1m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d, 1w).
  */
-async function getOrComputeMtfBotLevels(pair: string, timeframe = '1h'): Promise<BotChartLevel[]> {
+async function getOrComputeMtfBotLevels(
+  pair: string,
+  timeframe = '1h',
+  forceRefresh = false
+): Promise<BotChartLevel[]> {
   const cleanPair = pair.toUpperCase();
   const normTf = String(timeframe || '1h').trim().toLowerCase();
-  const tfLabel = normTf.toUpperCase();
   const storeKey = `${cleanPair}_${normTf}`;
 
-  if (botLevelsStore.has(storeKey)) {
+  if (!forceRefresh && botLevelsStore.has(storeKey)) {
     return botLevelsStore.get(storeKey)!;
   }
 
@@ -1597,10 +1600,10 @@ async function getOrComputeMtfBotLevels(pair: string, timeframe = '1h'): Promise
   const hasManualResistance = manualLevels.some((l) => l.role === 'resistance');
 
   try {
-    // Top-Down 1D -> 4H Global Level Analysis across full available history (not short 1h window!)
+    // Top-Down 1D -> 4H Global Level Analysis across full available history (up to 1000 bars)
     const [{ candles: c1d }, { candles: c4h }, { candles: tfCandles }] = await Promise.all([
-      fetchRealCandles(cleanPair, '1d', 365),
-      fetchRealCandles(cleanPair, '4h', 500),
+      fetchRealCandles(cleanPair, '1d', 1000),
+      fetchRealCandles(cleanPair, '4h', 1000),
       normTf === '4h' || normTf === '1d'
         ? Promise.resolve({ candles: [] as RawCandle[] })
         : fetchRealCandles(cleanPair, normTf, 500),
@@ -1608,35 +1611,46 @@ async function getOrComputeMtfBotLevels(pair: string, timeframe = '1h'): Promise
 
     const activeCandles =
       normTf === '1d' ? c1d : normTf === '4h' ? c4h : tfCandles.length > 0 ? tfCandles : c4h;
-    const ms1d = detectMarketStructure(c1d, Math.max(30, c1d.length));
-    const ms4h = detectMarketStructure(c4h, Math.max(30, c4h.length));
+    const ms1d = detectMarketStructure(c1d, Math.max(30, c1d.length), true);
+    const ms4h = detectMarketStructure(c4h, Math.max(30, c4h.length), true);
     const msActive =
       normTf === '1d'
         ? ms1d
         : normTf === '4h'
         ? ms4h
-        : detectMarketStructure(activeCandles, Math.max(30, activeCandles.length));
+        : detectMarketStructure(activeCandles, Math.max(30, activeCandles.length), false);
 
-    // На рабочих таймфреймах (1h / 4h) бот выставляет глобальные уровни поддержки и сопротивления по всей истории 1D + 4H
+    // Выбираем самые низкие/высокие глобальные уровни SUP и RES по всей доступной истории 1D и 4H
     const globalSup =
       normTf === '1d'
         ? ms1d.nearest_support
-        : ms4h.nearest_support > 0
-        ? ms4h.nearest_support
+        : ms1d.nearest_support > 0 && ms4h.nearest_support > 0
+        ? Math.min(ms1d.nearest_support, ms4h.nearest_support)
         : ms1d.nearest_support > 0
         ? ms1d.nearest_support
+        : ms4h.nearest_support > 0
+        ? ms4h.nearest_support
         : msActive.nearest_support;
+
     const globalRes =
       normTf === '1d'
         ? ms1d.nearest_resistance
-        : ms4h.nearest_resistance > 0
-        ? ms4h.nearest_resistance
+        : ms1d.nearest_resistance > 0 && ms4h.nearest_resistance > 0
+        ? Math.max(ms1d.nearest_resistance, ms4h.nearest_resistance)
         : ms1d.nearest_resistance > 0
         ? ms1d.nearest_resistance
+        : ms4h.nearest_resistance > 0
+        ? ms4h.nearest_resistance
         : msActive.nearest_resistance;
 
-    const sh = (normTf === '1d' ? ms1d.support_history : ms4h.support_history) || msActive.support_history;
-    const rh = (normTf === '1d' ? ms1d.resistance_history : ms4h.resistance_history) || msActive.resistance_history;
+    const sh =
+      (ms1d.nearest_support > 0 && globalSup === ms1d.nearest_support
+        ? ms1d.support_history
+        : ms4h.support_history) || msActive.support_history;
+    const rh =
+      (ms1d.nearest_resistance > 0 && globalRes === ms1d.nearest_resistance
+        ? ms1d.resistance_history
+        : ms4h.resistance_history) || msActive.resistance_history;
 
     const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
     const generated: BotChartLevel[] = [...manualLevels];
@@ -1651,15 +1665,13 @@ async function getOrComputeMtfBotLevels(pair: string, timeframe = '1h'): Promise
       (l) => l.id === resId || (l.id === `mtf-res-${cleanPair}` && normTf === '4h')
     );
 
-    const globalTag = normTf === '1d' ? '1D GLOBAL' : '4H/1D GLOBAL';
+    const globalTag = normTf === '1d' ? '1D GLOBAL' : '1D/4H GLOBAL';
 
     if (!hasManualSupport && !savedSup?.deleted) {
-      if (savedSup && !savedSup.deleted) {
-        if (!generated.some((g) => g.id === savedSup.id)) generated.push(savedSup);
-      } else if (globalSup > 0) {
+      if (globalSup > 0) {
         const scoreTxt = sh ? ` ${sh.strength_score.toFixed(1)}★` : '';
         const lvl: BotChartLevel = {
-          id: supId,
+          id: savedSup?.id || supId,
           pair: cleanPair,
           label: `${globalTag} SUP${scoreTxt}`,
           role: 'support',
@@ -1673,19 +1685,19 @@ async function getOrComputeMtfBotLevels(pair: string, timeframe = '1h'): Promise
           updated_at: nowStr,
         };
         generated.push(lvl);
-        if (!allForPair.some((l) => l.id === supId)) {
+        if (!savedSup || Math.abs(savedSup.price - lvl.price) / Math.max(1e-8, lvl.price) > 0.0005) {
           sqliteDb.upsertBotLevel({ ...lvl, deleted: false });
         }
+      } else if (savedSup && !savedSup.deleted) {
+        if (!generated.some((g) => g.id === savedSup.id)) generated.push(savedSup);
       }
     }
 
     if (!hasManualResistance && !savedRes?.deleted) {
-      if (savedRes && !savedRes.deleted) {
-        if (!generated.some((g) => g.id === savedRes.id)) generated.push(savedRes);
-      } else if (globalRes > 0) {
+      if (globalRes > 0) {
         const scoreTxt = rh ? ` ${rh.strength_score.toFixed(1)}★` : '';
         const lvl: BotChartLevel = {
-          id: resId,
+          id: savedRes?.id || resId,
           pair: cleanPair,
           label: `${globalTag} RES${scoreTxt}`,
           role: 'resistance',
@@ -1699,9 +1711,11 @@ async function getOrComputeMtfBotLevels(pair: string, timeframe = '1h'): Promise
           updated_at: nowStr,
         };
         generated.push(lvl);
-        if (!allForPair.some((l) => l.id === resId)) {
+        if (!savedRes || Math.abs(savedRes.price - lvl.price) / Math.max(1e-8, lvl.price) > 0.0005) {
           sqliteDb.upsertBotLevel({ ...lvl, deleted: false });
         }
+      } else if (savedRes && !savedRes.deleted) {
+        if (!generated.some((g) => g.id === savedRes.id)) generated.push(savedRes);
       }
     }
 
@@ -1740,8 +1754,19 @@ async function initializeBotTrades() {
   // 2. Подтягиваем актуальные рыночные котировки до пересчета сделок (если сеть временно недоступна — используем сохраненный current_rate из БД)
   await fetchAllMarketPairs().catch(() => {});
 
-  // 3. Восстанавливаем все сделки бота без потерь, НО удаляем чужие старые исторические сделки (EXCHANGE_HISTORY), которых бот не открывал!
+  // 3. Восстанавливаем все сделки бота без потерь, НО удаляем чужие старые исторические сделки (до подключения API или EXCHANGE_HISTORY)!
   const hasActiveExchange = exchangeAccountsStore.some((a) => a.enabled);
+  const ownerConnectedAt =
+    exchangeAccountsStore
+      .filter((a) => a.is_owner && a.connected_at && a.connected_at > 0)
+      .reduce((minTs, a) => (minTs === 0 ? a.connected_at! : Math.min(minTs, a.connected_at!)), 0) ||
+    exchangeAccountsStore
+      .filter((a) => a.enabled && a.connected_at && a.connected_at > 0)
+      .reduce((minTs, a) => (minTs === 0 ? a.connected_at! : Math.min(minTs, a.connected_at!)), 0);
+  const accConnectedById = new Map<string, number>(
+    exchangeAccountsStore.map((a) => [a.id, a.connected_at || 0])
+  );
+
   const seenOpenKeys = new Set<string>();
   const cleanTrades: FreqtradeTrade[] = [];
   // Sort ascending by trade_id so we keep the original trade #1 first
@@ -1751,7 +1776,18 @@ async function initializeBotTrades() {
     const isOrphanClient = accId !== 'master' && exchangeAccountsStore.length > 0 && !validAccIds.has(accId);
     const isFakeTestRate =
       t.pair === 'ETH/USDT:USDT' && t.open_rate === 2500 && exchangeAccountsStore.length === 0;
-    const isForeignHistoricalTrade = !t.is_open && t.enter_tag === 'EXCHANGE_HISTORY';
+    const accConnTs = accId === 'master' ? ownerConnectedAt : accConnectedById.get(accId) || 0;
+    const closedTs = t.close_timestamp || 0;
+    const isBeforeApiConnection =
+      !t.is_open &&
+      accConnTs > 0 &&
+      closedTs > 0 &&
+      closedTs < accConnTs - 1000;
+    const isForeignHistoricalTrade =
+      !t.is_open &&
+      (t.enter_tag === 'EXCHANGE_HISTORY' ||
+        t.exit_reason === 'exchange_closed_pnl' ||
+        isBeforeApiConnection);
     if (isOrphanClient || isFakeTestRate || isForeignHistoricalTrade) {
       sqliteDb.deleteTrade(t.trade_id);
       continue;
@@ -1903,21 +1939,20 @@ async function dispatchOrderToExchangeAccount(
 
 const dismissedExchangeSyncKeys = new Set<string>();
 
-async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord): Promise<void> {
+async function syncPositionsAndHistoryFromExchanges(
+  acc: ExchangeAccountRecord,
+  forceReanalyzeOpen = false
+): Promise<void> {
   const creds = getAccountCredentialsFromStore(acc);
   if (!creds || isSimulatedTestApiKey(creds.apiKey)) return;
 
   const targetAccountId = acc.is_owner ? 'master' : acc.id;
   const targetAccountName = acc.is_owner ? 'Master' : acc.name;
-  const knownPairs = Array.from(new Set(tradesStore.map((t) => t.pair)));
 
   try {
-    const [openPosRes, closedPnlRes] = await Promise.all([
-      fetchExchangeOpenPositions(creds),
-      fetchExchangeClosedPnl(creds, 150, knownPairs),
-    ]);
+    // 1. Всегда запрашиваем ТОЛЬКО открытые позиции с биржи (закрытую историю биржи НЕ импортируем при подключении!)
+    const openPosRes = await fetchExchangeOpenPositions(creds);
 
-    // 1. Синхронизация всех открытых позиций, которые уже есть на биржевом аккаунте
     if (openPosRes.success) {
       let totalPosUnrealized = 0;
       let totalPosMargin = 0;
@@ -1945,53 +1980,116 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
           existingOpen.exchange_synced_at = Date.now();
           if (
             Math.abs(existingOpen.amount - pos.size) > 1e-5 ||
-            Math.abs(existingOpen.open_rate - pos.entry_price) / Math.max(1e-8, pos.entry_price) > 0.0005
+            Math.abs(existingOpen.open_rate - pos.entry_price) / Math.max(1e-8, pos.entry_price) > 0.0005 ||
+            (pos.margin_usdt > 0 && Math.abs((existingOpen.stake_amount || 0) - pos.margin_usdt) > 0.05)
           ) {
             existingOpen.open_rate = roundPrice(pos.entry_price);
             existingOpen.amount = Number(pos.size.toFixed(4));
-            existingOpen.stake_amount = Number(pos.margin_usdt.toFixed(2));
+            if (pos.margin_usdt > 0) {
+              existingOpen.stake_amount = Number(pos.margin_usdt.toFixed(2));
+            }
             existingOpen.leverage = pos.leverage || existingOpen.leverage;
           }
-          // Инициализируем глобальные уровни 1D/4H и плановые DCA только если они еще вообще не были созданы у сделки,
-          // при этом строго учитываем сохраненные ручные уровни SUP/RES в bot_levels!
+
+          // При отсутствии плановых DCA ИЛИ при подключении / восстановлении связи анализируем открытую позицию (1D -> 4H)
           const hasExistingPlannedDca =
             Array.isArray(existingOpen.planned_dca_levels) &&
-            existingOpen.planned_dca_levels.length > 0 &&
+            existingOpen.planned_dca_levels.length >= 2 &&
             existingOpen.planned_dca_levels.every((l) => l.price > 0);
-          if (!existingOpen.dca_manual_override && !hasExistingPlannedDca) {
+          const hasManualDcaStep1 = Boolean(existingOpen.planned_dca_levels?.[0]?.manual_override);
+          const hasManualDcaStep2 = Boolean(existingOpen.planned_dca_levels?.[1]?.manual_override);
+
+          if (!existingOpen.dca_manual_override && (!hasExistingPlannedDca || forceReanalyzeOpen)) {
             try {
               const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
-                fetchRealCandles(pos.pair, '1d', 365),
-                fetchRealCandles(pos.pair, '4h', 500),
+                fetchRealCandles(pos.pair, '1d', 1000),
+                fetchRealCandles(pos.pair, '4h', 1000),
                 fetchRealCandles(pos.pair, '1h', 200),
               ]);
               if (c4h.length >= 20) {
+                const refreshedLvls = await getOrComputeMtfBotLevels(
+                  pos.pair,
+                  botConfig.timeframe,
+                  forceReanalyzeOpen
+                ).catch(() => [] as BotChartLevel[]);
+                const manualSup = refreshedLvls.find((l) => l.role === 'support' && l.manual_override);
+                const manualRes = refreshedLvls.find((l) => l.role === 'resistance' && l.manual_override);
                 const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d);
                 const strongDca = findStrongestDcaLevel(
                   c4h,
                   c1d,
                   existingOpen.open_rate,
                   existingOpen.is_short,
-                  2.8
+                  2.8,
+                  95.0
                 );
-                const savedBotLevels = sqliteDb.getBotLevelsForPair(pos.pair);
-                const manualSup = savedBotLevels.find((l) => l.role === 'support' && l.manual_override && !l.deleted);
-                const manualRes = savedBotLevels.find((l) => l.role === 'resistance' && l.manual_override && !l.deleted);
-                existingOpen.support_level = manualSup ? roundPrice(manualSup.price) : roundPrice(mtf.key_4h_support);
-                existingOpen.resistance_level = manualRes ? roundPrice(manualRes.price) : roundPrice(mtf.key_4h_resistance);
-                const boundDca1 = !existingOpen.is_short && manualSup
+                existingOpen.support_level = manualSup
                   ? roundPrice(manualSup.price)
-                  : existingOpen.is_short && manualRes
+                  : roundPrice(mtf.key_4h_support);
+                existingOpen.resistance_level = manualRes
                   ? roundPrice(manualRes.price)
-                  : roundPrice(strongDca.price);
-                existingOpen.next_dca_price = boundDca1;
-                if (existingOpen.planned_dca_levels && existingOpen.planned_dca_levels.length >= 2) {
-                  if (!existingOpen.planned_dca_levels[0].manual_override) {
+                  : roundPrice(mtf.key_4h_resistance);
+
+                const lev = existingOpen.leverage || pos.leverage || acc.max_leverage || 25;
+                const dcaStake = Math.max(5, existingOpen.stake_amount || 25);
+                const boundDca1 =
+                  !existingOpen.is_short && manualSup
+                    ? roundPrice(manualSup.price)
+                    : existingOpen.is_short && manualRes
+                    ? roundPrice(manualRes.price)
+                    : roundPrice(strongDca.price);
+                const boundDca2 = roundPrice(strongDca.second_price);
+
+                if (!existingOpen.planned_dca_levels || existingOpen.planned_dca_levels.length < 2) {
+                  existingOpen.planned_dca_levels = [
+                    {
+                      step: 1,
+                      label: `DCA 1 (${strongDca.source})`,
+                      price: boundDca1,
+                      stake_amount: dcaStake,
+                      amount: Number(((dcaStake * lev) / Math.max(1e-8, boundDca1)).toFixed(4)),
+                      distance_pct: Number(
+                        (((boundDca1 - existingOpen.open_rate) / existingOpen.open_rate) * 100).toFixed(2)
+                      ),
+                      manual_override: Boolean((!existingOpen.is_short && manualSup) || (existingOpen.is_short && manualRes)),
+                    },
+                    {
+                      step: 2,
+                      label: `DCA 2 (${existingOpen.is_short ? 'Abs Peak' : 'Abs Bottom'})`,
+                      price: boundDca2,
+                      stake_amount: dcaStake,
+                      amount: Number(((dcaStake * lev) / Math.max(1e-8, boundDca2)).toFixed(4)),
+                      distance_pct: Number(
+                        (((boundDca2 - existingOpen.open_rate) / existingOpen.open_rate) * 100).toFixed(2)
+                      ),
+                      manual_override: false,
+                    },
+                  ];
+                } else {
+                  if (!hasManualDcaStep1) {
                     existingOpen.planned_dca_levels[0].price = boundDca1;
+                    existingOpen.planned_dca_levels[0].label = `DCA 1 (${strongDca.source})`;
+                    existingOpen.planned_dca_levels[0].distance_pct = Number(
+                      (((boundDca1 - existingOpen.open_rate) / existingOpen.open_rate) * 100).toFixed(2)
+                    );
                   }
-                  if (!existingOpen.planned_dca_levels[1].manual_override) {
-                    existingOpen.planned_dca_levels[1].price = roundPrice(strongDca.second_price);
+                  if (!hasManualDcaStep2) {
+                    existingOpen.planned_dca_levels[1].price = boundDca2;
+                    existingOpen.planned_dca_levels[1].label = `DCA 2 (${existingOpen.is_short ? 'Abs Peak' : 'Abs Bottom'})`;
+                    existingOpen.planned_dca_levels[1].distance_pct = Number(
+                      (((boundDca2 - existingOpen.open_rate) / existingOpen.open_rate) * 100).toFixed(2)
+                    );
                   }
+                }
+                existingOpen.next_dca_price = existingOpen.planned_dca_levels[0].price;
+
+                if (
+                  !existingOpen.tp_manual_override &&
+                  (!existingOpen.take_profit_abs || existingOpen.take_profit_abs <= 0)
+                ) {
+                  existingOpen.take_profit_abs = roundPrice(
+                    existingOpen.is_short ? mtf.recommended_tp_short : mtf.recommended_tp_long
+                  );
                 }
               }
             } catch {
@@ -2002,7 +2100,7 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
           sqliteDb.upsertTrade(existingOpen);
         } else {
           // На бирже есть открытая позиция, которой еще нет на сайте (подключение бота или восстановление связи с сервером) —
-          // СРАЗУ проводим полный Top-Down анализ 1D -> 4H по всей истории, выставляем глобальные уровни, DCA по предыдущим максимумам/минимумам и биржевой TP!
+          // СРАЗУ проводим полный Top-Down анализ 1D -> 4H по всей истории, выставляем глобальные уровни, DCA по глобальным SUP/RES + абс. экстремуму и биржевой TP!
           const id = nextTradeId++;
           const openTs = pos.created_time > 0 ? pos.created_time : Date.now();
           const openDateStr = new Date(openTs).toISOString().replace('T', ' ').slice(0, 19);
@@ -2023,30 +2121,46 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
               : roundPrice(pos.is_short ? entryRate * (1 - 0.012) : entryRate * (1 + 0.012));
           let dcaPrice1 = roundPrice(pos.is_short ? entryRate * 1.032 : entryRate * 0.968);
           let dcaPrice2 = roundPrice(pos.is_short ? entryRate * 1.068 : entryRate * 0.935);
-          let dcaSource = '4H_PREV_SWING';
+          let dcaSource = '1D/4H_GLOBAL';
           let d1TrendLabel = 'NEUTRAL';
+          let hasManualSup = false;
+          let hasManualRes = false;
 
           try {
             const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
-              fetchRealCandles(pos.pair, '1d', 365),
-              fetchRealCandles(pos.pair, '4h', 500),
+              fetchRealCandles(pos.pair, '1d', 1000),
+              fetchRealCandles(pos.pair, '4h', 1000),
               fetchRealCandles(pos.pair, '1h', 200),
             ]);
+            const refreshedLvls = await getOrComputeMtfBotLevels(
+              pos.pair,
+              botConfig.timeframe,
+              true
+            ).catch(() => [] as BotChartLevel[]);
+            const manualSup = refreshedLvls.find((l) => l.role === 'support' && l.manual_override);
+            const manualRes = refreshedLvls.find((l) => l.role === 'resistance' && l.manual_override);
+            hasManualSup = Boolean(manualSup);
+            hasManualRes = Boolean(manualRes);
+
             if (c4h.length >= 20) {
               const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d);
               d1TrendLabel = mtf.d1_trend;
-              analyzedSup = roundPrice(mtf.key_4h_support);
-              analyzedRes = roundPrice(mtf.key_4h_resistance);
+              analyzedSup = manualSup ? roundPrice(manualSup.price) : roundPrice(mtf.key_4h_support);
+              analyzedRes = manualRes ? roundPrice(manualRes.price) : roundPrice(mtf.key_4h_resistance);
               if (!(posTp > 0)) {
                 analyzedTp = roundPrice(
                   pos.is_short ? mtf.recommended_tp_short : mtf.recommended_tp_long
                 );
               }
-              const strongDca = findStrongestDcaLevel(c4h, c1d, entryRate, pos.is_short, 2.8);
-              dcaPrice1 = roundPrice(strongDca.price);
+              const strongDca = findStrongestDcaLevel(c4h, c1d, entryRate, pos.is_short, 2.8, 95.0);
+              dcaPrice1 =
+                !pos.is_short && manualSup
+                  ? roundPrice(manualSup.price)
+                  : pos.is_short && manualRes
+                  ? roundPrice(manualRes.price)
+                  : roundPrice(strongDca.price);
               dcaPrice2 = roundPrice(strongDca.second_price);
               dcaSource = strongDca.source;
-              await getOrComputeMtfBotLevels(pos.pair, botConfig.timeframe).catch(() => {});
             }
           } catch {
             // fallback to structural percentages if offline
@@ -2117,11 +2231,11 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
                 stake_amount: stakeUsdt,
                 amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice1)).toFixed(4)),
                 distance_pct: Number((((dcaPrice1 - entryRate) / entryRate) * 100).toFixed(2)),
-                manual_override: false,
+                manual_override: (!pos.is_short && hasManualSup) || (pos.is_short && hasManualRes),
               },
               {
                 step: 2,
-                label: `DCA 2 (Global Swing)`,
+                label: `DCA 2 (${pos.is_short ? 'Abs Peak' : 'Abs Bottom'})`,
                 price: dcaPrice2,
                 stake_amount: stakeUsdt,
                 amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice2)).toFixed(4)),
@@ -2131,7 +2245,7 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
             ],
             support_level: analyzedSup,
             resistance_level: analyzedRes,
-            plan_notes: `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) и проанализирована (1D=${d1TrendLabel} | SUP=${analyzedSup}$ | RES=${analyzedRes}$ | DCA1=${dcaPrice1}$)`,
+            plan_notes: `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) и проанализирована (1D=${d1TrendLabel} | SUP=${analyzedSup}$ | RES=${analyzedRes}$ | DCA1=${dcaPrice1}$ | DCA2=${dcaPrice2}$)`,
             trade_state: 'WAITING_PULLBACK',
             next_dca_price: dcaPrice1,
             tp_manual_override: posTp > 0,
@@ -2143,7 +2257,7 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
           tradesStore.unshift(importedTrade);
           sqliteDb.upsertTrade(importedTrade);
 
-          // Если на самой бирже еще не стоял Take-Profit ордер — сразу выставляем наш рассчитанный безубыточный/профитный TP на биржу
+          // Если на самой бирже еще не стоял Take-Profit ордер — выставляем наш рассчитанный безубыточный/профитный TP на биржу
           if (!(posTp > 0) && importedTrade.take_profit_abs && importedTrade.take_profit_abs > 0) {
             placeOrUpdateExchangeTakeProfitOrder(creds, {
               pair: pos.pair,
@@ -2156,19 +2270,22 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
           appendLog(
             `freqtrade.exchange.${acc.exchange}`,
             'INFO',
-            `🔄 [OPEN POSITION ANALYZED] Подтянута и проанализирована (1D->4H) открытая сделка с биржи ${acc.exchange.toUpperCase()} (${acc.name}): #${id} [${pos.pair}] ${pos.is_short ? 'SHORT' : 'LONG'} ${lev}x @ ${entryRate}$ | Global SUP: ${analyzedSup}$ | RES: ${analyzedRes}$ | TP: ${importedTrade.take_profit_abs}$ | DCA #1: ${dcaPrice1}$ (${dcaSource})`
+            `🔄 [OPEN POSITION ANALYZED] Подтянута и проанализирована (1D->4H) открытая сделка с биржи ${acc.exchange.toUpperCase()} (${acc.name}): #${id} [${pos.pair}] ${pos.is_short ? 'SHORT' : 'LONG'} ${lev}x @ ${entryRate}$ | Global SUP: ${analyzedSup}$ | RES: ${analyzedRes}$ | TP: ${importedTrade.take_profit_abs}$ | DCA1: ${dcaPrice1}$ | DCA2: ${dcaPrice2}$`
           );
         }
       }
 
       acc.open_trades_count = openPosRes.positions.length;
       acc.unrealized_pnl = Number(totalPosUnrealized.toFixed(4));
-      if (totalPosMargin > 0) {
-        acc.used_margin_usdt = Number(totalPosMargin.toFixed(2));
+      // Всегда актуализируем маржу аккаунта (включая сброс в 0, когда все позиции закрыты)
+      acc.used_margin_usdt = Number(totalPosMargin.toFixed(2));
+      const walletRef = acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0;
+      if (walletRef > 0 && (acc.available_balance_usdt === undefined || acc.used_margin_usdt === 0)) {
+        acc.available_balance_usdt = Number(Math.max(0, walletRef - acc.used_margin_usdt).toFixed(2));
       }
 
-      // 2. Если сделка числится открытой на сайте (старше 20 сек), но на бирже она уже закрыта (например, сработал биржевой Take-Profit ордер) —
-      // подтягиваем точную цену исполнения, комиссии и реализованный PnL с биржи 1-в-1!
+      // 2. ТОЛЬКО для уже отслеженных ботом открытых сделок, которые исчезли из списка открытых на бирже (закрылись по TP/вручную),
+      // точечно дотягиваем цену закрытия и PnL ПОСЛЕ connected_at!
       const localOpenForAcc = tradesStore.filter(
         (t) =>
           t.is_open &&
@@ -2179,17 +2296,30 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
           Date.now() - (t.open_timestamp || 0) > 20_000
       );
 
-      for (const localTrade of localOpenForAcc) {
-        const stillOpenOnExchange = openPosRes.positions.some(
-          (p) => p.pair === localTrade.pair && p.is_short === localTrade.is_short
-        );
-        if (!stillOpenOnExchange) {
-          const matchedClosed = closedPnlRes.closed.find(
-            (c) =>
-              c.pair === localTrade.pair &&
-              c.is_short === localTrade.is_short &&
-              c.updated_time >= (localTrade.open_timestamp || 0) - 120_000
-          );
+      const disappearedTrades = localOpenForAcc.filter(
+        (localTrade) =>
+          !openPosRes.positions.some(
+            (p) => p.pair === localTrade.pair && p.is_short === localTrade.is_short
+          )
+      );
+
+      if (disappearedTrades.length > 0) {
+        const missingPairs = Array.from(new Set(disappearedTrades.map((t) => t.pair)));
+        const closedPnlRes = await fetchExchangeClosedPnl(creds, 50, missingPairs).catch(() => ({
+          success: false,
+          closed: [],
+        }));
+        const minValidTs = acc.connected_at || 0;
+
+        for (const localTrade of disappearedTrades) {
+          const matchedClosed = closedPnlRes.success
+            ? closedPnlRes.closed.find(
+                (c) =>
+                  c.pair === localTrade.pair &&
+                  c.is_short === localTrade.is_short &&
+                  c.updated_time >= Math.max(minValidTs, (localTrade.open_timestamp || 0) - 120_000)
+              )
+            : undefined;
           const closePrice = roundPrice(
             matchedClosed && matchedClosed.exit_price > 0
               ? matchedClosed.exit_price
@@ -2226,49 +2356,6 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
             'INFO',
             `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] закрыта на бирже ${acc.exchange.toUpperCase()} @ ${closePrice}$ | Реальный PnL биржи: ${localTrade.profit_abs}$ (Комиссия: ${localTrade.fee_total}$)`
           );
-        }
-      }
-    }
-
-    // 3. Сверка точного PnL и комиссий ТОЛЬКО для тех сделок, которые уже есть в базе бота (мы НЕ добавляем старые чужие сделки с биржи, которых бот не открывал!)
-    if (closedPnlRes.success && closedPnlRes.closed.length > 0) {
-      const matchedLocalIds = new Set<number>();
-
-      for (const c of closedPnlRes.closed.slice(0, 150)) {
-        const histKey = `closed:${targetAccountId}:${c.pair}:${c.order_id || c.updated_time}`;
-        if (dismissedExchangeSyncKeys.has(histKey)) continue;
-
-        const existingClosed = tradesStore.find(
-          (t) =>
-            !t.is_open &&
-            !matchedLocalIds.has(t.trade_id) &&
-            (targetAccountId === 'master'
-              ? !t.account_id || t.account_id === 'master'
-              : t.account_id === targetAccountId) &&
-            t.pair === c.pair &&
-            ((c.order_id && t.plan_notes && t.plan_notes.includes(c.order_id)) ||
-              Math.abs((t.close_timestamp || 0) - c.updated_time) < 600_000)
-        );
-
-        if (existingClosed) {
-          matchedLocalIds.add(existingClosed.trade_id);
-          existingClosed.open_rate = roundPrice(c.entry_price);
-          existingClosed.close_rate = roundPrice(c.exit_price);
-          existingClosed.current_rate = roundPrice(c.exit_price);
-          existingClosed.amount = Number(c.qty.toFixed(4));
-          existingClosed.fee_open = Number(c.open_fee.toFixed(4));
-          existingClosed.fee_close = Number(c.close_fee.toFixed(4));
-          existingClosed.fee_total = Number((c.open_fee + c.close_fee).toFixed(4));
-          existingClosed.exchange_realized_pnl = Number(c.closed_pnl.toFixed(4));
-          if (c.updated_time > 0) {
-            existingClosed.close_timestamp = c.updated_time;
-            existingClosed.close_date = new Date(c.updated_time).toISOString().replace('T', ' ').slice(0, 19);
-          }
-          if (c.order_id && (!existingClosed.plan_notes || !existingClosed.plan_notes.includes(c.order_id))) {
-            existingClosed.plan_notes = `Синхронизировано с биржей ${acc.exchange.toUpperCase()} (OrderID: ${c.order_id})`;
-          }
-          recalculateTradeMetrics(existingClosed, false);
-          sqliteDb.upsertTrade(existingClosed);
         }
       }
     }
@@ -2739,9 +2826,13 @@ async function runScalpBotCycle(waitForActive = false) {
 
         if (reachedDcaLevel) {
           const { compoundedBalance: totalDeposit } = getCompoundedAccountBalance('master');
-          const usedMargin = tradesStore
+          const localUsedMargin = tradesStore
             .filter((t) => t.is_open && (!t.account_id || t.account_id === 'master'))
             .reduce((acc, t) => acc + t.stake_amount, 0);
+          const isRealOwner = Boolean(ownerAcc?.api_key_raw && !isSimulatedTestApiKey(ownerAcc.api_key_raw));
+          const usedMargin = isRealOwner
+            ? Math.max(localUsedMargin, Number(ownerAcc?.used_margin_usdt || 0))
+            : localUsedMargin;
 
           const riskCheck = canExecuteDca(
             {
@@ -2768,8 +2859,8 @@ async function runScalpBotCycle(waitForActive = false) {
             if (noKnifeOrPump) {
               // Find next strongest 4H/1D DCA level first
               const [{ candles: c4h }, { candles: c1d }] = await Promise.all([
-                fetchRealCandles(trade.pair, '4h', 250),
-                fetchRealCandles(trade.pair, '1d', 150),
+                fetchRealCandles(trade.pair, '4h', 1000),
+                fetchRealCandles(trade.pair, '1d', 1000),
               ]);
 
               // 2. Dynamic DCA calculation: pulls average entry price as close to current reversal price as possible (within ~0.8%)
@@ -3806,8 +3897,8 @@ async function createScalpBotPosition(
     ((Math.abs(targetTp - entryRate) / Math.max(1e-8, entryRate)) * 100).toFixed(2)
   );
 
-  // Усреднения (DCA) выставляются строго по предыдущим максимумам (для Шорта) и предыдущим минимумам (для Лонга) 4H/1D (минимум 2.8% от входа!)
-  const strongestDca = findStrongestDcaLevel(candles4h, candles1d, entryRate, isShort, 2.8);
+  // Усреднения: DCA 1 строго на глобальном уровне 1D/4H SUP/RES (или ручном SUP/RES), DCA 2 строго на абсолютном историческом пике (SHORT) или дне (LONG)
+  const strongestDca = findStrongestDcaLevel(candles4h, candles1d, entryRate, isShort, 2.8, 95.0);
   const nextDcaPrice = !isShort
     ? manualSupLvl
       ? roundPrice(manualSupLvl.price)
@@ -3817,7 +3908,7 @@ async function createScalpBotPosition(
     : roundPrice(strongestDca.price);
   const secondDcaPrice = roundPrice(
     strongestDca.second_price &&
-      (isShort ? strongestDca.second_price > nextDcaPrice * 1.02 : strongestDca.second_price < nextDcaPrice * 0.98)
+      (isShort ? strongestDca.second_price > nextDcaPrice * 1.005 : strongestDca.second_price < nextDcaPrice * 0.995)
       ? strongestDca.second_price
       : isShort
       ? nextDcaPrice * 1.035
@@ -3830,7 +3921,7 @@ async function createScalpBotPosition(
     customOpts?.strategyName || (isGlobalHedge ? 'GlobalHedgeStrategy' : 'ScalpingStrategy');
   const resolvedTimeframe =
     customOpts?.timeframeOverride || (isGlobalHedge ? '4h' : botConfig.timeframe);
-  const planNotes = `${side.toUpperCase()} [${resolvedStrategyName}] | 1D: ${mtf.d1_trend} | 4H: ${mtf.h4_trend} | ${isShort ? `Global Res: ${effectiveRes}` : `Global Sup: ${effectiveSup}`} | Target TP: ${targetTp} | DCA #1 (${dcaSourceLabel}): ${nextDcaPrice} | DCA #2: ${secondDcaPrice}`;
+  const planNotes = `${side.toUpperCase()} [${resolvedStrategyName}] | 1D: ${mtf.d1_trend} | 4H: ${mtf.h4_trend} | ${isShort ? `Global Res: ${effectiveRes}` : `Global Sup: ${effectiveSup}`} | Target TP: ${targetTp} | DCA #1 (${dcaSourceLabel}): ${nextDcaPrice} | DCA #2 (${isShort ? 'Abs Peak' : 'Abs Bottom'}): ${secondDcaPrice}`;
 
   const newTrade: FreqtradeTrade = {
     trade_id: id,
@@ -3907,7 +3998,7 @@ async function createScalpBotPosition(
       },
       {
         step: 2,
-        label: `DCA 2 (Global Swing)`,
+        label: `DCA 2 (${isShort ? 'Abs Peak' : 'Abs Bottom'})`,
         price: secondDcaPrice,
         stake_amount: stake,
         amount: Number(((stake * leverage) / Math.max(1e-8, secondDcaPrice)).toFixed(4)),
@@ -4401,8 +4492,8 @@ async function startServer() {
   app.get('/api/v1/mtf_analysis', async (req, res) => {
     const pair = String(req.query.pair || 'ETH/USDT:USDT').toUpperCase();
     const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
-      fetchRealCandles(pair, '1d', 150),
-      fetchRealCandles(pair, '4h', 250),
+      fetchRealCandles(pair, '1d', 1000),
+      fetchRealCandles(pair, '4h', 1000),
       fetchRealCandles(pair, '1h', 250),
     ]);
     const mtf = analyzeMultiTimeframe(pair, c1h, c4h, c1d);
@@ -4429,8 +4520,8 @@ async function startServer() {
       topSlice.map(async (pair) => {
         const ticker = tickerCache.get(pair);
         const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
-          fetchRealCandles(pair, '1d', 150),
-          fetchRealCandles(pair, '4h', 250),
+          fetchRealCandles(pair, '1d', 1000),
+          fetchRealCandles(pair, '4h', 1000),
           fetchRealCandles(pair, '1h', 100),
         ]);
         const mtf = analyzeMultiTimeframe(pair, c1h, c4h, c1d);
@@ -4489,7 +4580,7 @@ async function startServer() {
     });
   });
 
-  // Полная симуляция сбоя/перезапуска памяти сервера с холодным восстановлением из trades.sqlite
+  // Полная симуляция сбоя/перезапуска памяти сервера с холодным восстановлением из trades.sqlite и доанализом открытых позиций
   app.post('/api/v1/simulate_crash_recovery', async (_req, res) => {
     tradesStore = [];
     exchangeAccountsStore = [];
@@ -4498,6 +4589,12 @@ async function startServer() {
     candleCache.clear();
     initializedTrades = false;
     await initializeBotTrades();
+    const realEnabledAccs = exchangeAccountsStore.filter(
+      (a) => a.enabled && a.api_key_raw && !isSimulatedTestApiKey(a.api_key_raw)
+    );
+    if (realEnabledAccs.length > 0) {
+      await Promise.all(realEnabledAccs.map((a) => syncPositionsAndHistoryFromExchanges(a, true)));
+    }
     res.json({
       status: 'recovered_from_sqlite',
       state: botConfig.state,
@@ -4594,14 +4691,38 @@ async function startServer() {
     };
   }
 
+  function getScopeConnectedAt(scopeAccountId: string): number {
+    if (scopeAccountId === 'master') {
+      const ownerAccs = exchangeAccountsStore.filter((a) => a.is_owner && a.connected_at && a.connected_at > 0);
+      const pool = ownerAccs.length > 0
+        ? ownerAccs
+        : exchangeAccountsStore.filter((a) => a.enabled && a.connected_at && a.connected_at > 0);
+      return pool.reduce((minTs, a) => (minTs === 0 ? a.connected_at! : Math.min(minTs, a.connected_at!)), 0);
+    }
+    const targetAcc = exchangeAccountsStore.find((a) => a.id === scopeAccountId);
+    return targetAcc?.connected_at || 0;
+  }
+
   function filterTradesForScope(scopeAccountId: string): FreqtradeTrade[] {
     if (!hasConnectedExchangeAccount()) {
       return [];
     }
-    if (scopeAccountId === 'master') {
-      return tradesStore.filter((t) => !t.account_id || t.account_id === 'master');
-    }
-    return tradesStore.filter((t) => t.account_id === scopeAccountId);
+    const connectedAt = getScopeConnectedAt(scopeAccountId);
+    const matchesScope = (t: FreqtradeTrade) =>
+      scopeAccountId === 'master'
+        ? !t.account_id || t.account_id === 'master'
+        : t.account_id === scopeAccountId;
+
+    return tradesStore.filter((t) => {
+      if (!matchesScope(t)) return false;
+      if (t.is_open) return true;
+      if (t.enter_tag === 'EXCHANGE_HISTORY' || t.exit_reason === 'exchange_closed_pnl') return false;
+      const closedTs = t.close_timestamp || 0;
+      if (connectedAt > 0 && closedTs > 0 && closedTs < connectedAt - 1000) {
+        return false;
+      }
+      return true;
+    });
   }
 
   app.get('/api/v1/status', async (req, res) => {
@@ -4844,14 +4965,20 @@ async function startServer() {
               .toFixed(4)
           );
     const equityBalance = Number((totalBalance + unrealizedPnl).toFixed(4));
-    const usedStake =
-      isRealAcc && scope.account?.used_margin_usdt && scope.account.used_margin_usdt > 0
-        ? Number(scope.account.used_margin_usdt.toFixed(2))
-        : localUsedStake;
-    const freeBalance =
-      isRealAcc && scope.account?.available_balance_usdt && scope.account.available_balance_usdt > 0
-        ? Number(scope.account.available_balance_usdt.toFixed(2))
-        : Number(Math.max(0, totalBalance - usedStake).toFixed(2));
+    const hasExchangeMargin =
+      isRealAcc &&
+      typeof scope.account?.used_margin_usdt === 'number' &&
+      Number.isFinite(scope.account.used_margin_usdt);
+    const usedStake = hasExchangeMargin
+      ? Number(scope.account!.used_margin_usdt!.toFixed(2))
+      : localUsedStake;
+    const hasExchangeAvailable =
+      isRealAcc &&
+      typeof scope.account?.available_balance_usdt === 'number' &&
+      Number.isFinite(scope.account.available_balance_usdt);
+    const freeBalance = hasExchangeAvailable
+      ? Number(scope.account!.available_balance_usdt!.toFixed(2))
+      : Number(Math.max(0, totalBalance - usedStake).toFixed(2));
     res.json({
       currencies: [
         {
@@ -5106,8 +5233,8 @@ async function startServer() {
     } = req.body || {};
     const cleanPair = String(pair).toUpperCase();
     const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
-      fetchRealCandles(cleanPair, '1d', 150),
-      fetchRealCandles(cleanPair, '4h', 250),
+      fetchRealCandles(cleanPair, '1d', 1000),
+      fetchRealCandles(cleanPair, '4h', 1000),
       fetchRealCandles(cleanPair, '1h', 250),
     ]);
     const latestPrice = c1h.length > 0 ? c1h[c1h.length - 1].close : 100;
@@ -5196,8 +5323,8 @@ async function startServer() {
     }
 
     const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
-      fetchRealCandles(trade.pair, '1d', 150),
-      fetchRealCandles(trade.pair, '4h', 250),
+      fetchRealCandles(trade.pair, '1d', 1000),
+      fetchRealCandles(trade.pair, '4h', 1000),
       fetchRealCandles(trade.pair, '1h', 100),
     ]);
     const livePrice =
@@ -5990,6 +6117,9 @@ async function startServer() {
       (t) => t.is_open && (!t.account_id || t.account_id === 'master')
     );
     const masterOpenPnl = masterOpen.reduce((acc, t) => acc + t.profit_abs, 0);
+    const masterLocalUsedMargin = Number(
+      masterOpen.reduce((acc, t) => acc + t.stake_amount, 0).toFixed(2)
+    );
 
     const synced = exchangeAccountsStore.map((acc) => {
       if (!acc.enabled) {
@@ -5997,6 +6127,8 @@ async function startServer() {
           ...acc,
           open_trades_count: 0,
           unrealized_pnl: 0,
+          used_margin_usdt: 0,
+          available_balance_usdt: Number((acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2)),
           status: 'paused' as const,
         };
       }
@@ -6005,23 +6137,48 @@ async function startServer() {
           typeof acc.unrealized_pnl === 'number' && Number.isFinite(acc.unrealized_pnl) && acc.unrealized_pnl !== 0
             ? acc.unrealized_pnl
             : masterOpenPnl;
+        const usedMargin =
+          typeof acc.used_margin_usdt === 'number' && Number.isFinite(acc.used_margin_usdt)
+            ? Number(acc.used_margin_usdt.toFixed(2))
+            : masterLocalUsedMargin;
+        const walletBal = Number((acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2));
+        const availBal =
+          typeof acc.available_balance_usdt === 'number' && Number.isFinite(acc.available_balance_usdt)
+            ? Number(acc.available_balance_usdt.toFixed(2))
+            : Number(Math.max(0, walletBal - usedMargin).toFixed(2));
         return {
           ...acc,
           open_trades_count: masterOpen.length,
           unrealized_pnl: Number(liveUnrealized.toFixed(4)),
+          used_margin_usdt: usedMargin,
+          available_balance_usdt: availBal,
           status: 'connected' as const,
         };
       }
       const clientOpen = tradesStore.filter((t) => t.is_open && t.account_id === acc.id);
       const clientPnl = clientOpen.reduce((sum, t) => sum + t.profit_abs, 0);
+      const clientLocalUsed = Number(
+        clientOpen.reduce((sum, t) => sum + t.stake_amount, 0).toFixed(2)
+      );
       const liveClientUnrealized =
         typeof acc.unrealized_pnl === 'number' && Number.isFinite(acc.unrealized_pnl) && acc.unrealized_pnl !== 0
           ? acc.unrealized_pnl
           : clientPnl;
+      const clientUsedMargin =
+        typeof acc.used_margin_usdt === 'number' && Number.isFinite(acc.used_margin_usdt)
+          ? Number(acc.used_margin_usdt.toFixed(2))
+          : clientLocalUsed;
+      const clientWalletBal = Number((acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2));
+      const clientAvailBal =
+        typeof acc.available_balance_usdt === 'number' && Number.isFinite(acc.available_balance_usdt)
+          ? Number(acc.available_balance_usdt.toFixed(2))
+          : Number(Math.max(0, clientWalletBal - clientUsedMargin).toFixed(2));
       return {
         ...acc,
         open_trades_count: clientOpen.length,
         unrealized_pnl: Number(liveClientUnrealized.toFixed(4)),
+        used_margin_usdt: clientUsedMargin,
+        available_balance_usdt: clientAvailBal,
         status: 'connected' as const,
       };
     });
@@ -6128,15 +6285,16 @@ async function startServer() {
         : exchangeAccountsStore.length === 0;
 
     if (existingAcc) {
+      const apiKeyChanged = existingAcc.api_key_raw !== cleanKeyInput;
       existingAcc.name = cleanName;
       existingAcc.owner_label = owner_label ? String(owner_label).trim() : cleanName;
       existingAcc.exchange = cleanExchange;
       existingAcc.market_type = market_type === 'spot' ? 'spot' : 'futures';
       existingAcc.api_key_masked = maskApiKey(String(api_key));
-      existingAcc.api_key_raw = String(api_key).trim();
-      existingAcc.api_secret_raw = String(api_secret).trim();
-      existingAcc.passphrase_raw = passphrase ? String(passphrase).trim() : '';
-      existingAcc.has_passphrase = Boolean(passphrase && String(passphrase).trim().length > 0);
+      existingAcc.api_key_raw = cleanKeyInput;
+      existingAcc.api_secret_raw = cleanSecretInput;
+      existingAcc.passphrase_raw = cleanPassInput;
+      existingAcc.has_passphrase = Boolean(cleanPassInput.length > 0);
       existingAcc.is_owner = effectiveIsOwner;
       existingAcc.client_access_code = generatedCode;
       existingAcc.enabled = true;
@@ -6146,6 +6304,26 @@ async function startServer() {
       if (resolvedBalanceUsdt > 0) {
         existingAcc.balance_usdt = resolvedBalanceUsdt;
       }
+      if (liveCheckResult?.success) {
+        if (typeof liveCheckResult.wallet_balance_usdt === 'number') {
+          existingAcc.wallet_balance_usdt = Number(liveCheckResult.wallet_balance_usdt.toFixed(4));
+        }
+        if (typeof liveCheckResult.used_margin_usdt === 'number') {
+          existingAcc.used_margin_usdt = Number(liveCheckResult.used_margin_usdt.toFixed(2));
+        }
+        if (typeof liveCheckResult.available_balance_usdt === 'number') {
+          existingAcc.available_balance_usdt = Number(liveCheckResult.available_balance_usdt.toFixed(2));
+        }
+        if (typeof liveCheckResult.unrealized_pnl_usdt === 'number') {
+          existingAcc.unrealized_pnl = Number(liveCheckResult.unrealized_pnl_usdt.toFixed(4));
+        }
+        if (typeof liveCheckResult.equity_usdt === 'number') {
+          existingAcc.equity_usdt = Number(liveCheckResult.equity_usdt.toFixed(4));
+        }
+      }
+      if (apiKeyChanged || !existingAcc.connected_at) {
+        existingAcc.connected_at = Date.now();
+      }
       existingAcc.is_testnet = resolvedIsTestnet;
       existingAcc.network_label = resolvedNetworkLabel;
       existingAcc.status = 'connected';
@@ -6154,8 +6332,8 @@ async function startServer() {
       sqliteDb.upsertExchangeAccount(existingAcc);
       botConfig.state = 'running';
 
-      if (!isSimulatedTestApiKey(String(api_key))) {
-        await syncPositionsAndHistoryFromExchanges(existingAcc);
+      if (!isSimulatedTestApiKey(cleanKeyInput)) {
+        await syncPositionsAndHistoryFromExchanges(existingAcc, true);
         runScalpBotCycle(false).catch(() => {});
       }
 
@@ -6175,10 +6353,10 @@ async function startServer() {
       exchange: cleanExchange,
       market_type: market_type === 'spot' ? 'spot' : 'futures',
       api_key_masked: maskApiKey(String(api_key)),
-      api_key_raw: String(api_key).trim(),
-      api_secret_raw: String(api_secret).trim(),
-      passphrase_raw: passphrase ? String(passphrase).trim() : '',
-      has_passphrase: Boolean(passphrase && String(passphrase).trim().length > 0),
+      api_key_raw: cleanKeyInput,
+      api_secret_raw: cleanSecretInput,
+      passphrase_raw: cleanPassInput,
+      has_passphrase: Boolean(cleanPassInput.length > 0),
       is_owner: effectiveIsOwner,
       client_access_code: generatedCode,
       enabled: true,
@@ -6186,7 +6364,26 @@ async function startServer() {
       copy_multiplier: Math.max(0.05, Math.min(20, Number(copy_multiplier) || 1.0)),
       max_leverage: Math.max(1, Math.min(50, Math.round(Number(max_leverage) || 25))),
       balance_usdt: resolvedBalanceUsdt,
-      unrealized_pnl: 0,
+      wallet_balance_usdt:
+        liveCheckResult?.success && typeof liveCheckResult.wallet_balance_usdt === 'number'
+          ? Number(liveCheckResult.wallet_balance_usdt.toFixed(4))
+          : resolvedBalanceUsdt,
+      equity_usdt:
+        liveCheckResult?.success && typeof liveCheckResult.equity_usdt === 'number'
+          ? Number(liveCheckResult.equity_usdt.toFixed(4))
+          : resolvedBalanceUsdt,
+      available_balance_usdt:
+        liveCheckResult?.success && typeof liveCheckResult.available_balance_usdt === 'number'
+          ? Number(liveCheckResult.available_balance_usdt.toFixed(2))
+          : resolvedBalanceUsdt,
+      used_margin_usdt:
+        liveCheckResult?.success && typeof liveCheckResult.used_margin_usdt === 'number'
+          ? Number(liveCheckResult.used_margin_usdt.toFixed(2))
+          : 0,
+      unrealized_pnl:
+        liveCheckResult?.success && typeof liveCheckResult.unrealized_pnl_usdt === 'number'
+          ? Number(liveCheckResult.unrealized_pnl_usdt.toFixed(4))
+          : 0,
       open_trades_count: 0,
       status: 'connected',
       last_sync: new Date(nowTs).toISOString().replace('T', ' ').slice(0, 19),
@@ -6205,8 +6402,8 @@ async function startServer() {
       `Подключен новый API-аккаунт: ${newAcc.name} (${resolvedNetworkLabel || `${cleanExchange.toUpperCase()} ${newAcc.market_type.toUpperCase()}`}) | Баланс: ${newAcc.balance_usdt.toFixed(2)} USDT | Ключ: ${newAcc.api_key_masked}`
     );
 
-    if (!isSimulatedTestApiKey(String(api_key))) {
-      await syncPositionsAndHistoryFromExchanges(newAcc);
+    if (!isSimulatedTestApiKey(cleanKeyInput)) {
+      await syncPositionsAndHistoryFromExchanges(newAcc, true);
       runScalpBotCycle(false).catch(() => {});
     }
 
@@ -6364,12 +6561,29 @@ async function startServer() {
       if (testRes.network_label) {
         targetAcc.network_label = testRes.network_label;
       }
-      if (typeof testRes.balance_usdt === 'number' && testRes.balance_usdt > 0) {
-        targetAcc.balance_usdt = Number(testRes.balance_usdt.toFixed(2));
+      const exactBal = testRes.wallet_balance_usdt ?? testRes.balance_usdt;
+      if (typeof exactBal === 'number' && exactBal > 0) {
+        targetAcc.balance_usdt = Number(exactBal.toFixed(2));
+        targetAcc.wallet_balance_usdt = Number(exactBal.toFixed(4));
+      }
+      if (typeof testRes.used_margin_usdt === 'number') {
+        targetAcc.used_margin_usdt = Number(testRes.used_margin_usdt.toFixed(2));
+      }
+      if (typeof testRes.available_balance_usdt === 'number') {
+        targetAcc.available_balance_usdt = Number(testRes.available_balance_usdt.toFixed(2));
+      }
+      if (typeof testRes.unrealized_pnl_usdt === 'number') {
+        targetAcc.unrealized_pnl = Number(testRes.unrealized_pnl_usdt.toFixed(4));
+      }
+      if (typeof testRes.equity_usdt === 'number') {
+        targetAcc.equity_usdt = Number(testRes.equity_usdt.toFixed(4));
       }
       targetAcc.status = 'connected';
       targetAcc.last_sync = new Date().toISOString().replace('T', ' ').slice(0, 19);
       sqliteDb.upsertExchangeAccount(targetAcc);
+      if (!isSimulatedTestApiKey(String(credsKey))) {
+        await syncPositionsAndHistoryFromExchanges(targetAcc, true);
+      }
       runScalpBotCycle(false).catch(() => {});
     }
 
@@ -6402,12 +6616,18 @@ async function startServer() {
       return;
     }
 
-    // Изолированные сделки клиента: строго принадлежащие этому аккаунту (без слепого копирования старых сделок владельца)
+    const clientConnectedAt = acc.connected_at || 0;
+    // Изолированные сделки клиента: строго принадлежащие этому аккаунту и закрытые после подключения API
     const clientOpenTrades = tradesStore.filter(
       (t) => t.is_open && t.account_id === acc.id
     );
     const clientClosedTrades = tradesStore.filter(
-      (t) => !t.is_open && t.account_id === acc.id
+      (t) =>
+        !t.is_open &&
+        t.account_id === acc.id &&
+        t.enter_tag !== 'EXCHANGE_HISTORY' &&
+        t.exit_reason !== 'exchange_closed_pnl' &&
+        !(clientConnectedAt > 0 && (t.close_timestamp || 0) > 0 && (t.close_timestamp || 0) < clientConnectedAt - 1000)
     );
 
     const clientUnrealizedPnl = Number(

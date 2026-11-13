@@ -112,6 +112,22 @@ const DEFAULT_CORE_SYMBOLS = [
   'RENDERUSDT',
 ];
 
+export function isSupportedFuturesSymbol(rawSymbol: string): boolean {
+  const s = String(rawSymbol || '')
+    .trim()
+    .toUpperCase()
+    .replace('-SWAP', '')
+    .replace('_UMCBL', '');
+  return (
+    s.endsWith('USDT') ||
+    s.endsWith('USDC') ||
+    s.includes('-USDT') ||
+    s.includes('-USDC') ||
+    s.includes('/USDT') ||
+    s.includes('/USDC')
+  );
+}
+
 export function cleanSymbolToPair(rawSymbol: string): string {
   const s = String(rawSymbol || '')
     .trim()
@@ -119,11 +135,21 @@ export function cleanSymbolToPair(rawSymbol: string): string {
     .replace('-SWAP', '')
     .replace('_UMCBL', '');
   if (s.includes('/')) {
-    return s.includes(':USDT') ? s : `${s}:USDT`;
+    if (s.includes(':USDT') || s.includes(':USDC')) return s;
+    if (s.endsWith('/USDC') || s.includes('/USDC')) return `${s}:USDC`;
+    return `${s}:USDT`;
+  }
+  if (s.includes('-USDC')) {
+    const base = s.split('-USDC')[0];
+    return `${base}/USDC:USDC`;
   }
   if (s.includes('-USDT')) {
     const base = s.split('-USDT')[0];
     return `${base}/USDT:USDT`;
+  }
+  if (s.endsWith('USDC') && s.length > 4) {
+    const base = s.slice(0, -4);
+    return `${base}/USDC:USDC`;
   }
   if (s.endsWith('USDT') && s.length > 4) {
     const base = s.slice(0, -4);
@@ -230,7 +256,6 @@ function updatePositionsMarkPriceFromTicker(symbol: string, price: number): void
     if (changed) {
       state.unrealizedPnlUsdt = Number(totalUnrealized.toFixed(4));
       state.equityUsdt = Number((state.walletBalanceUsdt + state.unrealizedPnlUsdt).toFixed(4));
-      state.updatedAt = Date.now();
     }
   }
 }
@@ -803,13 +828,27 @@ const activePrivateSockets = new Map<
   }
 >();
 
+export function isPrivateWsStreamOpen(
+  exchange: 'binance' | 'bybit',
+  apiKey: string
+): boolean {
+  const entry = activePrivateSockets.get(`${exchange}:${apiKey}`);
+  if (!entry || !entry.ws) return false;
+  // WebSocket.OPEN === 1
+  return entry.ws.readyState === 1;
+}
+
 export function getWsAccountLiveState(
   apiKey: string,
   maxAgeMs = 180_000
 ): WsAccountLiveState | undefined {
   const state = wsAccountStateByKey.get(apiKey);
   if (!state) return undefined;
-  if (Date.now() - state.updatedAt > maxAgeMs && !state.wsConnected) {
+  const streamOpen = state.wsConnected && isPrivateWsStreamOpen(state.exchange, apiKey);
+  if (!streamOpen && Date.now() - state.updatedAt > maxAgeMs) {
+    return undefined;
+  }
+  if (Date.now() - state.lastRestBootstrapAt > Math.max(maxAgeMs, 180_000) && !streamOpen) {
     return undefined;
   }
   return state;
@@ -870,20 +909,20 @@ export async function ensureBinancePrivateUserStream(
         if (!state) return;
 
         if (msg.e === 'ACCOUNT_UPDATE' && msg.a) {
-          // 1. Update USDT balance
+          // 1. Update USDT + USDC wallet balance
           if (Array.isArray(msg.a.B)) {
-            const usdtBal = msg.a.B.find((b: any) => b.a === 'USDT');
-            if (usdtBal) {
-              const wb = Number(usdtBal.wb ?? state.walletBalanceUsdt);
-              const cw = Number(usdtBal.cw ?? wb);
-              if (wb >= 0) {
-                state.walletBalanceUsdt = wb;
-                state.availableBalanceUsdt = cw > 0 ? cw : wb;
+            const stableBals = msg.a.B.filter(
+              (b: any) => b.a === 'USDT' || b.a === 'USDC'
+            );
+            if (stableBals.length > 0) {
+              const totalWb = stableBals.reduce((sum: number, b: any) => sum + Number(b.wb || 0), 0);
+              if (totalWb >= 0) {
+                state.walletBalanceUsdt = Number(totalWb.toFixed(4));
               }
             }
           }
 
-          // 2. Update positions
+          // 2. Update positions (USDT and USDC futures)
           if (Array.isArray(msg.a.P)) {
             const posMap = new Map<string, ExchangePositionItem>();
             for (const p of state.positions) {
@@ -892,27 +931,39 @@ export async function ensureBinancePrivateUserStream(
 
             for (const rawP of msg.a.P) {
               const sym = String(rawP.s || '').toUpperCase();
-              if (!sym.endsWith('USDT')) continue;
+              if (!isSupportedFuturesSymbol(sym)) continue;
               const rawAmt = Number(rawP.pa || 0);
               const size = Math.abs(rawAmt);
-              const entryPrice = Number(rawP.ep || 0);
-              const unrealizedPnl = Number(rawP.up || 0);
               const ps = String(rawP.ps || 'BOTH').toUpperCase();
               const isShort = ps === 'SHORT' || (ps === 'BOTH' && rawAmt < 0);
               const key = `${sym}:${isShort ? 'SHORT' : 'LONG'}`;
+              const prevPos = posMap.get(key);
+              const liveTick = wsTickersBySymbol.get(sym);
+              const entryPrice =
+                Number(rawP.ep || 0) ||
+                prevPos?.entry_price ||
+                liveTick?.markPrice ||
+                liveTick?.price ||
+                0;
 
-              if (size <= 0 || entryPrice <= 0) {
+              if (size <= 0) {
                 posMap.delete(key);
                 if (ps === 'BOTH') {
                   posMap.delete(`${sym}:LONG`);
                   posMap.delete(`${sym}:SHORT`);
                 }
-              } else {
-                const prevPos = posMap.get(key);
-                const liveTick = wsTickersBySymbol.get(sym);
+              } else if (entryPrice > 0) {
                 const markPrice = liveTick?.markPrice || prevPos?.mark_price || entryPrice;
                 const lev = prevPos?.leverage || 25;
-                const marginUsdt = Number(((size * entryPrice) / lev).toFixed(2));
+                const prevSizeChanged = !prevPos || Math.abs(prevPos.size - size) > 1e-6;
+                const rawIw = Number(rawP.iw || 0);
+                const marginUsdt =
+                  rawIw > 0
+                    ? Number(rawIw.toFixed(2))
+                    : !prevSizeChanged && prevPos?.margin_usdt && prevPos.margin_usdt > 0
+                    ? prevPos.margin_usdt
+                    : Number(((size * entryPrice) / lev).toFixed(2));
+                const unrealizedPnl = Number(rawP.up ?? prevPos?.unrealized_pnl ?? 0);
                 const updatedPos: ExchangePositionItem = {
                   pair: cleanSymbolToPair(sym),
                   symbol: sym,
@@ -938,6 +989,9 @@ export async function ensureBinancePrivateUserStream(
             state.usedMarginUsdt = Number(
               state.positions.reduce((s, p) => s + Number(p.margin_usdt || 0), 0).toFixed(2)
             );
+            state.availableBalanceUsdt = Number(
+              Math.max(0, state.walletBalanceUsdt - state.usedMarginUsdt).toFixed(2)
+            );
             state.equityUsdt = Number(
               (state.walletBalanceUsdt + state.unrealizedPnlUsdt).toFixed(4)
             );
@@ -955,7 +1009,7 @@ export async function ensureBinancePrivateUserStream(
             const avgPrice = Number(o.ap || o.L || 0);
             const fee = Math.abs(Number(o.n || 0));
             const tradeTime = Number(o.T || msg.E || Date.now());
-            if (sym.endsWith('USDT') && Math.abs(realizedPnl) > 1e-8 && qty > 0 && avgPrice > 0) {
+            if (isSupportedFuturesSymbol(sym) && Math.abs(realizedPnl) > 1e-8 && qty > 0 && avgPrice > 0) {
               const side = String(o.S || '').toUpperCase();
               const ps = String(o.ps || '').toUpperCase();
               const isShort = ps === 'SHORT' ? true : ps === 'LONG' ? false : side === 'BUY';
@@ -1081,26 +1135,34 @@ export function ensureBybitPrivateUserStream(
           const acc = msg.data[0];
           if (acc) {
             const coins = Array.isArray(acc.coin) ? acc.coin : [];
+            const stableCoins = coins.filter((c: any) => c.coin === 'USDT' || c.coin === 'USDC');
             const usdt = coins.find((c: any) => c.coin === 'USDT');
+            const sumWallet = stableCoins.reduce((s: number, c: any) => s + Number(c.walletBalance || 0), 0);
+            const sumUpl = stableCoins.reduce((s: number, c: any) => s + Number(c.unrealisedPnl || 0), 0);
+            const sumIm = stableCoins.reduce((s: number, c: any) => s + Number(c.totalPositionIM || 0), 0);
             const walletBal = Number(
-              usdt?.walletBalance || acc.totalWalletBalance || state.walletBalanceUsdt
+              acc.totalWalletBalance || sumWallet || usdt?.walletBalance || state.walletBalanceUsdt
             );
             const unrealized = Number(
-              usdt?.unrealisedPnl ?? acc.totalPerpUPL ?? state.unrealizedPnlUsdt
+              acc.totalPerpUPL ?? (stableCoins.length > 0 ? sumUpl : state.unrealizedPnlUsdt)
             );
-            const equity = Number(usdt?.equity || acc.totalEquity || walletBal + unrealized);
-            const usedMargin = Number(usdt?.totalPositionIM || acc.totalInitialMargin || 0);
+            const equity = Number(acc.totalEquity || walletBal + unrealized);
+            const posMarginSum = Number(
+              state.positions.reduce((s, p) => s + Number(p.margin_usdt || 0), 0).toFixed(2)
+            );
+            const rawUsedMargin = Number(acc.totalInitialMargin || sumIm || usdt?.totalPositionIM || 0);
+            const usedMargin = rawUsedMargin > 0 ? rawUsedMargin : posMarginSum;
             const avail = Number(
-              usdt?.availableToWithdraw ||
-                acc.totalAvailableBalance ||
+              acc.totalAvailableBalance ||
+                usdt?.availableToWithdraw ||
                 Math.max(0, walletBal - usedMargin)
             );
             if (walletBal >= 0) {
               state.walletBalanceUsdt = walletBal;
               state.unrealizedPnlUsdt = unrealized;
               state.equityUsdt = equity;
-              state.usedMarginUsdt = usedMargin;
-              state.availableBalanceUsdt = avail;
+              state.usedMarginUsdt = Number(usedMargin.toFixed(2));
+              state.availableBalanceUsdt = Number(avail.toFixed(2));
               state.wsConnected = true;
               state.updatedAt = Date.now();
               emitAccountUpdate(state);
@@ -1114,27 +1176,39 @@ export function ensureBybitPrivateUserStream(
 
           for (const rawP of msg.data) {
             const sym = String(rawP.symbol || '').toUpperCase();
-            if (!sym.endsWith('USDT')) continue;
+            if (!isSupportedFuturesSymbol(sym)) continue;
             const size = Math.abs(Number(rawP.size || 0));
-            const entryPrice = Number(rawP.entryPrice || rawP.avgPrice || 0);
             const sideStr = String(rawP.side || '').toLowerCase();
             const isShort = sideStr === 'sell' || Number(rawP.positionIdx) === 2;
             const key = `${sym}:${isShort ? 'SHORT' : 'LONG'}`;
+            const prevPos = posMap.get(key);
+            const liveTick = wsTickersBySymbol.get(sym);
+            const entryPrice =
+              Number(rawP.entryPrice || rawP.avgPrice || 0) ||
+              prevPos?.entry_price ||
+              Number(rawP.markPrice || 0) ||
+              liveTick?.markPrice ||
+              0;
 
-            if (!(size > 0) || !(entryPrice > 0)) {
+            if (!(size > 0)) {
               posMap.delete(key);
               if (Number(rawP.positionIdx || 0) === 0) {
                 posMap.delete(`${sym}:LONG`);
                 posMap.delete(`${sym}:SHORT`);
               }
-            } else {
-              const markPrice = Number(rawP.markPrice || entryPrice);
-              const lev = Math.max(1, Math.round(Number(rawP.leverage || 25)));
+            } else if (entryPrice > 0) {
+              const markPrice = Number(rawP.markPrice || liveTick?.markPrice || entryPrice);
+              const lev = Math.max(1, Math.round(Number(rawP.leverage || prevPos?.leverage || 25)));
               const rawIm = Number(rawP.positionIM || rawP.positionBalance || 0);
+              const prevSizeChanged = !prevPos || Math.abs(prevPos.size - size) > 1e-6;
               const marginUsdt =
-                rawIm > 0 ? Number(rawIm.toFixed(2)) : Number(((size * entryPrice) / lev).toFixed(2));
-              const tp = Number(rawP.takeProfit || 0);
-              const sl = Number(rawP.stopLoss || 0);
+                rawIm > 0
+                  ? Number(rawIm.toFixed(2))
+                  : !prevSizeChanged && prevPos?.margin_usdt && prevPos.margin_usdt > 0
+                  ? prevPos.margin_usdt
+                  : Number(((size * entryPrice) / lev).toFixed(2));
+              const tp = Number(rawP.takeProfit || prevPos?.take_profit || 0);
+              const sl = Number(rawP.stopLoss || prevPos?.stop_loss || 0);
               const uTime = Number(rawP.updatedTime || Date.now());
               const updatedPos: ExchangePositionItem = {
                 pair: cleanSymbolToPair(sym),
@@ -1145,10 +1219,10 @@ export function ensureBybitPrivateUserStream(
                 mark_price: markPrice > 0 ? markPrice : entryPrice,
                 leverage: lev,
                 margin_usdt: marginUsdt,
-                unrealized_pnl: Number(rawP.unrealisedPnl || 0),
+                unrealized_pnl: Number(rawP.unrealisedPnl ?? prevPos?.unrealized_pnl ?? 0),
                 take_profit: tp > 0 ? tp : undefined,
                 stop_loss: sl > 0 ? sl : undefined,
-                created_time: Number(rawP.createdTime || uTime),
+                created_time: Number(rawP.createdTime || prevPos?.created_time || uTime),
                 updated_time: uTime,
               };
               posMap.set(key, updatedPos);
@@ -1162,6 +1236,9 @@ export function ensureBybitPrivateUserStream(
           );
           state.usedMarginUsdt = Number(
             state.positions.reduce((s, p) => s + Number(p.margin_usdt || 0), 0).toFixed(2)
+          );
+          state.availableBalanceUsdt = Number(
+            Math.max(0, state.walletBalanceUsdt - state.usedMarginUsdt).toFixed(2)
           );
           state.equityUsdt = Number(
             (state.walletBalanceUsdt + state.unrealizedPnlUsdt).toFixed(4)

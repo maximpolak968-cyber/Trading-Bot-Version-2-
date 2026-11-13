@@ -14,6 +14,8 @@ import {
   canExecuteDca,
   calculateDynamicDcaAmount,
   checkCandleRejection,
+  detectMarketStructure,
+  type OhlcvCandle,
 } from '../src/bot/scalpBotEngine';
 
 const sqliteDb = new SqliteBotDatabase();
@@ -1670,6 +1672,221 @@ async function runVerification() {
 
   console.log(
     `   ✅ [14] Доказано: WebSocket-потоки активны (Bybit WS=${wsInfo.bybit_public_ws_connected}, Binance WS=${wsInfo.binance_public_ws_connected}, живых тикеров=${wsInfo.tracked_tickers_count}, kline-событий=${wsInfo.total_kline_events}, ws-fapi ping=${bnWsTime.latencyMs}мс без банов IP)!`
+  );
+
+  // ---------------------------------------------------------------------------
+  // ТЕСТ 15: ПРАВКИ 1–6 (ГЛОБАЛЬНЫЕ УРОВНИ 1D/4H + DCA2 АБС. ЭКСТРЕМУМ +
+  //          USDT/USDC + WS PRIVATE GATING + ФИЛЬТР ИСТОРИИ ДО ПОДКЛЮЧЕНИЯ + МАРЖА)
+  // ---------------------------------------------------------------------------
+  console.log('\n1️⃣5️⃣ Проверка правок 1–6 (глобальные уровни без лимита 15%, DCA2 на абс. экстремуме, USDT/USDC, история строго после connected_at, маржа)...');
+
+  // 15A. Глобальный 1D/4H анализ без ограничения 15% и без distance-decay штрафа + DCA2 строго на абсолютном пике/дне
+  const globalC1d: OhlcvCandle[] = [];
+  const globalC4h: OhlcvCandle[] = [];
+  const baseTs15 = Date.now() - 120 * 86_400_000;
+  for (let i = 0; i < 120; i++) {
+    let close = 100;
+    let high = 103;
+    let low = 97;
+    // Двухточечный глобальный уровень поддержки ~75 (-25%) и сопротивления ~130 (+30%)
+    if (i === 18 || i === 55) {
+      low = 75;
+      close = 77;
+      high = 81;
+    } else if (i === 30 || i === 72) {
+      high = 130;
+      close = 128;
+      low = 124;
+    } else if (i === 42) {
+      // Абсолютное дно всей истории на 1D = 52
+      low = 52;
+      close = 58;
+      high = 64;
+    } else if (i === 85) {
+      // Абсолютный пик всей истории на 1D = 168
+      high = 168;
+      close = 160;
+      low = 154;
+    }
+    globalC1d.push({
+      timestamp: baseTs15 + i * 86_400_000,
+      open: close,
+      high,
+      low,
+      close,
+      volume: 10000,
+    });
+    globalC4h.push({
+      timestamp: baseTs15 + i * 14_400_000,
+      open: close,
+      high,
+      low,
+      close,
+      volume: 4000,
+    });
+  }
+
+  const globalStruct1d = detectMarketStructure(globalC1d, globalC1d.length, true);
+  assert.ok(
+    globalStruct1d.nearest_support < 85,
+    `Глобальный 1D SUP должен видеть уровни глубже старого порога -15% (<85, получено ${globalStruct1d.nearest_support})`
+  );
+  assert.ok(
+    globalStruct1d.nearest_resistance > 115,
+    `Глобальный 1D RES должен видеть уровни выше старого порога +15% (>115, получено ${globalStruct1d.nearest_resistance})`
+  );
+
+  const globalDcaLong = findStrongestDcaLevel(globalC4h, globalC1d, 100, false, 2.8, 95.0);
+  const globalDcaShort = findStrongestDcaLevel(globalC4h, globalC1d, 100, true, 2.8, 95.0);
+  assert.ok(
+    globalDcaLong.price < 97.2 && globalDcaLong.price > 52,
+    `DCA 1 для LONG должен опираться на глобальный 1D/4H уровень (${globalDcaLong.price}$)`
+  );
+  assert.equal(
+    globalDcaLong.second_price,
+    52,
+    `DCA 2 для LONG должен стоять строго на абсолютном историческом дне (52$), получено ${globalDcaLong.second_price}$`
+  );
+  assert.ok(
+    globalDcaShort.price > 102.8 && globalDcaShort.price < 168,
+    `DCA 1 для SHORT должен опираться на глобальный 1D/4H уровень (${globalDcaShort.price}$)`
+  );
+  assert.equal(
+    globalDcaShort.second_price,
+    168,
+    `DCA 2 для SHORT должен стоять строго на абсолютном историческом пике (168$), получено ${globalDcaShort.second_price}$`
+  );
+
+  // 15B. Проверка USDT + USDC маппинга и строгой проверки живого приватного WebSocket соединения
+  const {
+    cleanSymbolToPair,
+    isSupportedFuturesSymbol,
+    isPrivateWsStreamOpen,
+    setWsAccountLiveState,
+    getWsAccountLiveState,
+  } = await import('../src/bot/exchangeWebSocket.ts');
+  assert.equal(isSupportedFuturesSymbol('BTCUSDT'), true);
+  assert.equal(cleanSymbolToPair('BTCUSDT'), 'BTC/USDT:USDT');
+  assert.equal(isSupportedFuturesSymbol('ETHUSDC'), true);
+  assert.equal(cleanSymbolToPair('ETHUSDC'), 'ETH/USDC:USDC');
+  assert.equal(isSupportedFuturesSymbol('SOLBTC'), false);
+
+  setWsAccountLiveState({
+    exchange: 'bybit',
+    apiKey: 'test-ws-verify-key-15',
+    isTestnet: true,
+    networkLabel: 'BYBIT TESTNET',
+    wsConnected: false,
+    canTrade: true,
+    walletBalanceUsdt: 1500,
+    availableBalanceUsdt: 1200,
+    usedMarginUsdt: 300,
+    unrealizedPnlUsdt: 12.5,
+    equityUsdt: 1512.5,
+    updatedAt: Date.now() - 10_000,
+    lastRestBootstrapAt: Date.now() - 10_000,
+    closedPnl: [],
+    positions: [
+      {
+        symbol: 'ETHUSDC',
+        pair: 'ETH/USDC:USDC',
+        is_short: false,
+        size: 1.5,
+        entry_price: 3000,
+        mark_price: 3010,
+        unrealized_pnl: 15,
+        leverage: 15,
+        margin_usdt: 300,
+        created_time: Date.now(),
+        updated_time: Date.now(),
+      },
+    ],
+  });
+  assert.equal(
+    isPrivateWsStreamOpen('bybit', 'test-ws-verify-key-15'),
+    false,
+    'isPrivateWsStreamOpen обязан возвращать false когда реальный приватный сокет не открыт'
+  );
+  const freshWsVerify = getWsAccountLiveState('test-ws-verify-key-15');
+  assert.ok(
+    freshWsVerify &&
+      freshWsVerify.usedMarginUsdt === 300 &&
+      freshWsVerify.positions[0]?.pair === 'ETH/USDC:USDC',
+    'setWsAccountLiveState обязан сохранять позиции USDT/USDC и реальную маржу в WS-кэш'
+  );
+  const expiredWsVerify = getWsAccountLiveState('test-ws-verify-key-15', 5000);
+  assert.ok(
+    !expiredWsVerify,
+    'getWsAccountLiveState не должен отдавать устаревший кэш когда приватный сокет закрыт'
+  );
+
+  // 15C. Фильтр истории закрытых сделок строго ПОСЛЕ connected_at
+  const accsForTest15 = (await api('/api/v1/accounts')).data.accounts;
+  const masterAcc15 = accsForTest15.find((a: any) => a.is_owner) || accsForTest15[0];
+  assert.ok(masterAcc15, 'Для теста 15C должен быть активный мастер-аккаунт');
+  const preConnTs = (masterAcc15.connected_at || Date.now()) - 600_000;
+  sqliteDb.upsertTrade({
+    trade_id: 999777,
+    pair: 'SOL/USDT:USDT',
+    base_currency: 'SOL',
+    quote_currency: 'USDT',
+    is_open: false,
+    is_short: false,
+    exchange: masterAcc15.exchange,
+    account_id: 'master',
+    account_name: 'Master',
+    amount: 5,
+    stake_amount: 50,
+    strategy: 'ScalpingStrategy',
+    timeframe: '1h',
+    enter_tag: 'Long',
+    open_date: new Date(preConnTs - 120_000).toISOString().replace('T', ' ').slice(0, 19),
+    open_timestamp: preConnTs - 120_000,
+    open_rate: 150,
+    current_rate: 155,
+    close_date: new Date(preConnTs).toISOString().replace('T', ' ').slice(0, 19),
+    close_timestamp: preConnTs,
+    close_rate: 155,
+    profit_ratio: 0.03,
+    profit_pct: 3,
+    profit_abs: 15,
+    stop_loss_abs: 0,
+    stop_loss_pct: 0,
+    initial_stop_loss_abs: 0,
+    initial_stop_loss_pct: 0,
+    exit_reason: 'roi',
+    leverage: 25,
+    orders: [],
+  });
+  await api('/api/v1/simulate_crash_recovery', { method: 'POST' });
+  const tradesAfter15C = await api('/api/v1/trades');
+  assert.equal(
+    tradesAfter15C.data.trades.some((t: any) => t.trade_id === 999777),
+    false,
+    'Закрытая сделка с временем закрытия ДО connected_at должна удаляться и не попадать в /api/v1/trades!'
+  );
+
+  // 15D. Маржа и свободный баланс в /api/v1/accounts и /api/v1/balance
+  const accsMarginCheck = (await api('/api/v1/accounts')).data.accounts;
+  assert.ok(
+    accsMarginCheck.every(
+      (a: any) =>
+        typeof a.used_margin_usdt === 'number' &&
+        Number.isFinite(a.used_margin_usdt) &&
+        typeof a.available_balance_usdt === 'number' &&
+        Number.isFinite(a.available_balance_usdt)
+    ),
+    '/api/v1/accounts обязан возвращать поля used_margin_usdt и available_balance_usdt для каждого аккаунта'
+  );
+  const balMarginCheck = await api('/api/v1/balance');
+  assert.ok(
+    typeof balMarginCheck.data.used_margin === 'number' &&
+      typeof balMarginCheck.data.available_balance === 'number',
+    '/api/v1/balance обязан возвращать поля used_margin и available_balance'
+  );
+
+  console.log(
+    `   ✅ [15A-15D] Доказано: глобальный SUP=${globalStruct1d.nearest_support}$ / RES=${globalStruct1d.nearest_resistance}$, DCA1=${globalDcaLong.price}$(L)/${globalDcaShort.price}$(S), DCA2=${globalDcaLong.second_price}$(Bottom)/${globalDcaShort.second_price}$(Peak), USDT+USDC, фильтр истории до connected_at и поля маржи работают!`
   );
 
   console.log('\n🧹 Очистка тестовых аккаунтов и тестовых сделок...');

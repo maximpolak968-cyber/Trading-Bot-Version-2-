@@ -474,6 +474,10 @@ export const ExchangeAccountsView: React.FC<ExchangeAccountsViewProps> = ({
                         <div className="text-[10.5px] text-[#089981]">
                           0.5% = ${stakeUsdt} ({acc.max_leverage || 25}x)
                         </div>
+                        <div className="text-[10px] text-[#9ca3af] mt-0.5">
+                          Маржа: ${(acc.used_margin_usdt ?? 0).toFixed(2)} · Своб: $
+                          {(acc.available_balance_usdt ?? Math.max(0, acc.balance_usdt - (acc.used_margin_usdt ?? 0))).toFixed(2)}
+                        </div>
                       </td>
                       <td className="py-2.5 px-4 font-mono">
                         <div className="flex items-center gap-1.5">
