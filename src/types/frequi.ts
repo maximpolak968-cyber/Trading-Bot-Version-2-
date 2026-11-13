@@ -218,6 +218,8 @@ export interface DailyRecord {
   rel_profit: number;
   fiat_value: number;
   trade_count: number;
+  wins?: number;
+  losses?: number;
   equity: number;
 }
 
@@ -292,6 +294,7 @@ export interface BotConfig {
   dry_run: boolean;
   runmode: string;
   state: 'running' | 'stopped' | 'paused';
+  pause_new_entries?: boolean;
   bot_name: string;
   strategy: string;
   timeframe: string;

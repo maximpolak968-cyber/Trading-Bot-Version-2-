@@ -1,5 +1,14 @@
 import crypto from 'node:crypto';
 import https from 'node:https';
+import {
+  getBinanceWsRpcClient,
+  getWsAccountLiveState,
+  setWsAccountLiveState,
+  ensureBinancePrivateUserStream,
+  ensureBybitPrivateUserStream,
+  getLiveWsTicker,
+  subscribePairKlineStream,
+} from './exchangeWebSocket.ts';
 
 export type SupportedExchange = 'binance' | 'bybit' | 'okx' | 'bitget' | 'bingx';
 
@@ -294,21 +303,27 @@ async function getBinanceTimestamp(
   forceSync = false,
   baseUrl = 'https://fapi.binance.com'
 ): Promise<number> {
-  if (isBinanceHostRateLimited(baseUrl).limited) {
-    return Date.now() + binanceTimeOffsetMs;
-  }
   if (forceSync || Date.now() - lastTimeSyncTs > 10 * 60_000) {
     try {
-      const res = await makeHttpsRequest(`${baseUrl}/fapi/v1/time`, {
-        method: 'GET',
-        headers: { Accept: 'application/json' },
-        timeoutMs: 4000,
-      });
-      if (res.statusCode === 200) {
-        const parsed = JSON.parse(res.data);
-        if (parsed && typeof parsed.serverTime === 'number') {
-          binanceTimeOffsetMs = parsed.serverTime - Date.now();
-          lastTimeSyncTs = Date.now();
+      const wsRpc = getBinanceWsRpcClient(baseUrl);
+      const wsTime = await wsRpc.request('time', {}, undefined, 3000);
+      if (wsTime.status === 200 && typeof wsTime.result?.serverTime === 'number') {
+        binanceTimeOffsetMs = wsTime.result.serverTime - Date.now();
+        lastTimeSyncTs = Date.now();
+        return Date.now() + binanceTimeOffsetMs;
+      }
+      if (!isBinanceHostRateLimited(baseUrl).limited) {
+        const res = await makeHttpsRequest(`${baseUrl}/fapi/v1/time`, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+          timeoutMs: 4000,
+        });
+        if (res.statusCode === 200) {
+          const parsed = JSON.parse(res.data);
+          if (parsed && typeof parsed.serverTime === 'number') {
+            binanceTimeOffsetMs = parsed.serverTime - Date.now();
+            lastTimeSyncTs = Date.now();
+          }
         }
       }
     } catch {
@@ -371,9 +386,12 @@ async function ensureBinanceExchangeInfo(
     !forceRefresh &&
     existing &&
     existing.symbols.size > 50 &&
-    Date.now() - existing.syncTs < 30 * 60_000
+    Date.now() - existing.syncTs < 60 * 60_000
   ) {
     return existing.symbols;
+  }
+  if (isBinanceHostRateLimited(cleanHost).limited) {
+    return existing?.symbols || new Map<string, BinanceSymbolFilterMeta>();
   }
   try {
     const res = await makeHttpsRequest(`${cleanHost}/fapi/v1/exchangeInfo`, {
@@ -917,6 +935,9 @@ async function ensureBinanceSymbolLeverage(
   if (cachedLev === targetLeverage) {
     return cachedLev;
   }
+  if (isBinanceHostRateLimited(baseUrl).limited) {
+    return cachedLev || targetLeverage;
+  }
 
   // 1. Попытка установить тип маржи CROSSED (игнорируем -4046 "No need to change margin type")
   try {
@@ -1128,6 +1149,29 @@ export async function executeExchangeFuturesOrder(
         );
         let activeDualSide = await getBinanceDualSideMode(cleanKey, cleanSecret, false, baseUrl);
 
+        const buildOrderParamsObj = async (
+          useDualSide: boolean,
+          qtyStr = formattedQtyStr
+        ): Promise<Record<string, string | number>> => {
+          const ts = await getBinanceTimestamp(false, baseUrl);
+          const p: Record<string, string | number> = {
+            apiKey: cleanKey,
+            symbol,
+            side,
+            type: 'MARKET',
+            quantity: qtyStr,
+            newOrderRespType: 'RESULT',
+            timestamp: ts,
+            recvWindow: 10000,
+          };
+          if (useDualSide) {
+            p.positionSide = params.isShort ? 'SHORT' : 'LONG';
+          } else if (isClose) {
+            p.reduceOnly = 'true';
+          }
+          return p;
+        };
+
         const buildOrderQuery = async (useDualSide: boolean, qtyStr = formattedQtyStr): Promise<string> => {
           const ts = await getBinanceTimestamp(false, baseUrl);
           const qp = new URLSearchParams();
@@ -1146,34 +1190,44 @@ export async function executeExchangeFuturesOrder(
           return qp.toString();
         };
 
-        let query = await buildOrderQuery(activeDualSide, formattedQtyStr);
-        let signature = signBinanceFuturesQuery(query, cleanSecret);
-        let res = await makeHttpsRequest(
-          `${baseUrl}/fapi/v1/order?${query}&signature=${signature}`,
-          {
+        const wsRpc = getBinanceWsRpcClient(baseUrl);
+        const sendBinanceMarketOrder = async (
+          useDualSide: boolean,
+          qtyStr = formattedQtyStr
+        ): Promise<{ statusCode: number; data: string; latencyMs: number }> => {
+          const wsOrdParams = await buildOrderParamsObj(useDualSide, qtyStr);
+          const wsOrdRes = await wsRpc.request('order.place', wsOrdParams, cleanSecret, 5500);
+          if (wsOrdRes.status === 200 && wsOrdRes.result) {
+            return {
+              statusCode: 200,
+              data: JSON.stringify(wsOrdRes.result),
+              latencyMs: wsOrdRes.latencyMs,
+            };
+          }
+          if (wsOrdRes.error && wsOrdRes.status !== 503 && wsOrdRes.status !== 408) {
+            return {
+              statusCode: wsOrdRes.status,
+              data: JSON.stringify(wsOrdRes.error),
+              latencyMs: wsOrdRes.latencyMs,
+            };
+          }
+          const query = await buildOrderQuery(useDualSide, qtyStr);
+          const signature = signBinanceFuturesQuery(query, cleanSecret);
+          return makeHttpsRequest(`${baseUrl}/fapi/v1/order?${query}&signature=${signature}`, {
             method: 'POST',
             headers: {
               'X-MBX-APIKEY': cleanKey,
               'Content-Type': 'application/json',
             },
-          }
-        );
+          });
+        };
+
+        let res = await sendBinanceMarketOrder(activeDualSide, formattedQtyStr);
 
         // Если ошибка -1021 (рассинхрон времени) — принудительно синхронизируем часы и повторяем
         if (res.statusCode !== 200 && res.data.includes('-1021')) {
           await getBinanceTimestamp(true, baseUrl);
-          query = await buildOrderQuery(activeDualSide, formattedQtyStr);
-          signature = signBinanceFuturesQuery(query, cleanSecret);
-          res = await makeHttpsRequest(
-            `${baseUrl}/fapi/v1/order?${query}&signature=${signature}`,
-            {
-              method: 'POST',
-              headers: {
-                'X-MBX-APIKEY': cleanKey,
-                'Content-Type': 'application/json',
-              },
-            }
-          );
+          res = await sendBinanceMarketOrder(activeDualSide, formattedQtyStr);
         }
 
         // Если ошибка -2015 (ключ от Testnet отправлен на Mainnet или наоборот) — пробуем следующий хост
@@ -1186,18 +1240,7 @@ export async function executeExchangeFuturesOrder(
         if (res.statusCode !== 200 && res.data.includes('-4061')) {
           activeDualSide = !activeDualSide;
           binanceDualSideCache.set(cleanKey, { dualSide: activeDualSide, updatedAt: Date.now() });
-          query = await buildOrderQuery(activeDualSide, formattedQtyStr);
-          signature = signBinanceFuturesQuery(query, cleanSecret);
-          res = await makeHttpsRequest(
-            `${baseUrl}/fapi/v1/order?${query}&signature=${signature}`,
-            {
-              method: 'POST',
-              headers: {
-                'X-MBX-APIKEY': cleanKey,
-                'Content-Type': 'application/json',
-              },
-            }
-          );
+          res = await sendBinanceMarketOrder(activeDualSide, formattedQtyStr);
         }
 
         // Если ошибка -1111 (Precision is over the maximum defined for this asset) —
@@ -1220,18 +1263,7 @@ export async function executeExchangeFuturesOrder(
             );
           }
           formattedQtyStr = refreshedQty;
-          query = await buildOrderQuery(activeDualSide, formattedQtyStr);
-          signature = signBinanceFuturesQuery(query, cleanSecret);
-          res = await makeHttpsRequest(
-            `${baseUrl}/fapi/v1/order?${query}&signature=${signature}`,
-            {
-              method: 'POST',
-              headers: {
-                'X-MBX-APIKEY': cleanKey,
-                'Content-Type': 'application/json',
-              },
-            }
-          );
+          res = await sendBinanceMarketOrder(activeDualSide, formattedQtyStr);
 
           // Если всё ещё -1111 и есть дробная часть — округляем до целого числа контрактов (0 знаков после запятой)
           if (res.statusCode !== 200 && res.data.includes('-1111') && formattedQtyStr.includes('.')) {
@@ -1241,18 +1273,7 @@ export async function executeExchangeFuturesOrder(
                 isClose ? Math.floor(Number(formattedQtyStr)) : Math.ceil(Number(formattedQtyStr))
               )
             );
-            query = await buildOrderQuery(activeDualSide, formattedQtyStr);
-            signature = signBinanceFuturesQuery(query, cleanSecret);
-            res = await makeHttpsRequest(
-              `${baseUrl}/fapi/v1/order?${query}&signature=${signature}`,
-              {
-                method: 'POST',
-                headers: {
-                  'X-MBX-APIKEY': cleanKey,
-                  'Content-Type': 'application/json',
-                },
-              }
-            );
+            res = await sendBinanceMarketOrder(activeDualSide, formattedQtyStr);
           }
         }
 
@@ -2069,75 +2090,133 @@ export async function testExchangeConnection(
   }
 
   // ==========================================================================
-  // 1. BINANCE USDT-M FUTURES (Mainnet fapi.binance.com + Testnet testnet.binancefuture.com)
+  // 1. BINANCE USDT-M FUTURES (WebSocket API wss://ws-fapi.binance.com/ws-fapi/v1 + User Data Stream + REST fallback)
   // ==========================================================================
   if (creds.exchange === 'binance') {
+    // 1A. Если у нас уже есть живое WebSocket-состояние аккаунта (User Data Stream), отдаём его мгновенно за 1 мс без единого запроса к бирже!
+    const liveWsState = getWsAccountLiveState(cleanKey, 90_000);
+    if (liveWsState && liveWsState.exchange === 'binance') {
+      const statusMsg = `Успешно подключено к ${liveWsState.networkLabel} [WebSocket Live] (Пинг: 1 мс | Баланс: ${liveWsState.walletBalanceUsdt.toFixed(2)} USDT | Плавающий PnL: ${liveWsState.unrealizedPnlUsdt >= 0 ? '+' : ''}${liveWsState.unrealizedPnlUsdt.toFixed(2)} USDT | Доступно: ${liveWsState.availableBalanceUsdt.toFixed(2)} USDT | Открытых позиций: ${liveWsState.positions.length})`;
+      return {
+        success: true,
+        exchange: 'binance',
+        message: statusMsg,
+        latency_ms: 1,
+        balance_usdt: liveWsState.walletBalanceUsdt,
+        wallet_balance_usdt: liveWsState.walletBalanceUsdt,
+        unrealized_pnl_usdt: liveWsState.unrealizedPnlUsdt,
+        equity_usdt: liveWsState.equityUsdt,
+        available_balance_usdt: liveWsState.availableBalanceUsdt,
+        used_margin_usdt: liveWsState.usedMarginUsdt,
+        can_trade: liveWsState.canTrade,
+        dual_side_position: liveWsState.dualSidePosition,
+        open_positions_count: liveWsState.positions.length,
+        account_type: `${liveWsState.networkLabel} (WS)`,
+        is_testnet: liveWsState.isTestnet,
+        network_label: liveWsState.networkLabel,
+      };
+    }
+
     const candidateHosts = getBinanceCandidateHosts(cleanKey, creds.isTestnet);
     let primaryErrorRes: ConnectionTestResult | null = null;
     let lastErrorRes: ConnectionTestResult | null = null;
 
     for (const baseUrl of candidateHosts) {
-      // Если этот хост Binance сейчас под временным баном -1003, НЕ шлём на него новый REST-запрос (чтобы не продлевать бан!),
-      // а сначала проверяем второй хост (например, Testnet).
-      const rateLimit = isBinanceHostRateLimited(baseUrl);
-      if (rateLimit.limited) {
-        const cachedHost = binanceHostCache.get(cleanKey);
-        const lastGood = binanceLastGoodConnCache.get(cleanKey);
-        if (lastGood && (!cachedHost || cachedHost === baseUrl)) {
-          return {
-            ...lastGood.result,
-            latency_ms: 1,
-          };
-        }
-        const remainSec = Math.max(1, Math.ceil((rateLimit.untilMs - Date.now()) / 1000));
-        const banErr: ConnectionTestResult = {
-          success: false,
-          exchange: 'binance',
-          message: `Binance [-1003]: Пауза анти-спама IP на ${
-            baseUrl.includes('testnet') ? 'Testnet' : 'Mainnet'
-          } (осталось ~${remainSec} сек до авто-разблокировки)`,
-          latency_ms: 0,
-          can_trade: false,
-          error_code: -1003,
-          is_testnet: baseUrl.includes('testnet'),
-        };
-        if (!lastErrorRes) lastErrorRes = banErr;
-        continue;
-      }
-
       try {
-        const timestamp = await getBinanceTimestamp(false, baseUrl);
-        const recvWindow = 10000;
-        const query = `timestamp=${timestamp}&recvWindow=${recvWindow}`;
-        const signature = signBinanceFuturesQuery(query, cleanSecret);
-        const url = `${baseUrl}/fapi/v2/account?${query}&signature=${signature}`;
-
-        const res = await makeHttpsRequest(url, {
-          method: 'GET',
-          headers: {
-            'X-MBX-APIKEY': cleanKey,
-            'Content-Type': 'application/json',
-          },
-        });
-
-        if (res.statusCode !== 200 && res.data.includes('-1021')) {
-          const retryTs = await getBinanceTimestamp(true, baseUrl);
-          const retryQuery = `timestamp=${retryTs}&recvWindow=15000`;
-          const retrySig = signBinanceFuturesQuery(retryQuery, cleanSecret);
-          const retryRes = await makeHttpsRequest(
-            `${baseUrl}/fapi/v2/account?${retryQuery}&signature=${retrySig}`,
-            {
-              method: 'GET',
-              headers: {
-                'X-MBX-APIKEY': cleanKey,
-                'Content-Type': 'application/json',
-              },
-            }
+        // 1B. Сначала запрашиваем статус счёта и позиции через Binance Futures WebSocket API (wss://ws-fapi.binance.com/ws-fapi/v1),
+        // который НЕ блокируется баном IP -1003 на REST fapi.binance.com!
+        const wsRpc = getBinanceWsRpcClient(baseUrl);
+        const wsTs = await getBinanceTimestamp(false, baseUrl);
+        let wsAccRes = await wsRpc.request(
+          'v2/account.status',
+          { apiKey: cleanKey, timestamp: wsTs, recvWindow: 10000 },
+          cleanSecret,
+          5500
+        );
+        if (wsAccRes.status !== 200 && wsAccRes.error?.code === -1021) {
+          const retryWsTs = await getBinanceTimestamp(true, baseUrl);
+          wsAccRes = await wsRpc.request(
+            'v2/account.status',
+            { apiKey: cleanKey, timestamp: retryWsTs, recvWindow: 15000 },
+            cleanSecret,
+            5500
           );
-          if (retryRes.statusCode === 200) {
-            res.statusCode = 200;
-            res.data = retryRes.data;
-            res.latencyMs = retryRes.latencyMs;
+        }
+
+        let res: { statusCode: number; data: string; latencyMs: number } | null = null;
+        if (wsAccRes.status === 200 && wsAccRes.result) {
+          res = {
+            statusCode: 200,
+            data: JSON.stringify(wsAccRes.result),
+            latencyMs: wsAccRes.latencyMs,
+          };
+        } else if (wsAccRes.error && wsAccRes.status !== 503 && wsAccRes.status !== 408) {
+          res = {
+            statusCode: wsAccRes.status,
+            data: JSON.stringify(wsAccRes.error),
+            latencyMs: wsAccRes.latencyMs,
+          };
+        } else {
+          // Резервный REST-запрос только если WebSocket порт недоступен
+          const rateLimit = isBinanceHostRateLimited(baseUrl);
+          if (rateLimit.limited) {
+            const cachedHost = binanceHostCache.get(cleanKey);
+            const lastGood = binanceLastGoodConnCache.get(cleanKey);
+            if (lastGood && (!cachedHost || cachedHost === baseUrl)) {
+              return {
+                ...lastGood.result,
+                latency_ms: 1,
+              };
+            }
+            const remainSec = Math.max(1, Math.ceil((rateLimit.untilMs - Date.now()) / 1000));
+            const banErr: ConnectionTestResult = {
+              success: false,
+              exchange: 'binance',
+              message: `Binance [-1003]: Пауза анти-спама IP на ${
+                baseUrl.includes('testnet') ? 'Testnet' : 'Mainnet'
+              } (осталось ~${remainSec} сек до авто-разблокировки)`,
+              latency_ms: 0,
+              can_trade: false,
+              error_code: -1003,
+              is_testnet: baseUrl.includes('testnet'),
+            };
+            if (!lastErrorRes) lastErrorRes = banErr;
+            continue;
+          }
+
+          const timestamp = await getBinanceTimestamp(false, baseUrl);
+          const recvWindow = 10000;
+          const query = `timestamp=${timestamp}&recvWindow=${recvWindow}`;
+          const signature = signBinanceFuturesQuery(query, cleanSecret);
+          const url = `${baseUrl}/fapi/v2/account?${query}&signature=${signature}`;
+
+          res = await makeHttpsRequest(url, {
+            method: 'GET',
+            headers: {
+              'X-MBX-APIKEY': cleanKey,
+              'Content-Type': 'application/json',
+            },
+          });
+
+          if (res.statusCode !== 200 && res.data.includes('-1021')) {
+            const retryTs = await getBinanceTimestamp(true, baseUrl);
+            const retryQuery = `timestamp=${retryTs}&recvWindow=15000`;
+            const retrySig = signBinanceFuturesQuery(retryQuery, cleanSecret);
+            const retryRes = await makeHttpsRequest(
+              `${baseUrl}/fapi/v2/account?${retryQuery}&signature=${retrySig}`,
+              {
+                method: 'GET',
+                headers: {
+                  'X-MBX-APIKEY': cleanKey,
+                  'Content-Type': 'application/json',
+                },
+              }
+            );
+            if (retryRes.statusCode === 200) {
+              res.statusCode = 200;
+              res.data = retryRes.data;
+              res.latencyMs = retryRes.latencyMs;
+            }
           }
         }
 
@@ -2209,11 +2288,43 @@ export async function testExchangeConnection(
           });
 
           const openPositions = parsedPositions.length;
-          // Используем кэш dualSide (TTL 30 мин), чтобы не тратить 30 единиц веса лимита на каждый вызов!
-          const dualSide = await getBinanceDualSideMode(cleanKey, cleanSecret, false, baseUrl);
+          // Определяем Hedge Mode прямо из позиций в ответе v2/account (если есть LONG/SHORT positionSide), чтобы не делать лишний REST запрос!
+          const inferredDualSide = Array.isArray(json.positions)
+            ? json.positions.some((p: any) => {
+                const ps = String(p.positionSide || '').toUpperCase();
+                return ps === 'LONG' || ps === 'SHORT';
+              })
+            : false;
+          const cachedDual = binanceDualSideCache.get(cleanKey);
+          const dualSide = cachedDual ? cachedDual.dualSide : inferredDualSide;
+          if (!cachedDual) {
+            binanceDualSideCache.set(cleanKey, { dualSide, updatedAt: Date.now() });
+          }
           const canTrade = Boolean(json.canTrade);
 
-          let statusMsg = `Успешно подключено к ${netLabel} (Пинг: ${res.latencyMs} мс | Баланс: ${walletBalance.toFixed(2)} USDT | Плавающий PnL: ${unrealizedPnl >= 0 ? '+' : ''}${unrealizedPnl.toFixed(2)} USDT | Доступно: ${availableBalance.toFixed(2)} USDT | Режим: ${dualSide ? 'Hedge Mode' : 'One-Way'} | Открытых позиций: ${openPositions})`;
+          // Сохраняем состояние в WebSocket-движок и запускаем постоянный User Data Stream (listenKey WS)
+          const existingWsState = getWsAccountLiveState(cleanKey, 86_400_000);
+          setWsAccountLiveState({
+            apiKey: cleanKey,
+            exchange: 'binance',
+            isTestnet: isTestnetHost,
+            networkLabel: netLabel,
+            walletBalanceUsdt: walletBalance,
+            unrealizedPnlUsdt: unrealizedPnl,
+            equityUsdt: marginBalance,
+            availableBalanceUsdt: availableBalance,
+            usedMarginUsdt: usedMargin,
+            canTrade,
+            dualSidePosition: dualSide,
+            positions: parsedPositions,
+            closedPnl: existingWsState?.closedPnl || [],
+            wsConnected: true,
+            updatedAt: Date.now(),
+            lastRestBootstrapAt: Date.now(),
+          });
+          ensureBinancePrivateUserStream(cleanKey, cleanSecret, baseUrl).catch(() => {});
+
+          let statusMsg = `Успешно подключено к ${netLabel} [WebSocket] (Пинг: ${res.latencyMs} мс | Баланс: ${walletBalance.toFixed(2)} USDT | Плавающий PnL: ${unrealizedPnl >= 0 ? '+' : ''}${unrealizedPnl.toFixed(2)} USDT | Доступно: ${availableBalance.toFixed(2)} USDT | Режим: ${dualSide ? 'Hedge Mode' : 'One-Way'} | Открытых позиций: ${openPositions})`;
           if (walletBalance <= 0) {
             statusMsg +=
               ' ⚠️ На фьючерсном кошельке USDⓈ-M сейчас 0 USDT! Переведите USDT со Спотового кошелька на Фьючерсный (USDⓈ-M Futures).';
@@ -2318,9 +2429,31 @@ export async function testExchangeConnection(
   }
 
   // ==========================================================================
-  // 2. BYBIT V5 (Mainnet api.bybit.com + Testnet api-testnet.bybit.com + Demo api-demo.bybit.com)
+  // 2. BYBIT V5 (Private WebSocket wss://stream.bybit.com/v5/private + Mainnet/Testnet/Demo REST bootstrap)
   // ==========================================================================
   if (creds.exchange === 'bybit') {
+    const liveBybitWs = getWsAccountLiveState(cleanKey, 90_000);
+    if (liveBybitWs && liveBybitWs.exchange === 'bybit') {
+      const msg = `Успешно подключено к ${liveBybitWs.networkLabel} [WebSocket Live] (Пинг: 1 мс | Баланс: ${liveBybitWs.walletBalanceUsdt.toFixed(2)} USDT | Плавающий PnL: ${liveBybitWs.unrealizedPnlUsdt >= 0 ? '+' : ''}${liveBybitWs.unrealizedPnlUsdt.toFixed(2)} USDT | Открытых позиций: ${liveBybitWs.positions.length})`;
+      return {
+        success: true,
+        exchange: 'bybit',
+        message: msg,
+        latency_ms: 1,
+        balance_usdt: liveBybitWs.walletBalanceUsdt,
+        wallet_balance_usdt: liveBybitWs.walletBalanceUsdt,
+        unrealized_pnl_usdt: liveBybitWs.unrealizedPnlUsdt,
+        equity_usdt: liveBybitWs.equityUsdt,
+        available_balance_usdt: liveBybitWs.availableBalanceUsdt,
+        used_margin_usdt: liveBybitWs.usedMarginUsdt,
+        can_trade: true,
+        open_positions_count: liveBybitWs.positions.length,
+        account_type: `${liveBybitWs.networkLabel} (WS)`,
+        is_testnet: liveBybitWs.isTestnet,
+        network_label: liveBybitWs.networkLabel,
+      };
+    }
+
     // Если пользователь вставил 64-символьный ключ Binance, забыв переключить вкладку с Bybit на Binance —
     // сначала быстро проверим Bybit, а при отказе автоматически проверим Binance!
     const candidateHosts = getBybitCandidateHosts(cleanKey, creds.isTestnet);
@@ -2543,7 +2676,35 @@ export async function testExchangeConnection(
             }
 
             const finalWalletBal = resolvedBalance > 0 ? resolvedBalance : fundBalance;
-            let msg = `Успешно подключено к ${netLabel} [${walletTypeLabel}] (Пинг: ${res.latencyMs} мс | Баланс: ${finalWalletBal.toFixed(2)} USDT | Плавающий PnL: ${resolvedUnrealizedPnl >= 0 ? '+' : ''}${resolvedUnrealizedPnl.toFixed(2)} USDT | Открытых позиций: ${openPositions})`;
+            const finalEquity =
+              resolvedEquity > 0 ? resolvedEquity : finalWalletBal + resolvedUnrealizedPnl;
+            const finalAvail =
+              resolvedAvailable > 0
+                ? resolvedAvailable
+                : Math.max(0, finalWalletBal - resolvedUsedMargin);
+
+            // Сохраняем состояние аккаунта Bybit в WebSocket-движок и запускаем приватный WebSocket поток
+            const prevBybitWs = getWsAccountLiveState(cleanKey, 86_400_000);
+            setWsAccountLiveState({
+              apiKey: cleanKey,
+              exchange: 'bybit',
+              isTestnet: isTestnetHost,
+              networkLabel: netLabel,
+              walletBalanceUsdt: finalWalletBal,
+              unrealizedPnlUsdt: resolvedUnrealizedPnl,
+              equityUsdt: finalEquity,
+              availableBalanceUsdt: finalAvail,
+              usedMarginUsdt: resolvedUsedMargin,
+              canTrade: true,
+              positions: prevBybitWs?.positions || [],
+              closedPnl: prevBybitWs?.closedPnl || [],
+              wsConnected: true,
+              updatedAt: Date.now(),
+              lastRestBootstrapAt: Date.now(),
+            });
+            ensureBybitPrivateUserStream(cleanKey, cleanSecret, baseUrl);
+
+            let msg = `Успешно подключено к ${netLabel} [${walletTypeLabel} + WebSocket] (Пинг: ${res.latencyMs} мс | Баланс: ${finalWalletBal.toFixed(2)} USDT | Плавающий PnL: ${resolvedUnrealizedPnl >= 0 ? '+' : ''}${resolvedUnrealizedPnl.toFixed(2)} USDT | Открытых позиций: ${openPositions})`;
             if (resolvedBalance <= 0 && fundBalance > 0) {
               msg += ` ⚠️ На торговом кошельке 0 USDT, но на кошельке Финансирования (Funding) найдено ${fundBalance.toFixed(2)} USDT — переведите их на Unified Trading (Единый торговый аккаунт) в Bybit!`;
             } else if (resolvedBalance <= 0) {
@@ -2558,11 +2719,8 @@ export async function testExchangeConnection(
               balance_usdt: finalWalletBal,
               wallet_balance_usdt: finalWalletBal,
               unrealized_pnl_usdt: resolvedUnrealizedPnl,
-              equity_usdt: resolvedEquity > 0 ? resolvedEquity : finalWalletBal + resolvedUnrealizedPnl,
-              available_balance_usdt:
-                resolvedAvailable > 0
-                  ? resolvedAvailable
-                  : Math.max(0, finalWalletBal - resolvedUsedMargin),
+              equity_usdt: finalEquity,
+              available_balance_usdt: finalAvail,
               used_margin_usdt: resolvedUsedMargin,
               can_trade: true,
               open_positions_count: openPositions,
@@ -3053,8 +3211,28 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
     return { success: false, positions: [] };
   }
 
-  // 1. BYBIT V5 LINEAR FUTURES (/v5/position/list?category=linear&settleCoin=USDT&limit=200)
+  // 1. BYBIT V5 LINEAR FUTURES (WebSocket Private Stream + /v5/position/list bootstrap)
   if (creds.exchange === 'bybit') {
+    const liveBybitWs = getWsAccountLiveState(cleanKey, 75_000);
+    if (liveBybitWs && liveBybitWs.exchange === 'bybit' && liveBybitWs.wsConnected) {
+      for (const pos of liveBybitWs.positions) {
+        const tick = getLiveWsTicker(pos.symbol);
+        if (tick && tick.markPrice > 0) {
+          pos.mark_price = tick.markPrice;
+          const diff = pos.is_short
+            ? pos.entry_price - tick.markPrice
+            : tick.markPrice - pos.entry_price;
+          pos.unrealized_pnl = Number((diff * pos.size).toFixed(4));
+        }
+      }
+      return {
+        success: true,
+        positions: liveBybitWs.positions,
+        network_label: liveBybitWs.networkLabel,
+        is_testnet: liveBybitWs.isTestnet,
+      };
+    }
+
     const candidateHosts = getBybitCandidateHosts(cleanKey, creds.isTestnet);
     for (const baseUrl of candidateHosts) {
       try {
@@ -3106,7 +3284,7 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
               const sl = Number(p.stopLoss || 0);
               const cTime = Number(p.createdTime || p.updatedTime || Date.now());
               const uTime = Number(p.updatedTime || cTime);
-              positions.push({
+              const posItem: ExchangePositionItem = {
                 pair: symbolToFreqtradePair(sym),
                 symbol: sym,
                 is_short: isShort,
@@ -3120,8 +3298,16 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
                 stop_loss: sl > 0 ? sl : undefined,
                 created_time: cTime,
                 updated_time: uTime,
-              });
+              };
+              positions.push(posItem);
+              subscribePairKlineStream(posItem.pair, '1h');
             }
+            const existingBybitWs = getWsAccountLiveState(cleanKey, 86_400_000);
+            if (existingBybitWs) {
+              existingBybitWs.positions = positions;
+              existingBybitWs.updatedAt = Date.now();
+            }
+            ensureBybitPrivateUserStream(cleanKey, cleanSecret, baseUrl);
             return {
               success: true,
               positions,
@@ -3137,10 +3323,40 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
     return { success: false, positions: [] };
   }
 
-  // 2. BINANCE USDT-M FUTURES (/fapi/v2/positionRisk + кэш из /fapi/v2/account)
+  // 2. BINANCE USDT-M FUTURES (WebSocket User Data Stream + ws-fapi v2/account.position + кэш)
   if (creds.exchange === 'binance') {
+    const liveWsState = getWsAccountLiveState(cleanKey, 90_000);
+    if (liveWsState && liveWsState.exchange === 'binance') {
+      for (const pos of liveWsState.positions) {
+        const tick = getLiveWsTicker(pos.symbol);
+        if (tick && tick.markPrice > 0) {
+          pos.mark_price = tick.markPrice;
+          const diff = pos.is_short
+            ? pos.entry_price - tick.markPrice
+            : tick.markPrice - pos.entry_price;
+          pos.unrealized_pnl = Number((diff * pos.size).toFixed(4));
+        }
+      }
+      return {
+        success: true,
+        positions: liveWsState.positions,
+        network_label: liveWsState.networkLabel,
+        is_testnet: liveWsState.isTestnet,
+      };
+    }
+
     const cachedPos = binancePositionsCache.get(cleanKey);
-    if (cachedPos && Date.now() - cachedPos.timestamp < 25_000) {
+    if (cachedPos && Date.now() - cachedPos.timestamp < 75_000) {
+      for (const pos of cachedPos.positions) {
+        const tick = getLiveWsTicker(pos.symbol);
+        if (tick && tick.markPrice > 0) {
+          pos.mark_price = tick.markPrice;
+          const diff = pos.is_short
+            ? pos.entry_price - tick.markPrice
+            : tick.markPrice - pos.entry_price;
+          pos.unrealized_pnl = Number((diff * pos.size).toFixed(4));
+        }
+      }
       return {
         success: true,
         positions: cachedPos.positions,
@@ -3151,76 +3367,96 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
 
     const candidateHosts = getBinanceCandidateHosts(cleanKey, creds.isTestnet);
     for (const baseUrl of candidateHosts) {
-      if (isBinanceHostRateLimited(baseUrl).limited) {
-        continue;
-      }
       try {
-        const ts = await getBinanceTimestamp(false, baseUrl);
-        const query = `timestamp=${ts}&recvWindow=10000`;
-        const sig = signBinanceFuturesQuery(query, cleanSecret);
-        const res = await makeHttpsRequest(
-          `${baseUrl}/fapi/v2/positionRisk?${query}&signature=${sig}`,
-          {
-            method: 'GET',
-            headers: { 'X-MBX-APIKEY': cleanKey },
-            timeoutMs: 6500,
-          }
+        // 2A. Сначала запрашиваем открытые позиции через WebSocket API (wss://ws-fapi.binance.com/ws-fapi/v1) без бана IP -1003!
+        const wsRpc = getBinanceWsRpcClient(baseUrl);
+        const wsTs = await getBinanceTimestamp(false, baseUrl);
+        const wsPosRes = await wsRpc.request(
+          'v2/account.position',
+          { apiKey: cleanKey, timestamp: wsTs, recvWindow: 10000 },
+          cleanSecret,
+          5500
         );
-        if (res.statusCode === 200) {
-          binanceHostCache.set(cleanKey, baseUrl);
-          const list = JSON.parse(res.data);
-          if (Array.isArray(list)) {
-            const positions: ExchangePositionItem[] = [];
-            for (const p of list) {
-              const rawAmt = Number(p.positionAmt || 0);
-              const size = Math.abs(rawAmt);
-              if (!(size > 0)) continue;
-              const sym = String(p.symbol || '');
-              if (!sym.endsWith('USDT')) continue;
-              const entryPrice = Number(p.entryPrice || 0);
-              if (!(entryPrice > 0)) continue;
-              const markPrice = Number(p.markPrice || entryPrice);
-              const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
-              const posSide = String(p.positionSide || '').toUpperCase();
-              const isShort = posSide === 'SHORT' || rawAmt < 0;
-              const notional = size * entryPrice;
-              const isolatedWallet = Number(p.isolatedWallet || 0);
-              const marginUsdt =
-                isolatedWallet > 0
-                  ? Number(isolatedWallet.toFixed(2))
-                  : Number((notional / lev).toFixed(2));
-              const uTime = Number(p.updateTime || Date.now());
-              positions.push({
-                pair: symbolToFreqtradePair(sym),
-                symbol: sym,
-                is_short: isShort,
-                size,
-                entry_price: entryPrice,
-                mark_price: markPrice > 0 ? markPrice : entryPrice,
-                leverage: lev,
-                margin_usdt: marginUsdt,
-                unrealized_pnl: Number(p.unRealizedProfit || 0),
-                created_time: uTime,
-                updated_time: uTime,
-              });
+
+        let list: any[] | null = null;
+        if (wsPosRes.status === 200 && Array.isArray(wsPosRes.result)) {
+          list = wsPosRes.result;
+        } else if (!wsPosRes.error || wsPosRes.status === 503 || wsPosRes.status === 408) {
+          if (!isBinanceHostRateLimited(baseUrl).limited) {
+            const ts = await getBinanceTimestamp(false, baseUrl);
+            const query = `timestamp=${ts}&recvWindow=10000`;
+            const sig = signBinanceFuturesQuery(query, cleanSecret);
+            const res = await makeHttpsRequest(
+              `${baseUrl}/fapi/v2/positionRisk?${query}&signature=${sig}`,
+              {
+                method: 'GET',
+                headers: { 'X-MBX-APIKEY': cleanKey },
+                timeoutMs: 6500,
+              }
+            );
+            if (res.statusCode === 200) {
+              const parsed = JSON.parse(res.data);
+              if (Array.isArray(parsed)) list = parsed;
             }
-            const netLabel = baseUrl.includes('testnet')
-              ? 'Binance Futures Testnet'
-              : 'Binance USDⓈ-M Mainnet';
-            const isTestnetHost = baseUrl.includes('testnet');
-            binancePositionsCache.set(cleanKey, {
-              timestamp: Date.now(),
-              positions,
-              network_label: netLabel,
-              is_testnet: isTestnetHost,
-            });
-            return {
-              success: true,
-              positions,
-              network_label: netLabel,
-              is_testnet: isTestnetHost,
-            };
           }
+        }
+
+        if (Array.isArray(list)) {
+          binanceHostCache.set(cleanKey, baseUrl);
+          const positions: ExchangePositionItem[] = [];
+          for (const p of list) {
+            const rawAmt = Number(p.positionAmt || 0);
+            const size = Math.abs(rawAmt);
+            if (!(size > 0)) continue;
+            const sym = String(p.symbol || '');
+            if (!sym.endsWith('USDT')) continue;
+            const entryPrice = Number(p.entryPrice || 0);
+            if (!(entryPrice > 0)) continue;
+            const liveTick = getLiveWsTicker(sym);
+            const markPrice = Number(p.markPrice || liveTick?.markPrice || entryPrice);
+            const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
+            const posSide = String(p.positionSide || '').toUpperCase();
+            const isShort = posSide === 'SHORT' || rawAmt < 0;
+            const notional = size * entryPrice;
+            const isolatedWallet = Number(p.isolatedWallet || 0);
+            const marginUsdt =
+              isolatedWallet > 0
+                ? Number(isolatedWallet.toFixed(2))
+                : Number((notional / lev).toFixed(2));
+            const uTime = Number(p.updateTime || Date.now());
+            const posItem: ExchangePositionItem = {
+              pair: symbolToFreqtradePair(sym),
+              symbol: sym,
+              is_short: isShort,
+              size,
+              entry_price: entryPrice,
+              mark_price: markPrice > 0 ? markPrice : entryPrice,
+              leverage: lev,
+              margin_usdt: marginUsdt,
+              unrealized_pnl: Number(p.unRealizedProfit ?? p.unrealizedProfit ?? 0),
+              created_time: uTime,
+              updated_time: uTime,
+            };
+            positions.push(posItem);
+            subscribePairKlineStream(posItem.pair, '1h');
+          }
+          const netLabel = baseUrl.includes('testnet')
+            ? 'Binance Futures Testnet'
+            : 'Binance USDⓈ-M Mainnet';
+          const isTestnetHost = baseUrl.includes('testnet');
+          binancePositionsCache.set(cleanKey, {
+            timestamp: Date.now(),
+            positions,
+            network_label: netLabel,
+            is_testnet: isTestnetHost,
+          });
+          ensureBinancePrivateUserStream(cleanKey, cleanSecret, baseUrl).catch(() => {});
+          return {
+            success: true,
+            positions,
+            network_label: netLabel,
+            is_testnet: isTestnetHost,
+          };
         }
       } catch {
         // try next host
@@ -3522,11 +3758,21 @@ export async function fetchExchangeClosedPnl(
     return { success: false, closed: [] };
   }
 
-  // 2. BINANCE USDT-M FUTURES (/fapi/v1/income?incomeType=REALIZED_PNL + кэшируемый /fapi/v1/userTrades)
+  // 2. BINANCE USDT-M FUTURES (WebSocket ORDER_TRADE_UPDATE + кэш 10 мин, чтобы не вызывать /fapi/v1/income каждые 30 сек)
   if (creds.exchange === 'binance') {
+    const liveWsState = getWsAccountLiveState(cleanKey, 600_000);
     const cachedClosed = binanceClosedPnlCache.get(cleanKey);
-    if (cachedClosed && Date.now() - cachedClosed.timestamp < 180_000) {
-      return { success: true, closed: cachedClosed.closed };
+    if (cachedClosed && Date.now() - cachedClosed.timestamp < 600_000) {
+      const merged = [
+        ...(liveWsState?.closedPnl || []),
+        ...cachedClosed.closed.filter(
+          (c) => !(liveWsState?.closedPnl || []).some((w) => w.order_id === c.order_id)
+        ),
+      ];
+      return { success: true, closed: merged };
+    }
+    if (liveWsState && liveWsState.closedPnl.length > 0) {
+      return { success: true, closed: liveWsState.closedPnl };
     }
 
     const candidateHosts = getBinanceCandidateHosts(cleanKey, creds.isTestnet);
@@ -4016,5 +4262,222 @@ export async function fetchExchangeClosedPnl(
 
   return { success: false, closed: [] };
 }
+
+/**
+ * Выставляет или обновляет биржевой ордер Take-Profit напрямую на позиции биржи (Bybit V5 /v5/position/trading-stop, Binance /fapi/v1/order TAKE_PROFIT_MARKET).
+ * Обеспечивает закрытие позиции на стороне биржи без сетевой задержки и расхождения цен.
+ */
+export async function placeOrUpdateExchangeTakeProfitOrder(
+  creds: ExchangeCredentials,
+  params: {
+    pair: string;
+    isShort: boolean;
+    quantity: number;
+    takeProfitPrice: number;
+  }
+): Promise<{
+  success: boolean;
+  exchange: string;
+  symbol: string;
+  take_profit_price: number;
+  message?: string;
+}> {
+  const cleanKey = sanitizeCredentialString(creds.apiKey);
+  const cleanSecret = sanitizeCredentialString(creds.apiSecret);
+  const symbol = String(params.pair || '')
+    .toUpperCase()
+    .split(':')[0]
+    .replace(/[^A-Z0-9]/g, '');
+  const tpNum = Number(params.takeProfitPrice || 0);
+
+  if (!cleanKey || !cleanSecret || !(tpNum > 0)) {
+    return {
+      success: false,
+      exchange: creds.exchange,
+      symbol,
+      take_profit_price: tpNum,
+      message: 'Invalid credentials or takeProfitPrice',
+    };
+  }
+
+  // Форматируем цену TP с разумной точностью для биржи
+  const formatTpPriceStr = (price: number): string => {
+    if (price >= 1000) return price.toFixed(2);
+    if (price >= 10) return price.toFixed(3);
+    if (price >= 1) return price.toFixed(4);
+    if (price >= 0.01) return price.toFixed(5);
+    return price.toFixed(6);
+  };
+  const formattedTp = formatTpPriceStr(tpNum);
+
+  // 1. BYBIT V5 (/v5/position/trading-stop)
+  if (creds.exchange === 'bybit') {
+    const candidateHosts = getBybitCandidateHosts(cleanKey, creds.isTestnet);
+    for (const baseUrl of candidateHosts) {
+      try {
+        const sendBybitTradingStop = async (positionIdx: 0 | 1 | 2) => {
+          const timestamp = await getBybitTimestamp(baseUrl, false);
+          const recvWindow = '15000';
+          const bodyObj = {
+            category: 'linear',
+            symbol,
+            takeProfit: formattedTp,
+            tpTriggerBy: 'MarkPrice',
+            tpslMode: 'Full',
+            tpOrderType: 'Market',
+            positionIdx,
+          };
+          const bodyStr = JSON.stringify(bodyObj);
+          const signature = signBybitV5(timestamp, cleanKey, recvWindow, bodyStr, cleanSecret);
+          return makeHttpsRequest(`${baseUrl}/v5/position/trading-stop`, {
+            method: 'POST',
+            headers: {
+              'X-BAPI-API-KEY': cleanKey,
+              'X-BAPI-TIMESTAMP': timestamp,
+              'X-BAPI-SIGN': signature,
+              'X-BAPI-RECV-WINDOW': recvWindow,
+              'Content-Type': 'application/json',
+            },
+            body: bodyStr,
+            timeoutMs: 6000,
+          });
+        };
+
+        let res = await sendBybitTradingStop(0);
+        if (res.statusCode === 200) {
+          let json = JSON.parse(res.data);
+          // Если аккаунт Bybit в Hedge Mode (retCode 10001: positionIdx not match position mode)
+          if (json.retCode === 10001) {
+            const hedgeIdx: 1 | 2 = params.isShort ? 2 : 1;
+            const retryRes = await sendBybitTradingStop(hedgeIdx);
+            if (retryRes.statusCode === 200) {
+              json = JSON.parse(retryRes.data);
+            }
+          }
+          // retCode 0 = успех, retCode 34040 = "not modified" (уже стоит такой же TP)
+          if (json.retCode === 0 || json.retCode === 34040) {
+            bybitHostCache.set(cleanKey, baseUrl);
+            return {
+              success: true,
+              exchange: 'bybit',
+              symbol,
+              take_profit_price: Number(formattedTp),
+              message: `Bybit TP установлен: ${formattedTp}`,
+            };
+          }
+          if (json.retCode === 10003 || json.retCode === 10004) {
+            continue;
+          }
+          return {
+            success: false,
+            exchange: 'bybit',
+            symbol,
+            take_profit_price: Number(formattedTp),
+            message: `Bybit TP [${json.retCode}]: ${json.retMsg}`,
+          };
+        }
+      } catch {
+        // ignore and try next host
+      }
+    }
+    return {
+      success: false,
+      exchange: 'bybit',
+      symbol,
+      take_profit_price: Number(formattedTp),
+    };
+  }
+
+  // 2. BINANCE USDⓈ-M FUTURES (WebSocket API ws-fapi order.place TAKE_PROFIT_MARKET + REST fallback)
+  if (creds.exchange === 'binance') {
+    const candidateHosts = getBinanceCandidateHosts(cleanKey, creds.isTestnet);
+    for (const baseUrl of candidateHosts) {
+      try {
+        const dualSide = await getBinanceDualSideMode(cleanKey, cleanSecret, false, baseUrl);
+        const timestamp = await getBinanceTimestamp(false, baseUrl);
+        const side = params.isShort ? 'BUY' : 'SELL';
+
+        // Сначала выставляем TAKE_PROFIT_MARKET через WebSocket API (ws-fapi/v1) без лимитов веса!
+        const wsRpc = getBinanceWsRpcClient(baseUrl);
+        const wsTpParams: Record<string, string | number> = {
+          apiKey: cleanKey,
+          symbol,
+          side,
+          type: 'TAKE_PROFIT_MARKET',
+          stopPrice: formattedTp,
+          closePosition: 'true',
+          workingType: 'MARK_PRICE',
+          timestamp,
+          recvWindow: 10000,
+        };
+        if (dualSide) {
+          wsTpParams.positionSide = params.isShort ? 'SHORT' : 'LONG';
+        }
+        const wsTpRes = await wsRpc.request('order.place', wsTpParams, cleanSecret, 5500);
+        if (wsTpRes.status === 200) {
+          binanceHostCache.set(cleanKey, baseUrl);
+          return {
+            success: true,
+            exchange: 'binance',
+            symbol,
+            take_profit_price: Number(formattedTp),
+            message: `Binance TP установлен [WS]: ${formattedTp}`,
+          };
+        }
+
+        if (isBinanceHostRateLimited(baseUrl).limited) continue;
+        const qp = new URLSearchParams({
+          symbol,
+          side,
+          type: 'TAKE_PROFIT_MARKET',
+          stopPrice: formattedTp,
+          closePosition: 'true',
+          workingType: 'MARK_PRICE',
+          timestamp: String(timestamp),
+          recvWindow: '10000',
+        });
+        if (dualSide) {
+          qp.set('positionSide', params.isShort ? 'SHORT' : 'LONG');
+        }
+        const query = qp.toString();
+        const sig = signBinanceFuturesQuery(query, cleanSecret);
+        const res = await makeHttpsRequest(`${baseUrl}/fapi/v1/order?${query}&signature=${sig}`, {
+          method: 'POST',
+          headers: {
+            'X-MBX-APIKEY': cleanKey,
+            'Content-Type': 'application/json',
+          },
+          timeoutMs: 6000,
+        });
+        if (res.statusCode === 200) {
+          binanceHostCache.set(cleanKey, baseUrl);
+          return {
+            success: true,
+            exchange: 'binance',
+            symbol,
+            take_profit_price: Number(formattedTp),
+            message: `Binance TP установлен: ${formattedTp}`,
+          };
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return {
+      success: false,
+      exchange: 'binance',
+      symbol,
+      take_profit_price: Number(formattedTp),
+    };
+  }
+
+  return {
+    success: true,
+    exchange: creds.exchange,
+    symbol,
+    take_profit_price: Number(formattedTp),
+  };
+}
+
 
 

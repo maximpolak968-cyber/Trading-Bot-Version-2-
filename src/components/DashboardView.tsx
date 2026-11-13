@@ -11,15 +11,24 @@ import {
   ArrowUpRight,
   ArrowDownRight,
 } from 'lucide-react';
-import { FreqtradeTrade, fmtComma, ExchangeAccount, BalanceResponse } from '../types/frequi';
+import {
+  FreqtradeTrade,
+  fmtComma,
+  ExchangeAccount,
+  BalanceResponse,
+  DailyRecord,
+} from '../types/frequi';
 import { ProfitPill } from './ProfitPill';
 
 interface DashboardViewProps {
   openTrades?: FreqtradeTrade[];
   closedTrades?: FreqtradeTrade[];
+  daily?: DailyRecord[];
   accounts?: ExchangeAccount[];
   balance?: BalanceResponse | null;
   botConfig?: any;
+  isOwner?: boolean;
+  onTogglePauseNewEntries?: () => Promise<void>;
   onJumpToPair: (pair: string) => void;
   onForceExit?: (tradeId: number) => void;
 }
@@ -34,14 +43,17 @@ function formatSmartNumber(val?: number): string {
 export const DashboardView: React.FC<DashboardViewProps> = ({
   openTrades = [],
   closedTrades = [],
+  daily = [],
   accounts = [],
   balance,
   botConfig,
+  isOwner = true,
+  onTogglePauseNewEntries,
   onJumpToPair,
   onForceExit,
 }) => {
   const [timePeriod, setTimePeriod] = useState<'Дни' | 'Недели' | 'Месяцы'>('Дни');
-  const [profitMode, setProfitMode] = useState<'Абс $' | 'Отн %'>('Отн %');
+  const [profitMode, setProfitMode] = useState<'Абс $' | 'Отн %'>('Абс $');
   const [binsCount, setBinsCount] = useState<'15' | '20' | '30'>('20');
 
   // 1. Live Account Balance and Equity Calculation (1:1 with Exchange API)
@@ -96,7 +108,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     startingBalance > 0 ? (closedProfitAbs / startingBalance) * 100 : 0;
 
   const isScalpTrade = (t: FreqtradeTrade) =>
-    !t.campaign_id && !String(t.enter_tag || '').toLowerCase().includes('hedge');
+    t.strategy !== 'GlobalHedgeStrategy' &&
+    !t.campaign_id &&
+    !String(t.enter_tag || '').toLowerCase().includes('hedge');
 
   const openScalpTrades = useMemo(() => openTrades.filter(isScalpTrade), [openTrades]);
   const openHedgeTrades = useMemo(
@@ -155,8 +169,23 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       : Math.max(0, currentEquity - openStakeSum);
   const marginUsagePct = walletBalance > 0 ? (openStakeSum / walletBalance) * 100 : 0;
 
-  // 5. Dynamic Time-based Profit aggregation (Days / Weeks / Months) from real chronological trades
+  // 5. Accurate Daily / Weekly / Monthly Realized Profit from strictly CLOSED trades
   const timeBasedData = useMemo(() => {
+    // If timePeriod === 'Дни' and backend /api/v1/daily returned records, use them or compute from closedTradesChronological
+    if (timePeriod === 'Дни' && daily && daily.length > 0) {
+      return daily.map((d) => ({
+        label: d.date,
+        pnlAbs: Number((d.abs_profit || 0).toFixed(2)),
+        pnlPct: Number(
+          (
+            d.rel_profit ??
+            (startingBalance > 0 ? ((d.abs_profit || 0) / startingBalance) * 100 : 0)
+          ).toFixed(2)
+        ),
+        count: d.trade_count || 0,
+      }));
+    }
+
     const map = new Map<string, { label: string; pnlAbs: number; pnlPct: number; count: number }>();
 
     for (const t of closedTradesChronological) {
@@ -175,22 +204,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       }
 
       const curr = map.get(key) || { label: key, pnlAbs: 0, pnlPct: 0, count: 0 };
-      const net = t.net_profit ?? t.profit_abs ?? 0;
-      curr.pnlAbs += net;
-      curr.pnlPct += startingBalance > 0 ? (net / startingBalance) * 100 : t.profit_pct || 0;
+      const net = Number(t.net_profit ?? t.profit_abs ?? 0);
+      curr.pnlAbs = Number((curr.pnlAbs + net).toFixed(2));
+      curr.pnlPct = Number(
+        (
+          startingBalance > 0
+            ? (curr.pnlAbs / startingBalance) * 100
+            : curr.pnlPct + (t.profit_pct || 0)
+        ).toFixed(2)
+      );
       curr.count += 1;
       map.set(key, curr);
-    }
-
-    // Include today's active open positions if they exist
-    if (openTrades.length > 0) {
-      const todayStr = new Date().toISOString().slice(0, 10);
-      const curr = map.get(todayStr) || { label: todayStr, pnlAbs: 0, pnlPct: 0, count: 0 };
-      curr.pnlAbs += openProfitAbs;
-      curr.pnlPct +=
-        startingBalance > 0 ? (openProfitAbs / startingBalance) * 100 : openProfitPct;
-      curr.count += openTrades.length;
-      map.set(todayStr, curr);
     }
 
     const items = Array.from(map.values()).sort((a, b) => a.label.localeCompare(b.label));
@@ -206,7 +230,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     }
 
     return items;
-  }, [closedTradesChronological, openTrades, openProfitAbs, openProfitPct, startingBalance, timePeriod]);
+  }, [closedTradesChronological, daily, startingBalance, timePeriod]);
 
   // 6. Cumulative Profit Points (chronological: 0 -> trade 1 -> trade 2 ... -> current)
   const cumulativePoints = useMemo(() => {
@@ -438,22 +462,42 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </div>
           </div>
 
-          {/* 6. Винрейт и автоматический режим 2 стратегий */}
+          {/* 6. Винрейт и управление новыми входами для владельца */}
           <div className="bg-[#191e26] border border-[#2b3340] rounded-[6px] p-2.5 flex flex-col justify-between">
             <div className="flex items-center justify-between text-[#94a3b8] text-[11px]">
-              <span className="font-medium">Винрейт / Авто-режим</span>
+              <span className="font-medium">Винрейт / Новые сделки</span>
               <Percent className="w-3.5 h-3.5 text-[#38bdf8]" />
             </div>
-            <div className="mt-1">
-              <div className="text-[17px] font-bold text-white tracking-tight font-mono">
-                {winRatePct.toFixed(0)}%{' '}
-                <span className="text-[11px] text-[#94a3b8]">
-                  ({winningTradesCount}В / {losingTradesCount}П)
-                </span>
+            <div className="mt-1 flex items-center justify-between gap-2">
+              <div>
+                <div className="text-[16px] font-bold text-white tracking-tight font-mono">
+                  {winRatePct.toFixed(0)}%{' '}
+                  <span className="text-[10px] text-[#94a3b8]">
+                    ({winningTradesCount}В/{losingTradesCount}П)
+                  </span>
+                </div>
+                <div className="text-[10px] text-[#38bdf8] font-medium mt-0.5 truncate">
+                  2 стратегии: Скальп + 2-Way
+                </div>
               </div>
-              <div className="text-[10px] text-[#38bdf8] font-medium mt-0.5 truncate" title="Авто: 1) Скальпинг (TP 0.8-1.5%) ➔ 2) Вход в 2 стороны">
-                Авто: 1H Скальп + 2-Way Хедж
-              </div>
+              {isOwner && onTogglePauseNewEntries && (
+                <button
+                  type="button"
+                  onClick={onTogglePauseNewEntries}
+                  className={`px-2 py-1 rounded text-[10px] font-semibold border transition-colors shrink-0 ${
+                    botConfig?.pause_new_entries
+                      ? 'bg-amber-500/20 border-amber-500/60 text-amber-300 hover:bg-amber-500/30'
+                      : 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300 hover:bg-emerald-500/30'
+                  }`}
+                  title={
+                    botConfig?.pause_new_entries
+                      ? 'Новые сделки остановлены. Нажмите, чтобы разрешить новые входы'
+                      : 'Нажмите, чтобы остановить открытие новых сделок (DCA и TP текущих продолжат работать)'
+                  }
+                >
+                  {botConfig?.pause_new_entries ? '⏸ Без новых' : '▶ Входы ВКЛ'}
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -471,7 +515,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div className="lg:col-span-7 border-r border-[#242b35] bg-[#12151b] flex flex-col">
             <div className="bg-[#181d24] border-b border-[#242b35] py-2 px-3 flex flex-wrap items-center justify-between gap-2 text-[13px] font-medium text-[#e2e8f0]">
               <div className="flex items-center gap-2">
-                <span>Реальная доходность стратегий ({botName})</span>
+                <span>Раздельные стратегии ({botName} · Top-Down 1D ➔ 4H)</span>
                 <span className="px-1.5 py-0.2 rounded bg-[#0284c7]/20 border border-[#0284c7]/40 text-[#38bdf8] text-[10px]">
                   {ownerAccount
                     ? ownerAccount.network_label ||
@@ -488,11 +532,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <table className="w-full text-left border-collapse text-[12px]">
                 <thead>
                   <tr className="border-b border-[#242b35] text-[#94a3b8] font-semibold text-[11px]">
-                    <th className="py-2 px-3">Стратегия / Контур</th>
+                    <th className="py-2 px-3">Отдельная стратегия</th>
                     <th className="py-2 px-3">Откр. / Закр.</th>
                     <th className="py-2 px-3">Плавающий PnL</th>
                     <th className="py-2 px-3">Чистый закр. PnL</th>
-                    <th className="py-2 px-3">Текущий капитал</th>
+                    <th className="py-2 px-3">Горизонт и DCA</th>
                     <th className="py-2 px-3">Винрейт</th>
                   </tr>
                 </thead>
@@ -500,7 +544,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <tr>
                     <td className="py-2.5 px-3 font-medium text-white flex items-center gap-1.5">
                       <span className="w-2 h-2 rounded-full bg-[#10b981]" />
-                      <span>1H Скальпинг (Отбой от 4H уровней)</span>
+                      <span>ScalpingStrategy (Лонг/Шорт от глобальных уровней 1D/4H)</span>
                     </td>
                     <td className="py-2.5 px-3 font-mono">
                       <span className="text-[#10b981] font-semibold">{openScalpTrades.length}</span>
@@ -519,7 +563,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                         {fmtComma(scalpClosedPnl, 2)} $
                       </span>
                     </td>
-                    <td className="py-2.5 px-3 font-mono text-[#94a3b8]">TP 0.8%–1.5%</td>
+                    <td className="py-2.5 px-3 font-mono text-[#94a3b8]">Краткосрок · DCA по хаям/лоям</td>
                     <td className="py-2.5 px-3 font-mono text-[#10b981]">
                       {closedScalpTrades.filter((t) => (t.net_profit ?? t.profit_abs ?? 0) > 0).length}В /{' '}
                       {closedScalpTrades.filter((t) => (t.net_profit ?? t.profit_abs ?? 0) <= 0).length}П
@@ -529,7 +573,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <tr>
                     <td className="py-2.5 px-3 font-medium text-white flex items-center gap-1.5">
                       <span className="w-2 h-2 rounded-full bg-[#38bdf8]" />
-                      <span>4H Вход в 2 стороны (LONG + SHORT Хедж)</span>
+                      <span>GlobalHedgeStrategy (2-сторонние сделки: Среднесрок / Долгосрок)</span>
                     </td>
                     <td className="py-2.5 px-3 font-mono">
                       <span className="text-[#38bdf8] font-semibold">{openHedgeTrades.length}</span>
@@ -548,7 +592,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                         {fmtComma(hedgeClosedPnl, 2)} $
                       </span>
                     </td>
-                    <td className="py-2.5 px-3 font-mono text-[#94a3b8]">Канал 4H + DCA</td>
+                    <td className="py-2.5 px-3 font-mono text-[#94a3b8]">Среднесрок 4H / Долгосрок 1D</td>
                     <td className="py-2.5 px-3 font-mono text-[#10b981]">
                       {closedHedgeTrades.filter((t) => (t.net_profit ?? t.profit_abs ?? 0) > 0).length}В /{' '}
                       {closedHedgeTrades.filter((t) => (t.net_profit ?? t.profit_abs ?? 0) <= 0).length}П
@@ -582,10 +626,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </div>
           </div>
 
-          {/* Справа: Прибыль по времени (5 колонок) */}
+          {/* Справа: Прибыль по дням (5 колонок) */}
           <div className="lg:col-span-5 bg-[#12151b] flex flex-col">
             <div className="bg-[#181d24] border-b border-[#242b35] py-2 px-3 flex items-center justify-between text-[13px] font-medium text-[#e2e8f0]">
-              <span>Прибыль по времени</span>
+              <span>Прибыль по дням (Закрытые сделки)</span>
               <div className="flex items-center gap-2">
                 {/* Переключатели периода */}
                 <div className="inline-flex rounded-[4px] overflow-hidden border border-[#2b3340]">
@@ -660,9 +704,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     const x = 70 + (i * 410) / Math.max(1, totalItems - 1 || 1);
                     const val = profitMode === 'Абс $' ? d.pnlAbs : d.pnlPct;
                     const zeroY = 100;
-                    const scale = 14;
-                    const barH = Math.min(60, d.count * 15);
-                    const lineY = Math.max(30, Math.min(160, zeroY - val * scale));
+                    const maxAbsVal = Math.max(
+                      1,
+                      ...timeBasedData.map((item) =>
+                        Math.abs(profitMode === 'Абс $' ? item.pnlAbs : item.pnlPct)
+                      )
+                    );
+                    const scale = 55 / maxAbsVal;
+                    const barH = Math.min(60, d.count * 12);
+                    const lineY = Math.max(28, Math.min(162, zeroY - val * scale));
 
                     return (
                       <g key={i}>
@@ -705,13 +755,51 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                           textAnchor="middle"
                         >
                           {val >= 0 ? '+' : ''}
-                          {val.toFixed(1)}
+                          {val.toFixed(2)}
                           {profitMode === 'Абс $' ? '$' : '%'}
                         </text>
                       </g>
                     );
                   })}
                 </svg>
+              </div>
+
+              {/* Таблица детализации прибыли по дням */}
+              <div className="mt-2 border-t border-[#1e242d] pt-2 max-h-[115px] overflow-y-auto">
+                <table className="w-full text-left border-collapse text-[11px]">
+                  <thead>
+                    <tr className="text-[#94a3b8] border-b border-[#1e242d]">
+                      <th className="py-1 px-2">Период</th>
+                      <th className="py-1 px-2 text-right">Чистый PnL ($)</th>
+                      <th className="py-1 px-2 text-right">К депо (%)</th>
+                      <th className="py-1 px-2 text-right">Закр. сделок</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#1e242d] font-mono">
+                    {[...timeBasedData].reverse().map((row) => (
+                      <tr key={row.label} className="hover:bg-[#181d24]">
+                        <td className="py-1 px-2 text-[#cbd5e1]">{row.label}</td>
+                        <td
+                          className={`py-1 px-2 text-right font-semibold ${
+                            row.pnlAbs >= 0 ? 'text-[#10b981]' : 'text-[#ef4444]'
+                          }`}
+                        >
+                          {row.pnlAbs >= 0 ? '+' : ''}
+                          {fmtComma(row.pnlAbs, 2)} $
+                        </td>
+                        <td
+                          className={`py-1 px-2 text-right ${
+                            row.pnlPct >= 0 ? 'text-[#10b981]' : 'text-[#ef4444]'
+                          }`}
+                        >
+                          {row.pnlPct >= 0 ? '+' : ''}
+                          {fmtComma(row.pnlPct, 2)}%
+                        </td>
+                        <td className="py-1 px-2 text-right text-[#94a3b8]">{row.count}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             </div>
           </div>

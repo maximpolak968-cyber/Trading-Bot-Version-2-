@@ -332,10 +332,21 @@ export const TradeView: React.FC<TradeViewProps> = ({
                 <button
                   type="button"
                   onClick={() => onBotCommand('stopbuy')}
-                  title="Пауза (запретить новые входы)"
-                  className="w-6 h-6 flex items-center justify-center rounded-[3px] bg-[#21252b] hover:bg-[#2c323a] border border-[#383e48] text-[#cfd6df]"
+                  title={
+                    botConfig?.pause_new_entries
+                      ? 'Новые сделки остановлены (DCA и TP текущих активны). Нажмите, чтобы снова разрешить открытие новых сделок'
+                      : 'Остановить открытие новых сделок (бот продолжит усреднять DCA и закрывать в плюс текущие позиции)'
+                  }
+                  className={`px-1.5 h-6 flex items-center gap-1 rounded-[3px] border text-[10px] font-semibold transition-colors ${
+                    botConfig?.pause_new_entries
+                      ? 'bg-amber-500/25 border-amber-500 text-amber-300'
+                      : 'bg-[#21252b] hover:bg-[#2c323a] border-[#383e48] text-[#cfd6df]'
+                  }`}
                 >
                   <Pause className="w-3 h-3 fill-current" />
+                  <span className="hidden xl:inline">
+                    {botConfig?.pause_new_entries ? 'Без новых' : 'Стоп вход'}
+                  </span>
                 </button>
                 <button
                   type="button"
@@ -1159,23 +1170,29 @@ export const TradeView: React.FC<TradeViewProps> = ({
                         <span className="text-[#8b949e]">Статус:</span>
                         <span className="uppercase text-emerald-400">
                           {botConfig?.state === 'running'
-                            ? 'Работает'
+                            ? botConfig?.pause_new_entries
+                              ? 'Работает (Без новых входов · Только DCA/TP)'
+                              : 'Работает (Анализ 1D➔4H + Входы)'
                             : botConfig?.state === 'paused'
                             ? 'Пауза'
                             : 'Остановлен'}
                         </span>
                       </div>
                       <div className="flex justify-between py-1 border-b border-[#2b3036]">
-                        <span className="text-[#8b949e]">Таймфрейм:</span>
-                        <span>{timeframe}</span>
+                        <span className="text-[#8b949e]">Активные стратегии:</span>
+                        <span className="text-[#38bdf8]">ScalpingStrategy + GlobalHedgeStrategy</span>
                       </div>
                       <div className="flex justify-between py-1 border-b border-[#2b3036]">
-                        <span className="text-[#8b949e]">Стоп-лосс:</span>
-                        <span>{(botConfig?.stoploss ?? -0.03) * 100}%</span>
+                        <span className="text-[#8b949e]">Таймфрейм анализа:</span>
+                        <span>1D ➔ 4H ➔ {timeframe}</span>
+                      </div>
+                      <div className="flex justify-between py-1 border-b border-[#2b3036]">
+                        <span className="text-[#8b949e]">Защита от минуса:</span>
+                        <span className="text-emerald-400">Zero-Loss Guard (Строго в +)</span>
                       </div>
                       <div className="flex justify-between py-1 border-b border-[#2b3036]">
                         <span className="text-[#8b949e]">Макс. открытых сделок:</span>
-                        <span>{botConfig?.max_open_trades ?? 5}</span>
+                        <span>{botConfig?.max_open_trades ?? 30}</span>
                       </div>
                     </div>
                   )}
@@ -1230,20 +1247,44 @@ export const TradeView: React.FC<TradeViewProps> = ({
                         <thead>
                           <tr className="border-b border-[#2b3036] text-[#8b949e]">
                             <th className="py-1.5 px-2">Дата</th>
-                            <th className="py-1.5 px-2 text-right">Прибыль ($)</th>
-                            <th className="py-1.5 px-2 text-right">Сделок</th>
+                            <th className="py-1.5 px-2 text-right">Чистая прибыль ($)</th>
+                            <th className="py-1.5 px-2 text-right">К депо %</th>
+                            <th className="py-1.5 px-2 text-right">Закр. сделок</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-[#2b3036]">
-                          {daily.map((d) => (
-                            <tr key={d.date}>
-                              <td className="py-1.5 px-2 font-mono">{d.date}</td>
-                              <td className="py-1.5 px-2 text-right font-mono">
-                                {fmtComma(d.abs_profit, 2)} $
+                          {daily.length === 0 ? (
+                            <tr>
+                              <td colSpan={4} className="py-4 text-center text-[#8b949e]">
+                                Пока нет закрытых сделок бота за выбранные дни
                               </td>
-                              <td className="py-1.5 px-2 text-right font-mono">{d.trade_count}</td>
                             </tr>
-                          ))}
+                          ) : (
+                            [...daily].reverse().map((d) => (
+                              <tr key={d.date}>
+                                <td className="py-1.5 px-2 font-mono">{d.date}</td>
+                                <td
+                                  className={`py-1.5 px-2 text-right font-mono font-semibold ${
+                                    d.abs_profit >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                                  }`}
+                                >
+                                  {d.abs_profit >= 0 ? '+' : ''}
+                                  {fmtComma(d.abs_profit, 2)} $
+                                </td>
+                                <td
+                                  className={`py-1.5 px-2 text-right font-mono ${
+                                    (d.rel_profit || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                                  }`}
+                                >
+                                  {(d.rel_profit || 0) >= 0 ? '+' : ''}
+                                  {fmtComma(d.rel_profit || 0, 2)}%
+                                </td>
+                                <td className="py-1.5 px-2 text-right font-mono">
+                                  {d.trade_count}
+                                </td>
+                              </tr>
+                            ))
+                          )}
                         </tbody>
                       </table>
                     </div>

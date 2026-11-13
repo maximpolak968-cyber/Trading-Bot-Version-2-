@@ -13,6 +13,7 @@ import {
   isHedgeEntryCandidate,
   checkBtcMarketHealth,
   evaluateScalpingStrategy,
+  evaluateGlobalHedgeStrategy,
   canExecuteDca,
   calculateDynamicDcaAmount,
   checkCandleRejection,
@@ -26,6 +27,7 @@ import {
   testExchangeConnection,
   calculateClientProportionalOrder,
   executeExchangeFuturesOrder,
+  placeOrUpdateExchangeTakeProfitOrder,
   isSimulatedTestApiKey,
   getExchangeTakerFeeRate,
   fetchExchangeOpenPositions,
@@ -37,6 +39,15 @@ import {
   ExchangeOrderParams,
   PlacedOrderResult,
 } from './src/bot/exchangeConnector.ts';
+import {
+  startPublicMarketWebSockets,
+  subscribePairKlineStream,
+  onWsTickerUpdate,
+  onWsKlineUpdate,
+  onWsAccountUpdate,
+  getAllLiveWsTickers,
+  getWebSocketEngineStatus,
+} from './src/bot/exchangeWebSocket.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -140,6 +151,66 @@ function pairToBinanceSymbol(pair: string): string {
 const candleCache = new Map<string, { timestamp: number; candles: RawCandle[]; source: string }>();
 const tickerCache = new Map<string, { price: number; change24h: number; volume24h: number; high24h: number; low24h: number; updatedAt: number }>();
 
+// Подключаем живые WebSocket-потоки тикеров и свечей (Bybit V5 Linear WS + Binance Market WS):
+// обновляем tickerCache и свечи в candleCache в реальном времени без единого REST-запроса!
+onWsTickerUpdate((wsTick) => {
+  tickerCache.set(wsTick.pair, {
+    price: wsTick.price,
+    change24h: wsTick.change24h,
+    volume24h: wsTick.volume24h,
+    high24h: wsTick.high24h,
+    low24h: wsTick.low24h,
+    updatedAt: wsTick.updatedAt,
+  });
+
+  // Обновляем закрытие последней свечи в кэше для этой пары в реальном времени
+  for (const [key, entry] of candleCache.entries()) {
+    if (key.startsWith(`${wsTick.pair}_`) && key.endsWith('_latest') && entry.candles.length > 0) {
+      const last = entry.candles[entry.candles.length - 1];
+      last.close = wsTick.price;
+      if (wsTick.price > last.high) last.high = wsTick.price;
+      if (wsTick.price < last.low) last.low = wsTick.price;
+      entry.timestamp = Date.now();
+    }
+  }
+});
+
+onWsKlineUpdate((wsKline) => {
+  const barTsMs = wsKline.time * 1000;
+  for (const [key, entry] of candleCache.entries()) {
+    if (
+      key.startsWith(`${wsKline.pair}_${wsKline.interval}_`) &&
+      key.endsWith('_latest') &&
+      entry.candles.length > 0
+    ) {
+      const last = entry.candles[entry.candles.length - 1];
+      if (last.timestamp === barTsMs) {
+        last.open = wsKline.open;
+        last.high = Math.max(last.high, wsKline.high);
+        last.low = Math.min(last.low, wsKline.low);
+        last.close = wsKline.close;
+        last.volume = wsKline.volume;
+      } else if (barTsMs > last.timestamp) {
+        entry.candles.push({
+          timestamp: barTsMs,
+          open: wsKline.open,
+          high: wsKline.high,
+          low: wsKline.low,
+          close: wsKline.close,
+          volume: wsKline.volume,
+        });
+        if (entry.candles.length > 1000) {
+          entry.candles.shift();
+        }
+      }
+      entry.timestamp = Date.now();
+      if (!entry.source.includes('[WS')) {
+        entry.source = `${entry.source} [WS Live]`;
+      }
+    }
+  }
+});
+
 async function fetchWithTimeout(url: string, timeoutMs = 6000): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -157,8 +228,44 @@ async function fetchWithTimeout(url: string, timeoutMs = 6000): Promise<Response
 }
 
 async function fetchAllMarketPairs(): Promise<string[]> {
-  if (marketPairsCache.pairs.length > PINNED_PAIRS.length && Date.now() - marketPairsCache.timestamp < 60_000) {
+  if (marketPairsCache.pairs.length > PINNED_PAIRS.length && Date.now() - marketPairsCache.timestamp < 120_000) {
     return marketPairsCache.pairs;
+  }
+
+  // 0. Сначала используем живые данные из WebSocket-потока (!miniTicker@arr / tickers.*), если уже получено >= 25 пар — 0 REST запросов!
+  const wsTickers = getAllLiveWsTickers();
+  if (wsTickers.length >= 25) {
+    const validWs = wsTickers
+      .filter((t) => {
+        const base = t.symbol.slice(0, -4);
+        if (!base || EXCLUDED_BASE_ASSETS.has(base)) return false;
+        if (
+          base.endsWith('UP') ||
+          base.endsWith('DOWN') ||
+          base.endsWith('BULL') ||
+          base.endsWith('BEAR')
+        ) {
+          return false;
+        }
+        return t.price > 0 && t.volume24h > 100_000;
+      })
+      .sort((a, b) => b.volume24h - a.volume24h);
+
+    if (validWs.length >= 15) {
+      const discoveredPairs: string[] = [...PINNED_PAIRS];
+      const seen = new Set<string>(PINNED_PAIRS);
+      for (const t of validWs) {
+        if (!seen.has(t.pair)) {
+          seen.add(t.pair);
+          discoveredPairs.push(t.pair);
+        }
+      }
+      marketPairsCache = {
+        timestamp: Date.now(),
+        pairs: discoveredPairs,
+      };
+      return discoveredPairs;
+    }
   }
 
   const endpoints = [
@@ -228,8 +335,54 @@ let volatilePairsCache: { timestamp: number; pairs: string[] } = {
 };
 
 async function fetchTopVolatileFuturesPairs(minVolumeUsdt = 50_000_000): Promise<string[]> {
-  if (volatilePairsCache.pairs.length > PINNED_PAIRS.length && Date.now() - volatilePairsCache.timestamp < 60_000) {
+  if (volatilePairsCache.pairs.length > PINNED_PAIRS.length && Date.now() - volatilePairsCache.timestamp < 120_000) {
     return volatilePairsCache.pairs;
+  }
+
+  // 0. Сначала используем живые данные из WebSocket-потока (!miniTicker@arr / tickers.*), если уже получено >= 25 пар — 0 REST запросов!
+  const wsTickers = getAllLiveWsTickers();
+  if (wsTickers.length >= 25) {
+    const volatileWs = wsTickers
+      .filter((t) => {
+        const base = t.symbol.slice(0, -4);
+        if (!base || EXCLUDED_BASE_ASSETS.has(base)) return false;
+        if (
+          base.endsWith('UP') ||
+          base.endsWith('DOWN') ||
+          base.endsWith('BULL') ||
+          base.endsWith('BEAR')
+        ) {
+          return false;
+        }
+        return t.volume24h >= minVolumeUsdt && t.price > 0;
+      })
+      .map((t) => {
+        const swingPct = t.low24h > 0 ? ((t.high24h - t.low24h) / t.low24h) * 100 : Math.abs(t.change24h);
+        return { pair: t.pair, swingPct, volume: t.volume24h };
+      })
+      .sort((a, b) => b.swingPct - a.swingPct);
+
+    if (volatileWs.length >= 10) {
+      const result: string[] = [];
+      const seen = new Set<string>();
+      for (const item of volatileWs) {
+        if (!seen.has(item.pair)) {
+          seen.add(item.pair);
+          result.push(item.pair);
+        }
+      }
+      for (const p of PINNED_PAIRS) {
+        if (!seen.has(p)) {
+          seen.add(p);
+          result.push(p);
+        }
+      }
+      volatilePairsCache = {
+        timestamp: Date.now(),
+        pairs: result,
+      };
+      return result;
+    }
   }
 
   // 1. Try Bybit V5 Linear USDT Perpetual Futures first (fast, unblocked globally, pure USDT-M futures)
@@ -396,14 +549,36 @@ async function fetchRealCandles(
     '1w': '1w',
   };
   const interval = validIntervals[normTf] || '1h';
+  if (!endTime) {
+    subscribePairKlineStream(pair, interval);
+  }
   const cacheKey = `${pair}_${interval}_${safeLimit}_${endTime || 'latest'}`;
   const cached = candleCache.get(cacheKey);
+  // Поскольку живые свечи обновляются в реальном времени по WebSocket, увеличиваем TTL кэша, чтобы не дёргать REST
   const candleTtlMs =
     interval === '1d' || interval === '1w' || interval === '4h' || interval === '6h' || interval === '12h'
-      ? 45_000
-      : 12_000;
+      ? 300_000
+      : 90_000;
   if (cached && Date.now() - cached.timestamp < candleTtlMs) {
     return { candles: cached.candles, source: cached.source };
+  }
+
+  // Если в candleCache уже есть более длинная история по этой же паре и таймфрейму (например, 500 или 1000 свечей),
+  // возвращаем срез последних safeLimit свечей из неё без повторного HTTP REST-запроса!
+  if (!endTime) {
+    for (const [k, v] of candleCache.entries()) {
+      if (
+        k.startsWith(`${pair}_${interval}_`) &&
+        k.endsWith('_latest') &&
+        v.candles.length >= safeLimit &&
+        Date.now() - v.timestamp < candleTtlMs
+      ) {
+        return {
+          candles: v.candles.slice(-safeLimit),
+          source: v.source,
+        };
+      }
+    }
   }
 
   const symbol = pairToBinanceSymbol(pair);
@@ -1074,34 +1249,37 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     return;
   }
 
-  const dist1 = (trade.dca_count || 0) > 0 ? 0.02 : 0.015;
+  // Минимальная структурная дистанция до уровней усреднения (по предыдущим максимумам/минимумам 4H/1D, не рядом со входом!)
+  const dist1 = (trade.dca_count || 0) > 0 ? 0.035 : 0.032;
   const baseStake = trade.initial_stake || trade.stake_amount || scalpBotConfig.stake_amount;
   const nextStep1 = (trade.dca_count || 0) + 1;
   const nextStep2 = (trade.dca_count || 0) + 2;
 
-  // Проверяем, является ли автоматический уровень адекватным (не дальше 20% от цены входа, чтобы исключить старые уровни вроде 0.027629 при пампе 0.26491)
+  // Проверяем, является ли автоматический уровень адекватным: минимум 2.2% от цены входа (чтобы не усреднять вплотную ко входу) и не дальше 25%
   const isReasonableAutoDca = (p: number) => {
     if (!(p > 0)) return false;
     if (trade.is_short && p <= openRate) return false;
     if (!trade.is_short && p >= openRate) return false;
     const distPct = (Math.abs(p - openRate) / openRate) * 100;
-    return distPct >= 0.3 && distPct <= 20.0;
+    return distPct >= 2.2 && distPct <= 25.0;
   };
 
   if (resetLevels || !Array.isArray(trade.planned_dca_levels) || trade.planned_dca_levels.length === 0) {
     const prevLevels = Array.isArray(trade.planned_dca_levels) ? trade.planned_dca_levels : [];
     const prevManualStep1 = prevLevels.find((l) => l.step === nextStep1 && l.manual_override);
     const prevManualStep2 = prevLevels.find((l) => l.step === nextStep2 && l.manual_override);
-
-    const isValidManualSide = (p: number) =>
-      p > 0 && (trade.is_short ? p > openRate : p < openRate);
+    const prevAutoStep1 = prevLevels.find((l) => l.step === nextStep1 && !l.manual_override);
+    const prevAutoStep2 = prevLevels.find((l) => l.step === nextStep2 && !l.manual_override);
 
     let dcaPrice1: number;
     let isManual1 = false;
-    if (prevManualStep1 && isValidManualSide(prevManualStep1.price)) {
+    if (!resetLevels && prevManualStep1 && prevManualStep1.price > 0) {
       dcaPrice1 = roundPrice(prevManualStep1.price);
       isManual1 = true;
-    } else if (trade.dca_manual_override && !resetLevels && trade.next_dca_price && isValidManualSide(trade.next_dca_price)) {
+    } else if (!resetLevels && prevAutoStep1 && prevAutoStep1.price > 0) {
+      dcaPrice1 = roundPrice(prevAutoStep1.price);
+      isManual1 = false;
+    } else if (!resetLevels && trade.dca_manual_override && trade.next_dca_price && trade.next_dca_price > 0) {
       dcaPrice1 = roundPrice(trade.next_dca_price);
       isManual1 = true;
     } else if (trade.next_dca_price && isReasonableAutoDca(trade.next_dca_price)) {
@@ -1113,13 +1291,12 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
 
     let dcaPrice2: number;
     let isManual2 = false;
-    if (
-      prevManualStep2 &&
-      prevManualStep2.price > 0 &&
-      (trade.is_short ? prevManualStep2.price > dcaPrice1 : prevManualStep2.price < dcaPrice1)
-    ) {
+    if (!resetLevels && prevManualStep2 && prevManualStep2.price > 0) {
       dcaPrice2 = roundPrice(prevManualStep2.price);
       isManual2 = true;
+    } else if (!resetLevels && prevAutoStep2 && prevAutoStep2.price > 0) {
+      dcaPrice2 = roundPrice(prevAutoStep2.price);
+      isManual2 = false;
     } else {
       dcaPrice2 = roundPrice(
         trade.is_short ? dcaPrice1 * (1 + dist1) : dcaPrice1 * (1 - dist1)
@@ -1149,17 +1326,18 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
       },
     ];
   } else {
-    // Сохраняем все уровни DCA, которые перетащил пользователь (manual_override === true),
-    // и автоматически исправляем только старые не-ручные уровни, если они улетели дальше 20% от openRate (как 0.027629 на ARIA/USDT)
+    // Сохраняем все уровни DCA (DCA 1, DCA 2) ровно на тех ценах, где они находятся,
+    // никогда не сдвигая соседний уровень и не сбрасывая ручные или привязанные к SUP/RES цены
     for (let i = 0; i < trade.planned_dca_levels.length; i++) {
       const lvl = trade.planned_dca_levels[i];
-      if (!lvl.manual_override && !isReasonableAutoDca(lvl.price)) {
+      if (!(lvl.price > 0)) {
         const refBase = i === 0 ? openRate : trade.planned_dca_levels[i - 1].price;
         lvl.price = roundPrice(trade.is_short ? refBase * (1 + dist1) : refBase * (1 - dist1));
       }
       lvl.amount = Number(((lvl.stake_amount * lev) / Math.max(1e-8, lvl.price)).toFixed(4));
       lvl.distance_pct = Number((((lvl.price - openRate) / openRate) * 100).toFixed(2));
     }
+    trade.dca_manual_override = trade.planned_dca_levels.some((l) => Boolean(l.manual_override));
     if (trade.planned_dca_levels[0]) {
       trade.next_dca_price = trade.planned_dca_levels[0].price;
     }
@@ -1168,11 +1346,12 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
 
 const botConfig = {
   version: '2026.9-ScalpBot',
-  strategy_version: 'v2.5-MTF',
+  strategy_version: 'v2.6-MTF-DualStrategy',
   api_version: 2.34,
   dry_run: Boolean(scalpBotConfig.dry_run),
   runmode: scalpBotConfig.dry_run ? 'dry_run' : 'live',
   state: 'running' as 'running' | 'stopped' | 'paused',
+  pause_new_entries: false,
   bot_name: 'ScalpBot',
   strategy: String(scalpBotConfig.strategy || 'ScalpingStrategy'),
   timeframe: String(scalpBotConfig.timeframe || '1h'),
@@ -1418,8 +1597,47 @@ async function getOrComputeMtfBotLevels(pair: string, timeframe = '1h'): Promise
   const hasManualResistance = manualLevels.some((l) => l.role === 'resistance');
 
   try {
-    const { candles: tfCandles } = await fetchRealCandles(cleanPair, normTf, 220);
-    const ms = detectMarketStructure(tfCandles, Math.min(120, Math.max(25, tfCandles.length)));
+    // Top-Down 1D -> 4H Global Level Analysis across full available history (not short 1h window!)
+    const [{ candles: c1d }, { candles: c4h }, { candles: tfCandles }] = await Promise.all([
+      fetchRealCandles(cleanPair, '1d', 365),
+      fetchRealCandles(cleanPair, '4h', 500),
+      normTf === '4h' || normTf === '1d'
+        ? Promise.resolve({ candles: [] as RawCandle[] })
+        : fetchRealCandles(cleanPair, normTf, 500),
+    ]);
+
+    const activeCandles =
+      normTf === '1d' ? c1d : normTf === '4h' ? c4h : tfCandles.length > 0 ? tfCandles : c4h;
+    const ms1d = detectMarketStructure(c1d, Math.max(30, c1d.length));
+    const ms4h = detectMarketStructure(c4h, Math.max(30, c4h.length));
+    const msActive =
+      normTf === '1d'
+        ? ms1d
+        : normTf === '4h'
+        ? ms4h
+        : detectMarketStructure(activeCandles, Math.max(30, activeCandles.length));
+
+    // На рабочих таймфреймах (1h / 4h) бот выставляет глобальные уровни поддержки и сопротивления по всей истории 1D + 4H
+    const globalSup =
+      normTf === '1d'
+        ? ms1d.nearest_support
+        : ms4h.nearest_support > 0
+        ? ms4h.nearest_support
+        : ms1d.nearest_support > 0
+        ? ms1d.nearest_support
+        : msActive.nearest_support;
+    const globalRes =
+      normTf === '1d'
+        ? ms1d.nearest_resistance
+        : ms4h.nearest_resistance > 0
+        ? ms4h.nearest_resistance
+        : ms1d.nearest_resistance > 0
+        ? ms1d.nearest_resistance
+        : msActive.nearest_resistance;
+
+    const sh = (normTf === '1d' ? ms1d.support_history : ms4h.support_history) || msActive.support_history;
+    const rh = (normTf === '1d' ? ms1d.resistance_history : ms4h.resistance_history) || msActive.resistance_history;
+
     const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
     const generated: BotChartLevel[] = [...manualLevels];
 
@@ -1433,23 +1651,24 @@ async function getOrComputeMtfBotLevels(pair: string, timeframe = '1h'): Promise
       (l) => l.id === resId || (l.id === `mtf-res-${cleanPair}` && normTf === '4h')
     );
 
+    const globalTag = normTf === '1d' ? '1D GLOBAL' : '4H/1D GLOBAL';
+
     if (!hasManualSupport && !savedSup?.deleted) {
       if (savedSup && !savedSup.deleted) {
         if (!generated.some((g) => g.id === savedSup.id)) generated.push(savedSup);
-      } else if (ms.nearest_support > 0) {
-        const sh = ms.support_history;
+      } else if (globalSup > 0) {
         const scoreTxt = sh ? ` ${sh.strength_score.toFixed(1)}★` : '';
         const lvl: BotChartLevel = {
           id: supId,
           pair: cleanPair,
-          label: `${tfLabel} SUP${scoreTxt}`,
+          label: `${globalTag} SUP${scoreTxt}`,
           role: 'support',
-          price: roundPrice(ms.nearest_support),
-          touches: sh?.touches || 2,
-          bounces: sh?.bounces || 2,
+          price: roundPrice(globalSup),
+          touches: sh?.touches || 3,
+          bounces: sh?.bounces || 3,
           breaks: sh?.breaks || 0,
-          strength_score: sh?.strength_score || 3.0,
-          source: tfLabel,
+          strength_score: sh?.strength_score || 5.0,
+          source: globalTag,
           manual_override: false,
           updated_at: nowStr,
         };
@@ -1463,20 +1682,19 @@ async function getOrComputeMtfBotLevels(pair: string, timeframe = '1h'): Promise
     if (!hasManualResistance && !savedRes?.deleted) {
       if (savedRes && !savedRes.deleted) {
         if (!generated.some((g) => g.id === savedRes.id)) generated.push(savedRes);
-      } else if (ms.nearest_resistance > 0) {
-        const rh = ms.resistance_history;
+      } else if (globalRes > 0) {
         const scoreTxt = rh ? ` ${rh.strength_score.toFixed(1)}★` : '';
         const lvl: BotChartLevel = {
           id: resId,
           pair: cleanPair,
-          label: `${tfLabel} RES${scoreTxt}`,
+          label: `${globalTag} RES${scoreTxt}`,
           role: 'resistance',
-          price: roundPrice(ms.nearest_resistance),
-          touches: rh?.touches || 2,
-          bounces: rh?.bounces || 2,
+          price: roundPrice(globalRes),
+          touches: rh?.touches || 3,
+          bounces: rh?.bounces || 3,
           breaks: rh?.breaks || 0,
-          strength_score: rh?.strength_score || 3.0,
-          source: tfLabel,
+          strength_score: rh?.strength_score || 5.0,
+          source: globalTag,
           manual_override: false,
           updated_at: nowStr,
         };
@@ -1522,7 +1740,7 @@ async function initializeBotTrades() {
   // 2. Подтягиваем актуальные рыночные котировки до пересчета сделок (если сеть временно недоступна — используем сохраненный current_rate из БД)
   await fetchAllMarketPairs().catch(() => {});
 
-  // 3. Восстанавливаем все сделки без потерь (НИКОГДА не удаляем реальные открытые или усредненные сделки при перезапуске/сбое)
+  // 3. Восстанавливаем все сделки бота без потерь, НО удаляем чужие старые исторические сделки (EXCHANGE_HISTORY), которых бот не открывал!
   const hasActiveExchange = exchangeAccountsStore.some((a) => a.enabled);
   const seenOpenKeys = new Set<string>();
   const cleanTrades: FreqtradeTrade[] = [];
@@ -1533,7 +1751,8 @@ async function initializeBotTrades() {
     const isOrphanClient = accId !== 'master' && exchangeAccountsStore.length > 0 && !validAccIds.has(accId);
     const isFakeTestRate =
       t.pair === 'ETH/USDT:USDT' && t.open_rate === 2500 && exchangeAccountsStore.length === 0;
-    if (isOrphanClient || isFakeTestRate) {
+    const isForeignHistoricalTrade = !t.is_open && t.enter_tag === 'EXCHANGE_HISTORY';
+    if (isOrphanClient || isFakeTestRate || isForeignHistoricalTrade) {
       sqliteDb.deleteTrade(t.trade_id);
       continue;
     }
@@ -1733,10 +1952,57 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
             existingOpen.stake_amount = Number(pos.margin_usdt.toFixed(2));
             existingOpen.leverage = pos.leverage || existingOpen.leverage;
           }
+          // Инициализируем глобальные уровни 1D/4H и плановые DCA только если они еще вообще не были созданы у сделки,
+          // при этом строго учитываем сохраненные ручные уровни SUP/RES в bot_levels!
+          const hasExistingPlannedDca =
+            Array.isArray(existingOpen.planned_dca_levels) &&
+            existingOpen.planned_dca_levels.length > 0 &&
+            existingOpen.planned_dca_levels.every((l) => l.price > 0);
+          if (!existingOpen.dca_manual_override && !hasExistingPlannedDca) {
+            try {
+              const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
+                fetchRealCandles(pos.pair, '1d', 365),
+                fetchRealCandles(pos.pair, '4h', 500),
+                fetchRealCandles(pos.pair, '1h', 200),
+              ]);
+              if (c4h.length >= 20) {
+                const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d);
+                const strongDca = findStrongestDcaLevel(
+                  c4h,
+                  c1d,
+                  existingOpen.open_rate,
+                  existingOpen.is_short,
+                  2.8
+                );
+                const savedBotLevels = sqliteDb.getBotLevelsForPair(pos.pair);
+                const manualSup = savedBotLevels.find((l) => l.role === 'support' && l.manual_override && !l.deleted);
+                const manualRes = savedBotLevels.find((l) => l.role === 'resistance' && l.manual_override && !l.deleted);
+                existingOpen.support_level = manualSup ? roundPrice(manualSup.price) : roundPrice(mtf.key_4h_support);
+                existingOpen.resistance_level = manualRes ? roundPrice(manualRes.price) : roundPrice(mtf.key_4h_resistance);
+                const boundDca1 = !existingOpen.is_short && manualSup
+                  ? roundPrice(manualSup.price)
+                  : existingOpen.is_short && manualRes
+                  ? roundPrice(manualRes.price)
+                  : roundPrice(strongDca.price);
+                existingOpen.next_dca_price = boundDca1;
+                if (existingOpen.planned_dca_levels && existingOpen.planned_dca_levels.length >= 2) {
+                  if (!existingOpen.planned_dca_levels[0].manual_override) {
+                    existingOpen.planned_dca_levels[0].price = boundDca1;
+                  }
+                  if (!existingOpen.planned_dca_levels[1].manual_override) {
+                    existingOpen.planned_dca_levels[1].price = roundPrice(strongDca.second_price);
+                  }
+                }
+              }
+            } catch {
+              // ignore transient candle fetch error
+            }
+          }
           recalculateTradeMetrics(existingOpen, false);
           sqliteDb.upsertTrade(existingOpen);
         } else {
-          // На бирже уже есть открытая позиция, которой еще нет на сайте — импортируем её со стандартной сеткой DCA 1 и DCA 2
+          // На бирже есть открытая позиция, которой еще нет на сайте (подключение бота или восстановление связи с сервером) —
+          // СРАЗУ проводим полный Top-Down анализ 1D -> 4H по всей истории, выставляем глобальные уровни, DCA по предыдущим максимумам/минимумам и биржевой TP!
           const id = nextTradeId++;
           const openTs = pos.created_time > 0 ? pos.created_time : Date.now();
           const openDateStr = new Date(openTs).toISOString().replace('T', ' ').slice(0, 19);
@@ -1747,12 +2013,44 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
           const stakeUsdt = Number(pos.margin_usdt.toFixed(2));
           const posTp = Number(pos.take_profit || 0);
           const posSl = Number(pos.stop_loss || 0);
-          const initialTp =
+          const feeRate = getExchangeTakerFeeRate(acc.exchange);
+
+          let analyzedSup = roundPrice(pos.is_short ? entryRate * 0.985 : entryRate * 0.968);
+          let analyzedRes = roundPrice(pos.is_short ? entryRate * 1.032 : entryRate * 1.015);
+          let analyzedTp =
             posTp > 0
               ? roundPrice(posTp)
               : roundPrice(pos.is_short ? entryRate * (1 - 0.012) : entryRate * (1 + 0.012));
-          const initialDcaPrice = roundPrice(pos.is_short ? entryRate * 1.015 : entryRate * 0.985);
-          const feeRate = getExchangeTakerFeeRate(acc.exchange);
+          let dcaPrice1 = roundPrice(pos.is_short ? entryRate * 1.032 : entryRate * 0.968);
+          let dcaPrice2 = roundPrice(pos.is_short ? entryRate * 1.068 : entryRate * 0.935);
+          let dcaSource = '4H_PREV_SWING';
+          let d1TrendLabel = 'NEUTRAL';
+
+          try {
+            const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
+              fetchRealCandles(pos.pair, '1d', 365),
+              fetchRealCandles(pos.pair, '4h', 500),
+              fetchRealCandles(pos.pair, '1h', 200),
+            ]);
+            if (c4h.length >= 20) {
+              const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d);
+              d1TrendLabel = mtf.d1_trend;
+              analyzedSup = roundPrice(mtf.key_4h_support);
+              analyzedRes = roundPrice(mtf.key_4h_resistance);
+              if (!(posTp > 0)) {
+                analyzedTp = roundPrice(
+                  pos.is_short ? mtf.recommended_tp_short : mtf.recommended_tp_long
+                );
+              }
+              const strongDca = findStrongestDcaLevel(c4h, c1d, entryRate, pos.is_short, 2.8);
+              dcaPrice1 = roundPrice(strongDca.price);
+              dcaPrice2 = roundPrice(strongDca.second_price);
+              dcaSource = strongDca.source;
+              await getOrComputeMtfBotLevels(pos.pair, botConfig.timeframe).catch(() => {});
+            }
+          } catch {
+            // fallback to structural percentages if offline
+          }
 
           const importedTrade: FreqtradeTrade = {
             trade_id: id,
@@ -1794,7 +2092,7 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
             initial_stop_loss_abs: posSl > 0 ? roundPrice(posSl) : 0,
             initial_stop_loss_pct: 0,
             exit_reason: null,
-            take_profit_abs: initialTp,
+            take_profit_abs: analyzedTp,
             take_profit_pct: Number((0.012 * lev * 100).toFixed(1)),
             leverage: lev,
             enter_tag: 'EXCHANGE_SYNC_LIVE',
@@ -1811,24 +2109,54 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
                 date: openDateStr,
               },
             ],
-            planned_dca_levels: [],
-            support_level: pos.is_short ? initialTp : initialDcaPrice,
-            resistance_level: pos.is_short ? initialDcaPrice : initialTp,
-            plan_notes: `Позиция синхронизирована напрямую с биржи ${acc.exchange.toUpperCase()} (${acc.name})`,
+            planned_dca_levels: [
+              {
+                step: 1,
+                label: `DCA 1 (${dcaSource})`,
+                price: dcaPrice1,
+                stake_amount: stakeUsdt,
+                amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice1)).toFixed(4)),
+                distance_pct: Number((((dcaPrice1 - entryRate) / entryRate) * 100).toFixed(2)),
+                manual_override: false,
+              },
+              {
+                step: 2,
+                label: `DCA 2 (Global Swing)`,
+                price: dcaPrice2,
+                stake_amount: stakeUsdt,
+                amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice2)).toFixed(4)),
+                distance_pct: Number((((dcaPrice2 - entryRate) / entryRate) * 100).toFixed(2)),
+                manual_override: false,
+              },
+            ],
+            support_level: analyzedSup,
+            resistance_level: analyzedRes,
+            plan_notes: `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) и проанализирована (1D=${d1TrendLabel} | SUP=${analyzedSup}$ | RES=${analyzedRes}$ | DCA1=${dcaPrice1}$)`,
             trade_state: 'WAITING_PULLBACK',
-            next_dca_price: initialDcaPrice,
+            next_dca_price: dcaPrice1,
             tp_manual_override: posTp > 0,
             sl_manual_override: posSl > 0,
             dca_manual_override: false,
           };
 
-          recalculateTradeMetrics(importedTrade, true);
+          recalculateTradeMetrics(importedTrade, false);
           tradesStore.unshift(importedTrade);
           sqliteDb.upsertTrade(importedTrade);
+
+          // Если на самой бирже еще не стоял Take-Profit ордер — сразу выставляем наш рассчитанный безубыточный/профитный TP на биржу
+          if (!(posTp > 0) && importedTrade.take_profit_abs && importedTrade.take_profit_abs > 0) {
+            placeOrUpdateExchangeTakeProfitOrder(creds, {
+              pair: pos.pair,
+              isShort: pos.is_short,
+              quantity: importedTrade.amount,
+              takeProfitPrice: importedTrade.take_profit_abs,
+            }).catch(() => {});
+          }
+
           appendLog(
             `freqtrade.exchange.${acc.exchange}`,
             'INFO',
-            `🔄 [EXCHANGE POSITION SYNC] Подтянута действующая позиция с биржи ${acc.exchange.toUpperCase()} (${acc.name}): #${id} [${pos.pair}] ${pos.is_short ? 'SHORT' : 'LONG'} ${lev}x | Объем: ${pos.size} @ ${entryRate}$ (Маржа: $${stakeUsdt} | Unrealized PnL: ${pos.unrealized_pnl.toFixed(2)}$)`
+            `🔄 [OPEN POSITION ANALYZED] Подтянута и проанализирована (1D->4H) открытая сделка с биржи ${acc.exchange.toUpperCase()} (${acc.name}): #${id} [${pos.pair}] ${pos.is_short ? 'SHORT' : 'LONG'} ${lev}x @ ${entryRate}$ | Global SUP: ${analyzedSup}$ | RES: ${analyzedRes}$ | TP: ${importedTrade.take_profit_abs}$ | DCA #1: ${dcaPrice1}$ (${dcaSource})`
           );
         }
       }
@@ -1839,7 +2167,8 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
         acc.used_margin_usdt = Number(totalPosMargin.toFixed(2));
       }
 
-      // 2. Если сделка числится открытой на сайте (старше 20 сек), но на бирже она уже закрыта — закрываем её и подтягиваем реальную цену и PnL с биржи
+      // 2. Если сделка числится открытой на сайте (старше 20 сек), но на бирже она уже закрыта (например, сработал биржевой Take-Profit ордер) —
+      // подтягиваем точную цену исполнения, комиссии и реализованный PnL с биржи 1-в-1!
       const localOpenForAcc = tradesStore.filter(
         (t) =>
           t.is_open &&
@@ -1877,7 +2206,7 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
           localTrade.current_rate = closePrice;
           localTrade.close_timestamp = closeTs;
           localTrade.close_date = closeDateStr;
-          localTrade.exit_reason = 'exchange_closed_sync';
+          localTrade.exit_reason = 'exchange_tp_closed_sync';
           localTrade.trade_state = 'CLOSED';
           localTrade.planned_dca_levels = [];
           if (matchedClosed) {
@@ -1895,13 +2224,13 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
           appendLog(
             `freqtrade.exchange.${acc.exchange}`,
             'INFO',
-            `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] была закрыта на бирже ${acc.exchange.toUpperCase()} @ ${closePrice}$ | Реальный PnL: ${localTrade.profit_abs}$ (Комиссия: ${localTrade.fee_total}$)`
+            `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] закрыта на бирже ${acc.exchange.toUpperCase()} @ ${closePrice}$ | Реальный PnL биржи: ${localTrade.profit_abs}$ (Комиссия: ${localTrade.fee_total}$)`
           );
         }
       }
     }
 
-    // 3. Полная сверка и синхронизация истории закрытых сделок и комиссий с биржи (без удаления существующих локальных сделок)
+    // 3. Сверка точного PnL и комиссий ТОЛЬКО для тех сделок, которые уже есть в базе бота (мы НЕ добавляем старые чужие сделки с биржи, которых бот не открывал!)
     if (closedPnlRes.success && closedPnlRes.closed.length > 0) {
       const matchedLocalIds = new Set<number>();
 
@@ -1940,91 +2269,7 @@ async function syncPositionsAndHistoryFromExchanges(acc: ExchangeAccountRecord):
           }
           recalculateTradeMetrics(existingClosed, false);
           sqliteDb.upsertTrade(existingClosed);
-          continue;
         }
-
-        const id = nextTradeId++;
-        const [base, quote] = c.pair.split(':')[0].split('/');
-        const openTs = c.created_time > 0 ? c.created_time : c.updated_time - 600_000;
-        const closeTs = c.updated_time > 0 ? c.updated_time : Date.now();
-        const openDateStr = new Date(openTs).toISOString().replace('T', ' ').slice(0, 19);
-        const closeDateStr = new Date(closeTs).toISOString().replace('T', ' ').slice(0, 19);
-        const lev = c.leverage || acc.max_leverage || 25;
-        const notional = c.entry_price * c.qty;
-        const stakeUsdt = Math.max(0.5, Number((notional / Math.max(1, lev)).toFixed(2)));
-        const feeOpen = Number(c.open_fee.toFixed(4));
-        const feeClose = Number(c.close_fee.toFixed(4));
-        const feeTotal = Number((feeOpen + feeClose).toFixed(4));
-        const netPnl = Number(c.closed_pnl.toFixed(4));
-        const netPct = Number(((netPnl / Math.max(1e-8, stakeUsdt)) * 100).toFixed(2));
-
-        const closedTrade: FreqtradeTrade = {
-          trade_id: id,
-          pair: c.pair,
-          base_currency: base || 'ETH',
-          quote_currency: quote || 'USDT',
-          is_open: false,
-          is_short: c.is_short,
-          exchange: acc.exchange,
-          account_id: targetAccountId,
-          account_name: targetAccountName,
-          synced_accounts: [acc.name],
-          amount: Number(c.qty.toFixed(4)),
-          initial_amount: Number(c.qty.toFixed(4)),
-          stake_amount: stakeUsdt,
-          initial_stake: stakeUsdt,
-          strategy: botConfig.strategy,
-          timeframe: botConfig.timeframe,
-          fee_open: feeOpen,
-          fee_close: feeClose,
-          fee_total: feeTotal,
-          open_date: openDateStr,
-          open_timestamp: openTs,
-          open_rate: roundPrice(c.entry_price),
-          initial_open_rate: roundPrice(c.entry_price),
-          dca_count: 0,
-          last_dca_date: null,
-          close_date: closeDateStr,
-          close_timestamp: closeTs,
-          close_rate: roundPrice(c.exit_price),
-          current_rate: roundPrice(c.exit_price),
-          exchange_realized_pnl: netPnl,
-          gross_profit: Number((netPnl + feeTotal).toFixed(4)),
-          net_profit: netPnl,
-          net_profit_percent: netPct,
-          profit_ratio: Number((netPct / 100).toFixed(4)),
-          profit_pct: netPct,
-          profit_abs: Number(netPnl.toFixed(4)),
-          stop_loss_abs: 0,
-          stop_loss_pct: 0,
-          initial_stop_loss_abs: 0,
-          initial_stop_loss_pct: 0,
-          take_profit_abs: roundPrice(c.exit_price),
-          take_profit_pct: 0,
-          leverage: lev,
-          enter_tag: 'EXCHANGE_HISTORY',
-          exit_reason: 'exchange_closed_pnl',
-          orders: [
-            {
-              id: `ord-${id}-0`,
-              step: 0,
-              label: `Вход на бирже (${c.is_short ? 'Шорт' : 'Лонг'})`,
-              side: c.is_short ? 'short' : 'long',
-              price: roundPrice(c.entry_price),
-              amount: Number(c.qty.toFixed(4)),
-              stake_amount: stakeUsdt,
-              timestamp: openTs,
-              date: openDateStr,
-            },
-          ],
-          planned_dca_levels: [],
-          plan_notes: `Историческая сделка с биржи ${acc.exchange.toUpperCase()} (OrderID: ${c.order_id})`,
-          trade_state: 'CLOSED',
-        };
-
-        matchedLocalIds.add(id);
-        tradesStore.push(closedTrade);
-        sqliteDb.upsertTrade(closedTrade);
       }
     }
   } catch {
@@ -2582,12 +2827,16 @@ async function runScalpBotCycle(waitForActive = false) {
                   ? dcaOrderRes.exchange_time
                   : Date.now();
               const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
+              // Ищем следующий уровень усреднения (DCA) строго за пределами текущей цены исполнения DCA (по следующим глобальным максимумам для Шорта / минимумам для Лонга, мин. 3.0% дальше!)
+              const dcaAnchorPrice = trade.is_short
+                ? Math.max(newAvgOpenRate, actualDcaPrice)
+                : Math.min(newAvgOpenRate, actualDcaPrice);
               const nextStrongDca = findStrongestDcaLevel(
                 c4h,
                 c1d,
-                newAvgOpenRate,
+                dcaAnchorPrice,
                 trade.is_short,
-                2.0
+                3.0
               );
 
               sqliteDb.runInTransaction(() => {
@@ -2658,7 +2907,43 @@ async function runScalpBotCycle(waitForActive = false) {
                     trade.is_short ? newAvgOpenRate * (1 - tpTargetMove) : newAvgOpenRate * (1 + tpTargetMove)
                   );
                 }
-                trade.next_dca_price = roundPrice(nextStrongDca.price);
+                const existingNextPlanned = (trade.planned_dca_levels || []).find(
+                  (l) => l.step === nextStep + 1 && l.manual_override && l.price > 0
+                );
+                const nextDca1 = existingNextPlanned
+                  ? roundPrice(existingNextPlanned.price)
+                  : roundPrice(nextStrongDca.price);
+                const nextDca2 = existingNextPlanned
+                  ? roundPrice(
+                      trade.is_short
+                        ? Math.max(nextStrongDca.second_price, nextDca1 * 1.032)
+                        : Math.min(nextStrongDca.second_price, nextDca1 * 0.968)
+                    )
+                  : roundPrice(nextStrongDca.second_price);
+                trade.next_dca_price = nextDca1;
+                trade.dca_manual_override = Boolean(existingNextPlanned);
+                trade.planned_dca_levels = [
+                  {
+                    step: nextStep + 1,
+                    label: existingNextPlanned
+                      ? existingNextPlanned.label || `DCA ${nextStep + 1} (USER)`
+                      : `DCA ${nextStep + 1} (${nextStrongDca.source})`,
+                    price: nextDca1,
+                    stake_amount: addStake,
+                    amount: Number(((addStake * (trade.leverage || 25)) / Math.max(1e-8, nextDca1)).toFixed(4)),
+                    distance_pct: Number((((nextDca1 - newAvgOpenRate) / newAvgOpenRate) * 100).toFixed(2)),
+                    manual_override: Boolean(existingNextPlanned),
+                  },
+                  {
+                    step: nextStep + 2,
+                    label: `DCA ${nextStep + 2}`,
+                    price: nextDca2,
+                    stake_amount: addStake,
+                    amount: Number(((addStake * (trade.leverage || 25)) / Math.max(1e-8, nextDca2)).toFixed(4)),
+                    distance_pct: Number((((nextDca2 - newAvgOpenRate) / newAvgOpenRate) * 100).toFixed(2)),
+                    manual_override: false,
+                  },
+                ];
 
                 trade.orders.push({
                   id: dcaOrderRes?.order_id || `ord-${trade.trade_id}-${nextStep}`,
@@ -2672,8 +2957,19 @@ async function runScalpBotCycle(waitForActive = false) {
                   date: nowStr,
                 });
 
-                recalculateTradeMetrics(trade, true);
+                recalculateTradeMetrics(trade, false);
                 sqliteDb.upsertTrade(trade);
+
+                // Сразу обновляем биржевой ордер Take-Profit на новую цену TP после усреднения
+                const ownerCreds = getAccountCredentialsFromStore(ownerAcc);
+                if (ownerCreds && !isSimulatedTestApiKey(ownerCreds.apiKey) && trade.take_profit_abs > 0) {
+                  placeOrUpdateExchangeTakeProfitOrder(ownerCreds, {
+                    pair: trade.pair,
+                    isShort: trade.is_short,
+                    quantity: trade.amount,
+                    takeProfitPrice: trade.take_profit_abs,
+                  }).catch(() => {});
+                }
                 sqliteDb.recordOrder({
                   trade_id: trade.trade_id,
                   pair: trade.pair,
@@ -2852,8 +3148,8 @@ async function runScalpBotCycle(waitForActive = false) {
       }
     }
 
-    // 2. Scan for new entries ONLY if bot state === 'running' AND at least 1 API account is enabled
-    if (botConfig.state !== 'running' || activeAccounts.length === 0) {
+    // 2. Scan for new entries ONLY if bot state === 'running', owner has NOT paused new entries, AND at least 1 API account is enabled
+    if (botConfig.state !== 'running' || botConfig.pause_new_entries || activeAccounts.length === 0) {
       return;
     }
 
@@ -2900,12 +3196,13 @@ async function runScalpBotCycle(waitForActive = false) {
       scannedCount++;
       if (scannedCount > 24) break; // Analyze top 24 most volatile pairs per cycle for high capital turnover
 
+      // Top-Down Анализ: 1D (вся доступная история 365 дн.) -> 4H (500 свечей) -> 1H (200 свечей)
       const [{ candles: c1h }, { candles: c4h }, { candles: c1d }] = await Promise.all([
-        fetchRealCandles(pair, botConfig.timeframe, 100),
-        fetchRealCandles(pair, '4h', 250),
-        fetchRealCandles(pair, '1d', 150),
+        fetchRealCandles(pair, botConfig.timeframe, 200),
+        fetchRealCandles(pair, '4h', 500),
+        fetchRealCandles(pair, '1d', 365),
       ]);
-      if (c1h.length < 35) continue;
+      if (c1h.length < 35 || c4h.length < 25) continue;
 
       const livePrice = c1h[c1h.length - 1].close;
       const pairLevels = await getOrComputeMtfBotLevels(pair, botConfig.timeframe);
@@ -2923,7 +3220,12 @@ async function runScalpBotCycle(waitForActive = false) {
 
       const customSup = manualSupLvl?.price || mtf.key_4h_support;
       const customRes = manualResLvl?.price || mtf.key_4h_resistance;
+
+      // СТРАТЕГИЯ №1: ScalpingStrategy (краткосрочный скальпинг Лонг/Шорт от глобальных уровней и по тренду)
       const sig = evaluateScalpingStrategy(c1h, customSup, customRes);
+
+      // СТРАТЕГИЯ №2 (ОТДЕЛЬНАЯ): GlobalHedgeStrategy (2-сторонние сделки LONG+SHORT в среднесрок 4H и долгосрок 1D)
+      const hedgeEval = evaluateGlobalHedgeStrategy(c1h, c4h, c1d, mtf, btcGuard.isSafe);
 
       const last1hCandle = c1h[c1h.length - 1];
       const isRed1h = Boolean(last1hCandle && last1hCandle.close < last1hCandle.open);
@@ -2938,40 +3240,28 @@ async function runScalpBotCycle(waitForActive = false) {
           ? 'short'
           : sig.enter_long
           ? 'long'
+          : hedgeEval.should_open_hedge
+          ? 'hedge'
           : effectiveTrend === 'BEARISH'
           ? 'short'
           : effectiveTrend === 'BULLISH'
           ? 'long'
           : mtf.d1_trend.toLowerCase(),
-        confidence: sig.enter_long || sig.enter_short ? 0.85 : 0.65,
+        confidence: sig.enter_long || sig.enter_short || hedgeEval.should_open_hedge ? 0.88 : 0.65,
         price: livePrice,
-        reason: `MTF Scan [${pair}]: Trend=${effectiveTrend} (1D=${mtf.d1_trend} RSI=${mtf.rsi_1d}, 4H=${mtf.h4_trend} RSI=${mtf.rsi_4h}, 1H=${mtf.h1_trend} RSI=${mtf.rsi_1h}) | 4H Sup=${roundPrice(customSup)} Res=${roundPrice(customRes)} | Signal=${sig.enter_tag || (effectiveTrend === 'BEARISH' && mtf.allow_short ? 'BEARISH_TREND_SHORT' : effectiveTrend === 'BULLISH' && mtf.allow_long ? 'BULLISH_TREND_LONG' : 'WAIT_LEVEL')}`,
+        reason: `Top-Down 1D->4H [${pair}]: Trend=${effectiveTrend} (1D=${mtf.d1_trend} RSI=${mtf.rsi_1d}, 4H=${mtf.h4_trend} RSI=${mtf.rsi_4h}, 1H=${mtf.h1_trend} RSI=${mtf.rsi_1h}) | Global Sup=${roundPrice(customSup)} Res=${roundPrice(customRes)} | Scalp=${sig.enter_tag || 'NONE'} | GlobalHedge=${hedgeEval.should_open_hedge ? hedgeEval.horizon : 'WAIT'}`,
       });
 
-      // CASE A: Master does NOT have this pair open yet -> Trend-Aligned & Level-Filtered Entry:
-      // 1. In BEARISH trend (or when BTC is in BEARISH trend): prioritize SHORT signals (ScalpingStrategy Short or MTF Bearish Trend Continuation Short). Never open unconfirmed counter-trend Longs!
-      // 2. In BULLISH trend (when BTC is not dumping/bearish): prioritize LONG signals (ScalpingStrategy Long or MTF Bullish Trend Continuation Long).
-      // 3. In a 4H channel (>= 2.2% width, price in 25%-75% middle zone): open 2-Way 4H Hedge (LONG + SHORT).
+      // CASE A: Master does NOT have this pair open yet -> Autonomous choice between Strategy 1 (ScalpingStrategy) and Strategy 2 (GlobalHedgeStrategy):
       if (!masterHasPair && currentMasterOpen.length < botConfig.max_open_trades) {
         const { compoundedBalance: totalDeposit } = getCompoundedAccountBalance('master');
         const usedMargin = currentMasterOpen.reduce((acc, t) => acc + t.stake_amount, 0);
         const masterMarginOk = totalDeposit > 0 && (usedMargin / totalDeposit) * 100 < 40.0;
-        const channel4hWidthPct =
-          livePrice > 0 && customRes > customSup
-            ? ((customRes - customSup) / livePrice) * 100.0
-            : 0;
-        const is4hHedgeCandidate =
-          btcGuard.isSafe &&
-          currentMasterOpen.length + 2 <= botConfig.max_open_trades &&
-          channel4hWidthPct >= 2.2 &&
-          mtf.pos_4h_pct >= 25.0 &&
-          mtf.pos_4h_pct <= 75.0 &&
-          mtf.rsi_1h >= 30.0 &&
-          mtf.rsi_1h <= 68.0 &&
-          !isKnifeDrop(c1h) &&
-          !isPumpExhaustion(c1h);
+        const canOpenHedgeStrategy =
+          hedgeEval.should_open_hedge &&
+          currentMasterOpen.length + 2 <= botConfig.max_open_trades;
 
-        // Safe check for LONG: BTC must not be flash dumping AND if BTC is in a bearish trend, only allow Long if the coin itself is strongly bullish or bouncing right off 4H support
+        // Safe check for LONG: BTC must not be flash dumping AND if BTC is in a bearish trend, only allow Long if the coin itself is strongly bullish or bouncing right off 4H/1D global support
         const btcAllowsLong =
           btcGuard.isSafe &&
           (btcGuard.btcTrend !== 'BEARISH' || effectiveTrend === 'BULLISH' || mtf.dist_to_4h_sup_pct <= 1.2);
@@ -2979,9 +3269,11 @@ async function runScalpBotCycle(waitForActive = false) {
         if (masterMarginOk) {
           try {
             if (effectiveTrend === 'BEARISH') {
-              // Market trend for this coin is BEARISH -> prioritize SHORT entries along the trend
+              // Market trend for this coin is BEARISH -> prioritize ScalpingStrategy SHORT or GlobalHedgeStrategy if inside wide 4H/1D channel
               if (sig.enter_short && mtf.allow_short) {
-                await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag);
+                await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, {
+                  strategyName: 'ScalpingStrategy',
+                });
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
                 continue;
@@ -2998,26 +3290,35 @@ async function runScalpBotCycle(waitForActive = false) {
                   mtf,
                   c4h,
                   c1d,
-                  'MTF_Trend_Scalp_Short'
+                  'Scalp_Trend_Short',
+                  { strategyName: 'ScalpingStrategy' }
                 );
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
                 continue;
-              } else if (is4hHedgeCandidate) {
-                await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d);
+              } else if (canOpenHedgeStrategy) {
+                await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d, {
+                  horizon: hedgeEval.horizon,
+                  longTpPrice: hedgeEval.long_tp_price,
+                  shortTpPrice: hedgeEval.short_tp_price,
+                });
                 openedInThisCycle += 2;
                 if (openedInThisCycle >= 3) break;
                 continue;
               } else if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
-                await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag);
+                await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, {
+                  strategyName: 'ScalpingStrategy',
+                });
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
                 continue;
               }
             } else if (effectiveTrend === 'BULLISH') {
-              // Market trend for this coin is BULLISH -> prioritize LONG entries along the trend
+              // Market trend for this coin is BULLISH -> prioritize ScalpingStrategy LONG or GlobalHedgeStrategy in wide 4H/1D channel
               if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
-                await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag);
+                await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, {
+                  strategyName: 'ScalpingStrategy',
+                });
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
                 continue;
@@ -3035,37 +3336,52 @@ async function runScalpBotCycle(waitForActive = false) {
                   mtf,
                   c4h,
                   c1d,
-                  'MTF_Trend_Scalp_Long'
+                  'Scalp_Trend_Long',
+                  { strategyName: 'ScalpingStrategy' }
                 );
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
                 continue;
-              } else if (is4hHedgeCandidate) {
-                await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d);
+              } else if (canOpenHedgeStrategy) {
+                await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d, {
+                  horizon: hedgeEval.horizon,
+                  longTpPrice: hedgeEval.long_tp_price,
+                  shortTpPrice: hedgeEval.short_tp_price,
+                });
                 openedInThisCycle += 2;
                 if (openedInThisCycle >= 3) break;
                 continue;
               } else if (sig.enter_short && mtf.allow_short) {
-                await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag);
+                await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, {
+                  strategyName: 'ScalpingStrategy',
+                });
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
                 continue;
               }
             } else {
-              // NEUTRAL / RANGING market -> check strategy signals, 2-Way Hedge in channel, or confirmed range bounce/rejection
-              if (sig.enter_short && mtf.allow_short) {
-                await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag);
+              // NEUTRAL / WIDE GLOBAL CHANNEL -> GlobalHedgeStrategy (Medium/Long-Term 2-way) or ScalpingStrategy at channel edges
+              if (canOpenHedgeStrategy) {
+                await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d, {
+                  horizon: hedgeEval.horizon,
+                  longTpPrice: hedgeEval.long_tp_price,
+                  shortTpPrice: hedgeEval.short_tp_price,
+                });
+                openedInThisCycle += 2;
+                if (openedInThisCycle >= 3) break;
+                continue;
+              } else if (sig.enter_short && mtf.allow_short) {
+                await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, {
+                  strategyName: 'ScalpingStrategy',
+                });
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
                 continue;
               } else if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
-                await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag);
+                await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, {
+                  strategyName: 'ScalpingStrategy',
+                });
                 openedInThisCycle++;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              } else if (is4hHedgeCandidate) {
-                await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d);
-                openedInThisCycle += 2;
                 if (openedInThisCycle >= 3) break;
                 continue;
               } else if (
@@ -3083,7 +3399,8 @@ async function runScalpBotCycle(waitForActive = false) {
                   mtf,
                   c4h,
                   c1d,
-                  'MTF_Overbought_Scalp_Short'
+                  'Scalp_Overbought_Short',
+                  { strategyName: 'ScalpingStrategy' }
                 );
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
@@ -3104,7 +3421,8 @@ async function runScalpBotCycle(waitForActive = false) {
                   mtf,
                   c4h,
                   c1d,
-                  'MTF_Oversold_Scalp_Long'
+                  'Scalp_Oversold_Long',
+                  { strategyName: 'ScalpingStrategy' }
                 );
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
@@ -3219,10 +3537,15 @@ async function openHedgeCampaign(
     stake?: number;
     leverage?: number;
     skipClientSync?: boolean;
+    horizon?: 'MEDIUM_TERM_4H' | 'LONG_TERM_1D';
+    longTpPrice?: number;
+    shortTpPrice?: number;
   }
 ): Promise<{ longTrade: FreqtradeTrade; shortTrade: FreqtradeTrade | null }> {
   const cleanPair = pair.toUpperCase();
   const campaignId = `hedge-${cleanPair.split(':')[0].replace('/', '')}-${Date.now()}`;
+  const horizonTag = customOpts?.horizon === 'LONG_TERM_1D' ? '1D_LongTerm_Hedge' : '4H_MedTerm_Hedge';
+  const hedgeTimeframe = customOpts?.horizon === 'LONG_TERM_1D' ? '1d' : '4h';
 
   // 1. Одновременно проверяем/включаем режим хеджирования (Hedge Mode) на активных аккаунтах и предзагружаем уровни пары без задержки
   const activeAccounts = exchangeAccountsStore.filter((a) => a.enabled);
@@ -3238,7 +3561,7 @@ async function openHedgeCampaign(
         return { accId: acc.id, ...res };
       })
     ),
-    getOrComputeMtfBotLevels(cleanPair, botConfig.timeframe),
+    getOrComputeMtfBotLevels(cleanPair, hedgeTimeframe),
   ]);
 
   const ownerHedgeStatus = hedgeCheckList.find((h) => h.accId === ownerAcc?.id);
@@ -3252,7 +3575,7 @@ async function openHedgeCampaign(
     appendLog(
       'freqtrade.bot.hedge',
       'WARNING',
-      `⚠️ [${cleanPair}] На бирже активен режим One-Way Mode (${ownerHedgeStatus?.message || 'переключение на Hedge Mode требует закрытия текущих сделок'}). Открываю 4H сделку по тренду (${fallbackSide.toUpperCase()}) без схлопывания.`
+      `⚠️ [${cleanPair}] На бирже активен режим One-Way Mode (${ownerHedgeStatus?.message || 'переключение на Hedge Mode требует закрытия текущих сделок'}). Открываю среднесрочную сделку по тренду (${fallbackSide.toUpperCase()}) без схлопывания.`
     );
     const singleTrade = await createScalpBotPosition(
       cleanPair,
@@ -3261,11 +3584,14 @@ async function openHedgeCampaign(
       mtf,
       candles4h,
       candles1d,
-      fallbackSide === 'short' ? '4H_Hedge_Short' : '4H_Hedge_Long',
+      fallbackSide === 'short' ? `${horizonTag}_Short` : `${horizonTag}_Long`,
       {
         ...customOpts,
+        customTp: fallbackSide === 'short' ? customOpts?.shortTpPrice : customOpts?.longTpPrice,
         campaignId,
         preloadedPairLevels,
+        strategyName: 'GlobalHedgeStrategy',
+        timeframeOverride: hedgeTimeframe,
       }
     );
     return { longTrade: singleTrade, shortTrade: null };
@@ -3274,7 +3600,7 @@ async function openHedgeCampaign(
   appendLog(
     'freqtrade.bot.hedge',
     'INFO',
-    `⚖️ Открываю 2-стороннюю хедж-кампанию ${campaignId} [${cleanPair}] @ ${entryPrice}$: мгновенный параллельный вход LONG + SHORT в 4H канале (0.5% депозит / 25x плечо)`
+    `⚖️ [GlobalHedgeStrategy] Открываю 2-стороннюю кампанию (${customOpts?.horizon === 'LONG_TERM_1D' ? 'ДОЛГОСРОК 1D' : 'СРЕДНЕСРОК 4H'}) ${campaignId} [${cleanPair}] @ ${entryPrice}$: параллельный вход LONG + SHORT от глобальных уровней (0.5% депозит / 25x плечо)`
   );
 
   // 2. Открываем LONG и SHORT строго параллельно (Promise.all) без малейшей задержки между ногами!
@@ -3286,11 +3612,14 @@ async function openHedgeCampaign(
       mtf,
       candles4h,
       candles1d,
-      '4H_Hedge_Long',
+      `${horizonTag}_Long`,
       {
         ...customOpts,
+        customTp: customOpts?.longTpPrice,
         campaignId,
         preloadedPairLevels,
+        strategyName: 'GlobalHedgeStrategy',
+        timeframeOverride: hedgeTimeframe,
       }
     ),
     createScalpBotPosition(
@@ -3300,11 +3629,14 @@ async function openHedgeCampaign(
       mtf,
       candles4h,
       candles1d,
-      '4H_Hedge_Short',
+      `${horizonTag}_Short`,
       {
         ...customOpts,
+        customTp: customOpts?.shortTpPrice,
         campaignId,
         preloadedPairLevels,
+        strategyName: 'GlobalHedgeStrategy',
+        timeframeOverride: hedgeTimeframe,
       }
     ),
   ]);
@@ -3332,6 +3664,8 @@ async function createScalpBotPosition(
     parentTradeId?: number;
     skipClientSync?: boolean;
     preloadedPairLevels?: Awaited<ReturnType<typeof getOrComputeMtfBotLevels>>;
+    strategyName?: string;
+    timeframeOverride?: string;
   }
 ): Promise<FreqtradeTrade> {
   const activeAccounts = exchangeAccountsStore.filter((a) => a.enabled);
@@ -3353,6 +3687,13 @@ async function createScalpBotPosition(
       t.is_short === isShort
   );
   if (existingSameSide) {
+    if (customOpts?.campaignId && existingSameSide.campaign_id !== customOpts.campaignId) {
+      existingSameSide.campaign_id = customOpts.campaignId;
+      if (customOpts.strategyName) {
+        existingSameSide.strategy = customOpts.strategyName;
+      }
+      sqliteDb.upsertTrade(existingSameSide);
+    }
     return existingSameSide;
   }
 
@@ -3432,26 +3773,30 @@ async function createScalpBotPosition(
     ? mtf.recommended_tp_short
     : mtf.recommended_tp_long;
 
+  const isGlobalHedge = Boolean(
+    customOpts?.campaignId || customOpts?.strategyName === 'GlobalHedgeStrategy'
+  );
+
   if (!isShort) {
     if (!hasCustomTp || rawTp <= entryRate * 1.002) {
       const minTpLong = manualResLvl ? entryRate * 1.0035 : entryRate * 1.008;
-      const maxTpLong = manualResLvl ? entryRate * 1.080 : entryRate * 1.015;
+      const maxTpLong = manualResLvl || isGlobalHedge ? entryRate * 1.080 : entryRate * 1.015;
       const structRes = effectiveRes * 0.998;
       if (structRes >= minTpLong && structRes <= maxTpLong) {
         rawTp = structRes;
       } else if (rawTp < minTpLong || rawTp > maxTpLong) {
-        rawTp = entryRate * 1.012;
+        rawTp = isGlobalHedge ? Math.max(minTpLong, Math.min(maxTpLong, structRes)) : entryRate * 1.012;
       }
     }
   } else {
     if (!hasCustomTp || rawTp >= entryRate * 0.998) {
       const minTpShort = manualSupLvl ? entryRate * 0.9965 : entryRate * 0.992;
-      const maxTpShort = manualSupLvl ? entryRate * 0.920 : entryRate * 0.985;
+      const maxTpShort = manualSupLvl || isGlobalHedge ? entryRate * 0.920 : entryRate * 0.985;
       const structSup = effectiveSup * 1.002;
       if (structSup <= minTpShort && structSup >= maxTpShort) {
         rawTp = structSup;
       } else if (rawTp > minTpShort || rawTp < maxTpShort) {
-        rawTp = entryRate * 0.988;
+        rawTp = isGlobalHedge ? Math.min(minTpShort, Math.max(maxTpShort, structSup)) : entryRate * 0.988;
       }
     }
   }
@@ -3461,7 +3806,8 @@ async function createScalpBotPosition(
     ((Math.abs(targetTp - entryRate) / Math.max(1e-8, entryRate)) * 100).toFixed(2)
   );
 
-  const strongestDca = findStrongestDcaLevel(candles4h, candles1d, entryRate, isShort, 1.5);
+  // Усреднения (DCA) выставляются строго по предыдущим максимумам (для Шорта) и предыдущим минимумам (для Лонга) 4H/1D (минимум 2.8% от входа!)
+  const strongestDca = findStrongestDcaLevel(candles4h, candles1d, entryRate, isShort, 2.8);
   const nextDcaPrice = !isShort
     ? manualSupLvl
       ? roundPrice(manualSupLvl.price)
@@ -3469,10 +3815,22 @@ async function createScalpBotPosition(
     : manualResLvl
     ? roundPrice(manualResLvl.price)
     : roundPrice(strongestDca.price);
+  const secondDcaPrice = roundPrice(
+    strongestDca.second_price &&
+      (isShort ? strongestDca.second_price > nextDcaPrice * 1.02 : strongestDca.second_price < nextDcaPrice * 0.98)
+      ? strongestDca.second_price
+      : isShort
+      ? nextDcaPrice * 1.035
+      : nextDcaPrice * 0.965
+  );
   const dcaSourceLabel =
     (!isShort && manualSupLvl) || (isShort && manualResLvl) ? 'MANUAL_LVL' : strongestDca.source;
 
-  const planNotes = `${side.toUpperCase()} ${customOpts?.campaignId ? '4H HEDGE' : '1H SCALP'} | 1D: ${mtf.d1_trend} | ${isShort ? `Res: ${effectiveRes}` : `Sup: ${effectiveSup}`} | Target TP: ${targetTp} | Next DCA (${dcaSourceLabel}): ${nextDcaPrice}`;
+  const resolvedStrategyName =
+    customOpts?.strategyName || (isGlobalHedge ? 'GlobalHedgeStrategy' : 'ScalpingStrategy');
+  const resolvedTimeframe =
+    customOpts?.timeframeOverride || (isGlobalHedge ? '4h' : botConfig.timeframe);
+  const planNotes = `${side.toUpperCase()} [${resolvedStrategyName}] | 1D: ${mtf.d1_trend} | 4H: ${mtf.h4_trend} | ${isShort ? `Global Res: ${effectiveRes}` : `Global Sup: ${effectiveSup}`} | Target TP: ${targetTp} | DCA #1 (${dcaSourceLabel}): ${nextDcaPrice} | DCA #2: ${secondDcaPrice}`;
 
   const newTrade: FreqtradeTrade = {
     trade_id: id,
@@ -3486,8 +3844,8 @@ async function createScalpBotPosition(
     initial_amount: amount,
     stake_amount: stake,
     initial_stake: stake,
-    strategy: botConfig.strategy,
-    timeframe: botConfig.timeframe,
+    strategy: resolvedStrategyName,
+    timeframe: resolvedTimeframe,
     enter_tag: enterTag || (isShort ? 'Short' : 'Long'),
     open_date: nowStr,
     open_timestamp: now,
@@ -3526,9 +3884,9 @@ async function createScalpBotPosition(
     parent_trade_id: customOpts?.parentTradeId,
     orders: [
       {
-        id: `ord-${id}-0`,
+        id: primaryOrderRes?.order_id || `ord-${id}-0`,
         step: 0,
-        label: `Нач. вход #1 (${isShort ? 'Шорт' : 'Лонг'})`,
+        label: `Нач. вход #1 (${isShort ? 'Шорт' : 'Лонг'} · ${resolvedStrategyName})`,
         side: isShort ? 'short' : 'long',
         price: entryRate,
         amount,
@@ -3537,7 +3895,26 @@ async function createScalpBotPosition(
         date: nowStr,
       },
     ],
-    planned_dca_levels: [],
+    planned_dca_levels: [
+      {
+        step: 1,
+        label: `DCA 1 (${dcaSourceLabel})`,
+        price: nextDcaPrice,
+        stake_amount: stake,
+        amount: Number(((stake * leverage) / Math.max(1e-8, nextDcaPrice)).toFixed(4)),
+        distance_pct: Number((((nextDcaPrice - entryRate) / entryRate) * 100).toFixed(2)),
+        manual_override: Boolean((!isShort && manualSupLvl) || (isShort && manualResLvl)),
+      },
+      {
+        step: 2,
+        label: `DCA 2 (Global Swing)`,
+        price: secondDcaPrice,
+        stake_amount: stake,
+        amount: Number(((stake * leverage) / Math.max(1e-8, secondDcaPrice)).toFixed(4)),
+        distance_pct: Number((((secondDcaPrice - entryRate) / entryRate) * 100).toFixed(2)),
+        manual_override: false,
+      },
+    ],
   };
 
   // Атомарная запись в SQLite: сделка владельца + анализированные входы всех активных клиентов сохраняются в одной транзакции
@@ -3548,6 +3925,16 @@ async function createScalpBotPosition(
     recalculateTradeMetrics(newTrade, false);
     tradesStore.unshift(newTrade);
     sqliteDb.upsertTrade(newTrade);
+    // Сразу после открытия позиции выставляем нативный Take-Profit ордер напрямую на биржу (чтобы закрытие происходило без задержки!)
+    const targetCreds = getAccountCredentialsFromStore(targetExchangeAcc);
+    if (targetCreds && !isSimulatedTestApiKey(targetCreds.apiKey) && newTrade.take_profit_abs > 0) {
+      placeOrUpdateExchangeTakeProfitOrder(targetCreds, {
+        pair: cleanPair,
+        isShort,
+        quantity: newTrade.amount,
+        takeProfitPrice: newTrade.take_profit_abs,
+      }).catch(() => {});
+    }
     sqliteDb.recordOrder({
       trade_id: id,
       pair: cleanPair,
@@ -4006,7 +4393,7 @@ async function startServer() {
       ...botConfig,
       exchange_connected: connected,
       active_accounts_count: exchangeAccountsStore.filter((a) => a.enabled).length,
-      available_strategies: ['ScalpingStrategy', 'SampleStrategy', 'AdvancedStrategy'],
+      available_strategies: ['ScalpingStrategy', 'GlobalHedgeStrategy'],
       available_timeframes: ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '1w'],
     });
   });
@@ -4345,19 +4732,83 @@ async function startServer() {
     await initializeBotTrades();
     const scope = resolveRequestAccountScope(req);
     const scopedTrades = filterTradesForScope(scope.accountId);
-    const dailyMap = new Map<string, { date: string; abs_profit: number; rel_profit: number; trades_count: number; wins: number; losses: number }>();
-    for (const t of scopedTrades) {
-      const dStr = (t.close_date || t.open_date || '').slice(0, 10) || new Date().toISOString().slice(0, 10);
-      const curr = dailyMap.get(dStr) || { date: dStr, abs_profit: 0, rel_profit: 0, trades_count: 0, wins: 0, losses: 0 };
-      curr.abs_profit = Number((curr.abs_profit + (t.profit_abs || 0)).toFixed(3));
-      curr.rel_profit = Number((curr.rel_profit + (t.profit_pct || 0)).toFixed(2));
+    const compounded = getCompoundedAccountBalance(scope.accountId);
+    const baseDeposit = compounded.baseDeposit > 0 ? compounded.baseDeposit : Math.max(100, scope.baseDeposit || 1000);
+
+    // Агрегируем строго закрытые сделки по дате их закрытия (YYYY-MM-DD) с использованием чистого PnL (net_profit)
+    const closedTrades = scopedTrades.filter((t) => !t.is_open);
+    const dailyMap = new Map<
+      string,
+      {
+        date: string;
+        abs_profit: number;
+        rel_profit: number;
+        fiat_value: number;
+        trade_count: number;
+        trades_count: number;
+        wins: number;
+        losses: number;
+        equity: number;
+      }
+    >();
+
+    // Предзаполняем последние 7 календарных дней (включая сегодня), чтобы таблица и график Прибыли по дням всегда были полными
+    for (let i = 0; i < 7; i++) {
+      const dStr = new Date(Date.now() - i * 86_400_000).toISOString().slice(0, 10);
+      dailyMap.set(dStr, {
+        date: dStr,
+        abs_profit: 0,
+        rel_profit: 0,
+        fiat_value: 0,
+        trade_count: 0,
+        trades_count: 0,
+        wins: 0,
+        losses: 0,
+        equity: baseDeposit,
+      });
+    }
+
+    for (const t of closedTrades) {
+      const dStr =
+        (t.close_date || t.open_date || '').slice(0, 10) ||
+        new Date().toISOString().slice(0, 10);
+      const netPnl = Number(t.net_profit ?? t.profit_abs ?? 0);
+      const curr = dailyMap.get(dStr) || {
+        date: dStr,
+        abs_profit: 0,
+        rel_profit: 0,
+        fiat_value: 0,
+        trade_count: 0,
+        trades_count: 0,
+        wins: 0,
+        losses: 0,
+        equity: baseDeposit,
+      };
+      curr.abs_profit = Number((curr.abs_profit + netPnl).toFixed(4));
+      curr.fiat_value = curr.abs_profit;
+      curr.rel_profit =
+        baseDeposit > 0 ? Number(((curr.abs_profit / baseDeposit) * 100).toFixed(2)) : 0;
+      curr.trade_count += 1;
       curr.trades_count += 1;
-      if ((t.profit_abs || 0) >= 0) curr.wins += 1;
+      if (netPnl >= 0) curr.wins += 1;
       else curr.losses += 1;
       dailyMap.set(dStr, curr);
     }
-    const data = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
-    res.json({ data, fiat_display_currency: 'USD', stake_currency: 'USDT' });
+
+    const sortedAsc = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
+    let runningEquity = baseDeposit;
+    for (const day of sortedAsc) {
+      runningEquity = Number((runningEquity + day.abs_profit).toFixed(2));
+      day.equity = runningEquity;
+    }
+    const sortedDesc = [...sortedAsc].sort((a, b) => b.date.localeCompare(a.date));
+
+    res.json({
+      data: sortedDesc,
+      fiat_display_currency: 'USD',
+      stake_currency: 'USDT',
+      starting_balance: baseDeposit,
+    });
   });
 
   app.get('/api/v1/balance', async (req, res) => {
@@ -4561,20 +5012,63 @@ async function startServer() {
       return;
     }
     botConfig.state = 'running';
-    appendLog('freqtrade.rpc.rpc', 'INFO', 'Changing state to: RUNNING');
-    res.json({ status: 'starting trader ...', state: botConfig.state });
+    botConfig.pause_new_entries = false;
+    appendLog('freqtrade.rpc.rpc', 'INFO', 'Changing state to: RUNNING (Новые входы разрешены)');
+    res.json({
+      status: 'starting trader ...',
+      state: botConfig.state,
+      pause_new_entries: botConfig.pause_new_entries,
+    });
   });
 
   app.post('/api/v1/stop', (_req, res) => {
     botConfig.state = 'stopped';
     appendLog('freqtrade.rpc.rpc', 'WARNING', 'Changing state to: STOPPED');
-    res.json({ status: 'stopping trader ...', state: botConfig.state });
+    res.json({
+      status: 'stopping trader ...',
+      state: botConfig.state,
+      pause_new_entries: botConfig.pause_new_entries,
+    });
   });
 
   app.post('/api/v1/stopbuy', (_req, res) => {
-    botConfig.state = 'paused';
-    appendLog('freqtrade.rpc.rpc', 'INFO', 'Changing state to: PAUSED');
-    res.json({ status: 'paused new entries', state: botConfig.state });
+    botConfig.pause_new_entries = !botConfig.pause_new_entries;
+    if (hasConnectedExchangeAccount() && botConfig.state === 'paused') {
+      botConfig.state = 'running';
+    }
+    appendLog(
+      'freqtrade.rpc.rpc',
+      'INFO',
+      botConfig.pause_new_entries
+        ? '⏸️ Владелец включил «Остановить открытие новых сделок»: бот прекратил новые входы, но продолжает усреднять (DCA) и закрывать в плюс текущие позиции.'
+        : '▶️ Владелец отключил паузу новых входов: бот снова ищет точки входа по стратегиям ScalpingStrategy и GlobalHedgeStrategy.'
+    );
+    res.json({
+      status: botConfig.pause_new_entries ? 'paused new entries' : 'resumed new entries',
+      state: botConfig.state,
+      pause_new_entries: botConfig.pause_new_entries,
+    });
+  });
+
+  app.post('/api/v1/bot/pause_entries', (req, res) => {
+    const explicitVal = req.body?.pause_new_entries;
+    botConfig.pause_new_entries =
+      typeof explicitVal === 'boolean' ? explicitVal : !botConfig.pause_new_entries;
+    if (hasConnectedExchangeAccount() && botConfig.state !== 'stopped') {
+      botConfig.state = 'running';
+    }
+    appendLog(
+      'freqtrade.rpc.rpc',
+      'INFO',
+      botConfig.pause_new_entries
+        ? '⏸️ Владелец включил режим «Без новых сделок»: бот НЕ открывает новые позиции, продолжая вести, усреднять (DCA) и закрывать в плюс уже открытые сделки.'
+        : '▶️ Владелец разрешил открытие новых сделок: сканер рынка и входы по стратегиям активны.'
+    );
+    res.json({
+      status: botConfig.pause_new_entries ? 'paused_new_entries' : 'active_entries',
+      state: botConfig.state,
+      pause_new_entries: botConfig.pause_new_entries,
+    });
   });
 
   app.post('/api/v1/reload_config', (_req, res) => {
@@ -4772,7 +5266,10 @@ async function startServer() {
 
     const now = Date.now();
     const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
-    const nextStrongDca = findStrongestDcaLevel(c4h, c1d, fillPrice, trade.is_short, 2.0);
+    const dcaAnchorPrice = trade.is_short
+      ? Math.max(newAvgOpenRate, fillPrice)
+      : Math.min(newAvgOpenRate, fillPrice);
+    const nextStrongDca = findStrongestDcaLevel(c4h, c1d, dcaAnchorPrice, trade.is_short, 3.0);
 
     // Pre-dispatch client DCA orders if master trade is averaged
     const clientDcaDispatches = new Map<number, PlacedOrderResult | null>();
@@ -4812,7 +5309,49 @@ async function startServer() {
       trade.trade_state = 'AVERAGED';
       trade.pullback_min_profit_pct = 0.4;
       trade.enter_tag = `${trade.is_short ? 'Short' : 'Long'} (DCA ×${nextStep})`;
-      trade.next_dca_price = roundPrice(nextStrongDca.price);
+      if (!trade.tp_manual_override) {
+        const tpTargetMove = 0.008;
+        trade.take_profit_abs = roundPrice(
+          trade.is_short ? newAvgOpenRate * (1 - tpTargetMove) : newAvgOpenRate * (1 + tpTargetMove)
+        );
+      }
+      const existingNextPlanned = (trade.planned_dca_levels || []).find(
+        (l) => l.step === nextStep + 1 && l.manual_override && l.price > 0
+      );
+      const nextDca1 = existingNextPlanned
+        ? roundPrice(existingNextPlanned.price)
+        : roundPrice(nextStrongDca.price);
+      const nextDca2 = existingNextPlanned
+        ? roundPrice(
+            trade.is_short
+              ? Math.max(nextStrongDca.second_price, nextDca1 * 1.032)
+              : Math.min(nextStrongDca.second_price, nextDca1 * 0.968)
+          )
+        : roundPrice(nextStrongDca.second_price);
+      trade.next_dca_price = nextDca1;
+      trade.dca_manual_override = Boolean(existingNextPlanned);
+      trade.planned_dca_levels = [
+        {
+          step: nextStep + 1,
+          label: existingNextPlanned
+            ? existingNextPlanned.label || `DCA ${nextStep + 1} (USER)`
+            : `DCA ${nextStep + 1} (${nextStrongDca.source})`,
+          price: nextDca1,
+          stake_amount: addStake,
+          amount: Number(((addStake * leverage) / Math.max(1e-8, nextDca1)).toFixed(4)),
+          distance_pct: Number((((nextDca1 - newAvgOpenRate) / newAvgOpenRate) * 100).toFixed(2)),
+          manual_override: Boolean(existingNextPlanned),
+        },
+        {
+          step: nextStep + 2,
+          label: `DCA ${nextStep + 2}`,
+          price: nextDca2,
+          stake_amount: addStake,
+          amount: Number(((addStake * leverage) / Math.max(1e-8, nextDca2)).toFixed(4)),
+          distance_pct: Number((((nextDca2 - newAvgOpenRate) / newAvgOpenRate) * 100).toFixed(2)),
+          manual_override: false,
+        },
+      ];
 
       trade.orders.push({
         id: dcaOrderRes?.order_id || `ord-${trade.trade_id}-${nextStep}`,
@@ -4826,8 +5365,17 @@ async function startServer() {
         date: nowStr,
       });
 
-      recalculateTradeMetrics(trade, true);
+      recalculateTradeMetrics(trade, false);
       sqliteDb.upsertTrade(trade);
+
+      if (targetCreds && !isSimulatedTestApiKey(targetCreds.apiKey) && trade.take_profit_abs > 0) {
+        placeOrUpdateExchangeTakeProfitOrder(targetCreds, {
+          pair: trade.pair,
+          isShort: trade.is_short,
+          quantity: trade.amount,
+          takeProfitPrice: trade.take_profit_abs,
+        }).catch(() => {});
+      }
       sqliteDb.recordOrder({
         trade_id: trade.trade_id,
         pair: trade.pair,
@@ -4963,12 +5511,21 @@ async function startServer() {
         trade.take_profit_abs = effectivePrice;
         trade.tp_manual_override = true;
         recalculateTradeMetrics(trade, false);
+        const tpCreds = getAccountCredentialsFromStore(trade.account_id || 'master');
+        if (tpCreds && !isSimulatedTestApiKey(tpCreds.apiKey) && trade.take_profit_abs > 0) {
+          placeOrUpdateExchangeTakeProfitOrder(tpCreds, {
+            pair: trade.pair,
+            isShort: trade.is_short,
+            quantity: trade.amount,
+            takeProfitPrice: trade.take_profit_abs,
+          }).catch(() => {});
+        }
         appendLog(
           'freqtrade.bot.levels',
           clampedToBreakeven ? 'WARNING' : 'INFO',
           clampedToBreakeven
             ? `🛡️ [${trade.pair}] Попытка поставить TP (${requestedPrice}$) в зону убытка/комиссии! Авто-коррекция TP до безубытка+профит: ${trade.take_profit_abs}$ (чистый ROI: +${trade.take_profit_pct}%).`
-            : `[${trade.pair}] TP изменен вручную на графике: ${prevPrice}$ ➔ ${trade.take_profit_abs}$ (чистый ROI: +${trade.take_profit_pct}%). Сохранено в trades.sqlite.`
+            : `[${trade.pair}] TP изменен вручную на графике: ${prevPrice}$ ➔ ${trade.take_profit_abs}$ (чистый ROI: +${trade.take_profit_pct}%). Синхронизировано с биржей и trades.sqlite.`
         );
       } else if (level_type === 'sl') {
         prevPrice = trade.stop_loss_abs;
@@ -4990,23 +5547,6 @@ async function startServer() {
           dcaItem.manual_override = true;
           if (targetStep === (trade.dca_count || 0) + 1) {
             trade.next_dca_price = effectivePrice;
-            if (!trade.is_short && effectivePrice < trade.open_rate) {
-              trade.support_level = effectivePrice;
-            } else if (trade.is_short && effectivePrice > trade.open_rate) {
-              trade.resistance_level = effectivePrice;
-            }
-            const secondItem = trade.planned_dca_levels?.find((l) => l.step === targetStep + 1);
-            if (
-              secondItem &&
-              (!secondItem.manual_override ||
-                (!trade.is_short && secondItem.price >= effectivePrice) ||
-                (trade.is_short && secondItem.price <= effectivePrice))
-            ) {
-              const dist = (trade.dca_count || 0) > 0 ? 0.02 : 0.015;
-              secondItem.price = roundPrice(
-                trade.is_short ? effectivePrice * (1 + dist) : effectivePrice * (1 - dist)
-              );
-            }
           }
           recalculateTradeMetrics(trade, false);
           appendLog(
@@ -5026,24 +5566,22 @@ async function startServer() {
       } else if (level_type === 'support') {
         prevPrice = trade.support_level || 0;
         trade.support_level = effectivePrice;
-        if (!trade.is_short && effectivePrice < trade.open_rate) {
+        const dca1 = trade.planned_dca_levels?.[0];
+        if (!trade.is_short && !dca1?.manual_override) {
           trade.next_dca_price = effectivePrice;
-          trade.dca_manual_override = true;
-          if (trade.planned_dca_levels?.[0]) {
-            trade.planned_dca_levels[0].price = effectivePrice;
-            trade.planned_dca_levels[0].manual_override = true;
+          if (dca1) {
+            dca1.price = effectivePrice;
           }
         }
         recalculateTradeMetrics(trade, false);
       } else if (level_type === 'resistance') {
         prevPrice = trade.resistance_level || 0;
         trade.resistance_level = effectivePrice;
-        if (trade.is_short && effectivePrice > trade.open_rate) {
+        const dca1 = trade.planned_dca_levels?.[0];
+        if (trade.is_short && !dca1?.manual_override) {
           trade.next_dca_price = effectivePrice;
-          trade.dca_manual_override = true;
-          if (trade.planned_dca_levels?.[0]) {
-            trade.planned_dca_levels[0].price = effectivePrice;
-            trade.planned_dca_levels[0].manual_override = true;
+          if (dca1) {
+            dca1.price = effectivePrice;
           }
         }
         recalculateTradeMetrics(trade, false);
@@ -5077,30 +5615,23 @@ async function startServer() {
             }
             if (targetStep === (ct.dca_count || 0) + 1) {
               ct.next_dca_price = effectivePrice;
-              const secondItem = ct.planned_dca_levels?.find((l) => l.step === targetStep + 1);
-              const masterSecond = trade.planned_dca_levels?.find((l) => l.step === targetStep + 1);
-              if (secondItem && masterSecond) {
-                secondItem.price = masterSecond.price;
-              }
             }
           } else if (level_type === 'support') {
             ct.support_level = effectivePrice;
-            if (!ct.is_short && effectivePrice < ct.open_rate) {
+            const ctDca1 = ct.planned_dca_levels?.[0];
+            if (!ct.is_short && !ctDca1?.manual_override) {
               ct.next_dca_price = effectivePrice;
-              ct.dca_manual_override = true;
-              if (ct.planned_dca_levels?.[0]) {
-                ct.planned_dca_levels[0].price = effectivePrice;
-                ct.planned_dca_levels[0].manual_override = true;
+              if (ctDca1) {
+                ctDca1.price = effectivePrice;
               }
             }
           } else if (level_type === 'resistance') {
             ct.resistance_level = effectivePrice;
-            if (ct.is_short && effectivePrice > ct.open_rate) {
+            const ctDca1 = ct.planned_dca_levels?.[0];
+            if (ct.is_short && !ctDca1?.manual_override) {
               ct.next_dca_price = effectivePrice;
-              ct.dca_manual_override = true;
-              if (ct.planned_dca_levels?.[0]) {
-                ct.planned_dca_levels[0].price = effectivePrice;
-                ct.planned_dca_levels[0].manual_override = true;
+              if (ctDca1) {
+                ctDca1.price = effectivePrice;
               }
             }
           }
@@ -5243,35 +5774,27 @@ async function startServer() {
       // Remove any old non-manual auto-levels of the same role for this pair so they never reappear on reload or other timeframes
       sqliteDb.replaceAutoBotLevelsWithManual(cleanPair, target.role, target.id);
 
-      // Синхронизируем передвинутый уровень бота (SUP / RES) со всеми открытыми сделками по этой паре (мастер и клиенты):
-      // - Для LONG: поддержка (SUP) ниже входа обновляет целевой уровень DCA 1 (и отменяет старый уровень DCA!), а сопротивление (RES) обновляет структурный TP.
-      // - Для SHORT: сопротивление (RES) выше входа обновляет целевой уровень DCA 1 (и отменяет старый уровень DCA!), а поддержка (SUP) обновляет структурный TP.
+      // Синхронизируем передвинутый уровень бота (SUP / RES) со всеми открытыми сделками по этой паре:
+      // - Если DCA 1 еще НЕ передвигали вручную (!dca1.manual_override), то DCA 1 привязывается к SUP (для LONG) или RES (для SHORT).
+      // - Если DCA 1 уже был передвинут вручную (dca1.manual_override === true), он двигается полностью независимо и НЕ перезаписывается!
+      // - DCA 2 никогда не сбрасывается и не сдвигается при перетаскивании SUP / RES.
       for (const t of tradesStore) {
         if (t.is_open && t.pair === cleanPair) {
           recalculateTradeMetrics(t, false);
           const minProfTp = t.min_profitable_tp || t.breakeven_price || t.open_rate;
-          const dist = (t.dca_count || 0) > 0 ? 0.02 : 0.015;
+          const dca1 = t.planned_dca_levels?.[0];
           if (target.role === 'support') {
             t.support_level = newPrice;
             if (!t.is_short) {
-              // LONG: пользователь передвинул уровень поддержки — обновляем целевой уровень Smart DCA #1 на новый уровень!
-              if (newPrice < t.open_rate) {
+              // LONG: привязываем DCA 1 к SUP только если DCA 1 не трогали вручную
+              if (!dca1?.manual_override) {
                 t.next_dca_price = newPrice;
-                t.dca_manual_override = true;
-                if (t.planned_dca_levels?.[0]) {
-                  t.planned_dca_levels[0].price = newPrice;
-                  t.planned_dca_levels[0].manual_override = true;
-                }
-                if (
-                  t.planned_dca_levels?.[1] &&
-                  (!t.planned_dca_levels[1].manual_override ||
-                    t.planned_dca_levels[1].price >= newPrice)
-                ) {
-                  t.planned_dca_levels[1].price = roundPrice(newPrice * (1 - dist));
+                if (dca1) {
+                  dca1.price = newPrice;
                 }
               }
             } else {
-              // SHORT: уровень поддержки служит структурной целью Take Profit
+              // SHORT: уровень поддержки служит структурной целью Take Profit (если TP не трогали вручную)
               if (!t.tp_manual_override) {
                 const candidateTp = roundPrice(newPrice * 1.002);
                 t.take_profit_abs = Math.min(candidateTp, minProfTp);
@@ -5280,26 +5803,17 @@ async function startServer() {
           } else {
             t.resistance_level = newPrice;
             if (!t.is_short) {
-              // LONG: уровень сопротивления служит структурной целью Take Profit
+              // LONG: уровень сопротивления служит структурной целью Take Profit (если TP не трогали вручную)
               if (!t.tp_manual_override) {
                 const candidateTp = roundPrice(newPrice * 0.998);
                 t.take_profit_abs = Math.max(candidateTp, minProfTp);
               }
             } else {
-              // SHORT: пользователь передвинул уровень сопротивления — обновляем целевой уровень Smart DCA #1 на новый уровень!
-              if (newPrice > t.open_rate) {
+              // SHORT: привязываем DCA 1 к RES только если DCA 1 не трогали вручную
+              if (!dca1?.manual_override) {
                 t.next_dca_price = newPrice;
-                t.dca_manual_override = true;
-                if (t.planned_dca_levels?.[0]) {
-                  t.planned_dca_levels[0].price = newPrice;
-                  t.planned_dca_levels[0].manual_override = true;
-                }
-                if (
-                  t.planned_dca_levels?.[1] &&
-                  (!t.planned_dca_levels[1].manual_override ||
-                    t.planned_dca_levels[1].price <= newPrice)
-                ) {
-                  t.planned_dca_levels[1].price = roundPrice(newPrice * (1 + dist));
+                if (dca1) {
+                  dca1.price = newPrice;
                 }
               }
             }
@@ -5316,13 +5830,22 @@ async function startServer() {
       }
     }
     const refreshedLevels = await getOrComputeMtfBotLevels(cleanPair, normTf);
+    const updatedPairTrades = tradesStore.filter(
+      (t) => t.is_open && t.pair === cleanPair && (!t.account_id || t.account_id === 'master')
+    );
 
     appendLog(
       'freqtrade.bot.levels',
       'INFO',
-      `[${cleanPair}] Уровень ${target.label} (${target.role.toUpperCase()}) перенесен на графике: ${prevPrice}$ ➔ ${newPrice}$. Цели TP и DCA открытых сделок синхронизированы.`
+      `[${cleanPair}] Уровень ${target.label} (${target.role.toUpperCase()}) перенесен на графике: ${prevPrice}$ ➔ ${newPrice}$.`
     );
-    res.json({ pair: cleanPair, previous_price: prevPrice, level: target, levels: refreshedLevels });
+    res.json({
+      pair: cleanPair,
+      previous_price: prevPrice,
+      level: target,
+      levels: refreshedLevels,
+      updated_trades: updatedPairTrades,
+    });
   });
 
   // Delete a single Bot Level (marks deleted in trades.sqlite so auto-MTF won't recreate it)
@@ -6121,7 +6644,35 @@ async function startServer() {
     res.json({ result_msg: `Deleted trade #${id}`, deleted_ids: toRemoveIds });
   });
 
+  app.get('/api/v1/ws_status', (_req, res) => {
+    res.json({
+      status: 'ok',
+      websocket: getWebSocketEngineStatus(),
+    });
+  });
+
   const httpServer = http.createServer(app);
+
+  // Запускаем постоянные WebSocket-потоки бирж (Bybit V5 Linear WS + Binance Market WS + User Data Streams)
+  startPublicMarketWebSockets();
+  for (const p of PINNED_PAIRS.slice(0, 6)) {
+    subscribePairKlineStream(p, '1h');
+    subscribePairKlineStream(p, '4h');
+  }
+  onWsAccountUpdate((wsState) => {
+    for (const acc of exchangeAccountsStore) {
+      if (acc.enabled && sanitizeCredentialString(acc.api_key_raw) === wsState.apiKey) {
+        acc.balance_usdt = Number(wsState.walletBalanceUsdt.toFixed(4));
+        acc.wallet_balance_usdt = Number(wsState.walletBalanceUsdt.toFixed(4));
+        acc.unrealized_pnl = Number(wsState.unrealizedPnlUsdt.toFixed(4));
+        acc.equity_usdt = Number(wsState.equityUsdt.toFixed(4));
+        acc.available_balance_usdt = Number(wsState.availableBalanceUsdt.toFixed(2));
+        acc.used_margin_usdt = Number(wsState.usedMarginUsdt.toFixed(2));
+        acc.open_trades_count = wsState.positions.length;
+        acc.status = 'connected';
+      }
+    }
+  });
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({

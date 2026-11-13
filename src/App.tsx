@@ -202,11 +202,15 @@ export default function App() {
   );
 
   const lastLevelMutationTsRef = useRef<number>(0);
+  const pendingLevelMutationsRef = useRef<number>(0);
 
   const fetchPairBotLevels = useCallback(
     async (pairArg = selectedPair, tfArg = timeframe) => {
       const reqStartTs = Date.now();
-      if (reqStartTs - lastLevelMutationTsRef.current < 2500) {
+      if (
+        pendingLevelMutationsRef.current > 0 ||
+        reqStartTs - lastLevelMutationTsRef.current < 3000
+      ) {
         return;
       }
       try {
@@ -215,7 +219,11 @@ export default function App() {
         );
         if (res.ok) {
           const data = await res.json();
-          if (reqStartTs >= lastLevelMutationTsRef.current && Date.now() - lastLevelMutationTsRef.current >= 1500) {
+          if (
+            pendingLevelMutationsRef.current === 0 &&
+            reqStartTs >= lastLevelMutationTsRef.current &&
+            Date.now() - lastLevelMutationTsRef.current >= 3000
+          ) {
             setBotLevels(data.levels || []);
           }
         }
@@ -346,8 +354,9 @@ export default function App() {
       if (statusRes.ok) {
         const statusData = await statusRes.json();
         if (
+          pendingLevelMutationsRef.current === 0 &&
           reqStartTs >= lastLevelMutationTsRef.current &&
-          Date.now() - lastLevelMutationTsRef.current >= 1500
+          Date.now() - lastLevelMutationTsRef.current >= 3000
         ) {
           setOpenTrades(statusData);
         }
@@ -505,11 +514,40 @@ export default function App() {
       } catch {
         // ignore parse error
       }
+    } else if (endpoint === 'stopbuy') {
+      try {
+        const data = await res.json();
+        setStatusNotification(
+          data.pause_new_entries
+            ? '⏸️ Остановлено открытие новых сделок (бот продолжает усреднять DCA и закрывать в плюс текущие позиции)'
+            : '▶️ Открытие новых сделок возобновлено'
+        );
+      } catch {
+        // ignore
+      }
     }
     await fetchBotState();
     if (endpoint === 'reload_config') {
       await fetchCandles();
     }
+  };
+
+  const handleTogglePauseNewEntries = async () => {
+    const nextPause = !botConfig?.pause_new_entries;
+    const res = await fetch('/api/v1/bot/pause_entries', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pause_new_entries: nextPause }),
+    });
+    if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setStatusNotification(
+        data.pause_new_entries
+          ? '⏸️ Новые сделки отключены владельцем: бот продолжает только усреднять (DCA) и закрывать в плюс текущие сделки'
+          : '▶️ Открытие новых сделок включено владельцем'
+      );
+    }
+    await fetchBotState();
   };
 
   const handleForceExit = async (tradeId: number | 'all') => {
@@ -557,6 +595,7 @@ export default function App() {
 
   const handleUpdateTradeLevel = async (payload: TradeLevelUpdatePayload) => {
     lastLevelMutationTsRef.current = Date.now();
+    pendingLevelMutationsRef.current += 1;
     // Optimistic update so the dragged level stays at the exact dropped price without snapping back
     setOpenTrades((prev) =>
       prev.map((t) => {
@@ -585,62 +624,85 @@ export default function App() {
       })
     );
 
-    const res = await fetch('/api/v1/trade_levels', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        tradeid: payload.tradeId,
-        level_type: payload.levelType,
-        step: payload.step,
-        price: payload.price,
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      const updatedTrade: FreqtradeTrade | undefined = data.trade;
-      if (updatedTrade) {
-        lastLevelMutationTsRef.current = Date.now();
-        setOpenTrades((prev) =>
-          prev.map((t) => (t.trade_id === updatedTrade.trade_id ? updatedTrade : t))
-        );
-        const lvlName =
-          payload.levelType === 'tp'
-            ? 'TP'
-            : payload.levelType === 'sl'
-            ? 'SL'
-            : `DCA ${payload.step || 1}`;
-        if (data.clamped_to_breakeven && data.warning) {
-          setStatusNotification(`🛡️ ${data.warning}`);
-        } else {
-          setStatusNotification(
-            `Бот обновил ${lvlName} по ${updatedTrade.pair.split('/')[0]}: ${data.previous_price}$ ➔ ${data.new_price}$ (бот отталкивается от вашего уровня)`
-          );
+    try {
+      const res = await fetch('/api/v1/trade_levels', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tradeid: payload.tradeId,
+          level_type: payload.levelType,
+          step: payload.step,
+          price: payload.price,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const updatedTrade: FreqtradeTrade | undefined = data.trade;
+        if (updatedTrade) {
+          lastLevelMutationTsRef.current = Date.now();
+          if (pendingLevelMutationsRef.current <= 1) {
+            setOpenTrades((prev) =>
+              prev.map((t) => (t.trade_id === updatedTrade.trade_id ? updatedTrade : t))
+            );
+          }
+          const lvlName =
+            payload.levelType === 'tp'
+              ? 'TP'
+              : payload.levelType === 'sl'
+              ? 'SL'
+              : `DCA ${payload.step || 1}`;
+          if (data.clamped_to_breakeven && data.warning) {
+            setStatusNotification(`🛡️ ${data.warning}`);
+          } else {
+            setStatusNotification(
+              `Бот обновил ${lvlName} по ${updatedTrade.pair.split('/')[0]}: ${data.previous_price}$ ➔ ${data.new_price}$ (бот отталкивается от вашего уровня)`
+            );
+          }
         }
       }
+    } finally {
+      pendingLevelMutationsRef.current = Math.max(0, pendingLevelMutationsRef.current - 1);
+      lastLevelMutationTsRef.current = Date.now();
     }
   };
 
   const handleUpdateBotLevel = async (id: string, price: number) => {
     lastLevelMutationTsRef.current = Date.now();
+    pendingLevelMutationsRef.current += 1;
     // Optimistic update so the dragged SUP/RES level stays immediately at the dropped price
     setBotLevels((prev) =>
       prev.map((lvl) => (lvl.id === id ? { ...lvl, price, manual_override: true } : lvl))
     );
 
-    const res = await fetch('/api/v1/pair_levels', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pair: selectedPair, timeframe, id, price }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      lastLevelMutationTsRef.current = Date.now();
-      if (data.levels) setBotLevels(data.levels);
-      if (data.level) {
-        setStatusNotification(
-          `Бот обновил уровень ${data.level.label} (${selectedPair.split('/')[0]}): ${data.previous_price}$ ➔ ${data.level.price}$`
-        );
+    try {
+      const res = await fetch('/api/v1/pair_levels', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pair: selectedPair, timeframe, id, price }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        lastLevelMutationTsRef.current = Date.now();
+        if (pendingLevelMutationsRef.current <= 1) {
+          if (data.levels) setBotLevels(data.levels);
+          if (Array.isArray(data.updated_trades) && data.updated_trades.length > 0) {
+            const updatedMap = new Map<number, FreqtradeTrade>(
+              data.updated_trades.map((ut: FreqtradeTrade) => [ut.trade_id, ut])
+            );
+            setOpenTrades((prev) =>
+              prev.map((t) => updatedMap.get(t.trade_id) || t)
+            );
+          }
+        }
+        if (data.level) {
+          setStatusNotification(
+            `Бот обновил уровень ${data.level.label} (${selectedPair.split('/')[0]}): ${data.previous_price}$ ➔ ${data.level.price}$`
+          );
+        }
       }
+    } finally {
+      pendingLevelMutationsRef.current = Math.max(0, pendingLevelMutationsRef.current - 1);
+      lastLevelMutationTsRef.current = Date.now();
     }
   };
 
@@ -1080,8 +1142,36 @@ export default function App() {
           </nav>
         </div>
 
-        {/* Справа: Статус бота и профиль владельца / клиента */}
+        {/* Справа: Тумблер владельца «Стоп новые сделки», статус бота и профиль */}
         <div className="flex items-center gap-2.5">
+          {authState.role === 'owner' && (
+            <button
+              type="button"
+              onClick={handleTogglePauseNewEntries}
+              title={
+                botConfig?.pause_new_entries
+                  ? 'Новые сделки остановлены владельцем (бот продолжает усреднять DCA и закрывать в плюс открытые сделки). Нажмите, чтобы снова разрешить открытие новых сделок.'
+                  : 'Нажмите, чтобы бот прекратил открывать новые сделки (текущие сделки продолжат усредняться и закрываться в плюс).'
+              }
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-[4px] border text-[11px] font-semibold transition-colors ${
+                botConfig?.pause_new_entries
+                  ? 'bg-amber-500/20 border-amber-500/70 text-amber-300 hover:bg-amber-500/30'
+                  : 'bg-[#123524] border-[#10b981]/50 text-[#4ade80] hover:bg-[#16422d]'
+              }`}
+            >
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  botConfig?.pause_new_entries ? 'bg-amber-400 animate-pulse' : 'bg-[#10b981]'
+                }`}
+              />
+              <span>
+                {botConfig?.pause_new_entries
+                  ? 'Новые сделки: СТОП (Только DCA/TP)'
+                  : 'Новые сделки: ВКЛ'}
+              </span>
+            </button>
+          )}
+
           <div className="text-[11px] leading-[1.15] text-right text-[#cfd6df] hidden sm:block">
             <div>scalp-</div>
             <div>bot</div>
@@ -1245,6 +1335,9 @@ export default function App() {
             accounts={accounts}
             balance={balance}
             botConfig={botConfig}
+            daily={daily}
+            isOwner={authState.role === 'owner'}
+            onTogglePauseNewEntries={handleTogglePauseNewEntries}
             onJumpToPair={(pair) => {
               setSelectedPair(pair);
               setActiveRoute('trade');

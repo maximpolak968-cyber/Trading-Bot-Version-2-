@@ -32,7 +32,7 @@ export interface ClusteredLevelWithHistory {
   bounce_rate: number;
   last_touch_index: number;
   strength_score: number;
-  source?: '1D' | '4H' | '1H';
+  source?: string;
 }
 
 export interface MarketStructureResult {
@@ -630,25 +630,43 @@ export function analyzeMultiTimeframe(
     (rsi1hSeries.length > 0 ? rsi1hSeries[rsi1hSeries.length - 1] : 50).toFixed(2)
   );
 
+  // STEP 1 (1D FULL HISTORY): Analyze entire 1D history first to establish macro trend and global 1D Support/Resistance
+  const structure1d =
+    candles1d.length >= 15
+      ? detectMarketStructure(candles1d, candles1d.length)
+      : null;
+
+  // STEP 2 (4H FULL HISTORY): Analyze entire 4H history (not just 1 hour!) to place global Support & Resistance levels
   const structure4h =
     candles4h.length >= 15
-      ? detectMarketStructure(candles4h, Math.min(120, candles4h.length))
-      : detectMarketStructure(candles1h, 48);
+      ? detectMarketStructure(candles4h, candles4h.length)
+      : detectMarketStructure(candles1h, candles1h.length);
 
-  const structure1d =
-    candles1d.length >= 30 ? detectMarketStructure(candles1d, candles1d.length) : null;
-
-  const structure1h = detectMarketStructure(candles1h, 36);
+  const structure1h = detectMarketStructure(candles1h, Math.min(72, candles1h.length));
 
   const hasCustomSup = Boolean(customLevels?.support && customLevels.support > 0);
   const hasCustomRes = Boolean(customLevels?.resistance && customLevels.resistance > 0);
 
+  // Combine 1D and 4H global support & resistance so levels reflect full historical extremes
+  const globalSupportCandidate =
+    structure4h.nearest_support > 0
+      ? structure4h.nearest_support
+      : structure1d?.nearest_support && structure1d.nearest_support > 0
+      ? structure1d.nearest_support
+      : currentPrice * 0.965;
+  const globalResistanceCandidate =
+    structure4h.nearest_resistance > 0
+      ? structure4h.nearest_resistance
+      : structure1d?.nearest_resistance && structure1d.nearest_resistance > 0
+      ? structure1d.nearest_resistance
+      : currentPrice * 1.035;
+
   const key4hSupport = hasCustomSup
     ? Number(customLevels!.support)
-    : structure4h.nearest_support || currentPrice * 0.97;
+    : globalSupportCandidate;
   const key4hResistance = hasCustomRes
     ? Number(customLevels!.resistance)
-    : structure4h.nearest_resistance || currentPrice * 1.03;
+    : globalResistanceCandidate;
   const pos4hPct =
     hasCustomSup || hasCustomRes
       ? key4hResistance > key4hSupport
@@ -764,28 +782,28 @@ export function analyzeMultiTimeframe(
   if (slDistPctShort < 0.8) recSlShort = currentPrice * 1.015;
   else if (slDistPctShort > 4.5) recSlShort = currentPrice * 1.04;
 
-  // Merge 4H and 1D histories
+  // Merge 1D and 4H global level histories
   const supportCandidates: ClusteredLevelWithHistory[] = [];
   const resistanceCandidates: ClusteredLevelWithHistory[] = [];
-  if (structure4h.support_history) {
-    supportCandidates.push({ ...structure4h.support_history, source: '4H' });
-  }
   if (structure1d?.support_history) {
     supportCandidates.push({
       ...structure1d.support_history,
-      strength_score: Number((structure1d.support_history.strength_score * 1.5).toFixed(3)),
+      strength_score: Number((structure1d.support_history.strength_score * 1.6).toFixed(3)),
+      source: '1D',
+    });
+  }
+  if (structure4h.support_history) {
+    supportCandidates.push({ ...structure4h.support_history, source: '4H' });
+  }
+  if (structure1d?.resistance_history) {
+    resistanceCandidates.push({
+      ...structure1d.resistance_history,
+      strength_score: Number((structure1d.resistance_history.strength_score * 1.6).toFixed(3)),
       source: '1D',
     });
   }
   if (structure4h.resistance_history) {
     resistanceCandidates.push({ ...structure4h.resistance_history, source: '4H' });
-  }
-  if (structure1d?.resistance_history) {
-    resistanceCandidates.push({
-      ...structure1d.resistance_history,
-      strength_score: Number((structure1d.resistance_history.strength_score * 1.5).toFixed(3)),
-      source: '1D',
-    });
   }
 
   const supportHistory =
@@ -825,19 +843,19 @@ export function analyzeMultiTimeframe(
       `Resistance at ${resistanceHistory.price} has weak history: ${resistanceHistory.bounces} bounces vs ${resistanceHistory.breaks} breaks`;
   }
 
-  // Collect top institutional levels (4H + 1D) for chart visualization
+  // Collect top global institutional levels (1D + 4H across full history) for chart visualization
   const mergedInstitutional: ClusteredLevelWithHistory[] = [
-    ...structure4h.all_levels.slice(0, 4).map((l) => ({ ...l, source: '4H' as const })),
-    ...(structure1d?.all_levels.slice(0, 4).map((l) => ({
+    ...(structure1d?.all_levels.slice(0, 6).map((l) => ({
       ...l,
-      strength_score: Number((l.strength_score * 1.5).toFixed(3)),
+      strength_score: Number((l.strength_score * 1.6).toFixed(3)),
       source: '1D' as const,
     })) || []),
+    ...structure4h.all_levels.slice(0, 6).map((l) => ({ ...l, source: '4H' as const })),
   ].sort((a, b) => b.strength_score - a.strength_score);
 
   const levelMapSummary =
     `Trend: ${marketTrend} (1D=${d1Trend} RSI ${rsi1d}, 4H=${h4Trend} RSI ${rsi4h}, 1H=${h1Trend} RSI ${rsi1h}) | ` +
-    `4H: Sup=${key4hSupport.toPrecision(6)} / Res=${key4hResistance.toPrecision(6)} (Pos: ${pos4hPct.toFixed(0)}%) | ` +
+    `Global 1D/4H: Sup=${key4hSupport.toPrecision(6)} / Res=${key4hResistance.toPrecision(6)} (Pos: ${pos4hPct.toFixed(0)}%) | ` +
     `1H: Sup=${local1hSupport.toPrecision(6)} / Res=${local1hResistance.toPrecision(6)} (Pos: ${pos1hPct.toFixed(0)}%)`;
 
   return {
@@ -872,7 +890,7 @@ export function analyzeMultiTimeframe(
     level_map_summary: levelMapSummary,
     support_history: supportHistory,
     resistance_history: resistanceHistory,
-    institutional_levels: mergedInstitutional.slice(0, 6),
+    institutional_levels: mergedInstitutional.slice(0, 8),
   };
 }
 
@@ -1033,24 +1051,33 @@ export function checkRsiCondition(
   }
 }
 
+/**
+ * Находит уровни усреднения (Smart DCA) СТРОГО по предыдущим историческим максимумам (для SHORT)
+ * и предыдущим историческим минимумам (для LONG) на графиках 4H и 1D.
+ * Гарантирует минимальную структурную дистанцию (не менее 2.8%–3.5% от точки входа или предыдущего добора),
+ * чтобы бот НИКОГДА не лепил несколько усреднений подряд рядом со входом.
+ */
 export function findStrongestDcaLevel(
   candles4h: OhlcvCandle[],
   candles1d: OhlcvCandle[],
-  currentPrice: number,
+  referencePrice: number,
   isShort: boolean,
-  minDistPct = 1.5,
-  maxDistPct = 12.0
+  minDistPct = 2.8,
+  maxDistPct = 18.0
 ): {
   price: number;
+  second_price: number;
   strength_score: number;
   bounces: number;
   breaks: number;
   source: string;
   type: 'support' | 'resistance';
 } {
-  if (currentPrice <= 0) {
+  const effectiveMinDistPct = Math.max(2.8, minDistPct);
+  if (referencePrice <= 0) {
     return {
       price: 0,
+      second_price: 0,
       strength_score: 0,
       bounces: 0,
       breaks: 0,
@@ -1060,61 +1087,237 @@ export function findStrongestDcaLevel(
   }
 
   const allCandidates: ClusteredLevelWithHistory[] = [];
-  if (candles4h && candles4h.length >= 30) {
-    const levels4h = buildLevelsWithHistory(candles4h, 3, 3, 0.6);
-    for (const lvl of levels4h) {
-      allCandidates.push({ ...lvl, source: '4H' });
-    }
-  }
-  if (candles1d && candles1d.length >= 30) {
-    const levels1d = buildLevelsWithHistory(candles1d, 3, 3, 0.8);
+
+  // 1. Кластеризованные глобальные уровни 1D и 4H за всю историю
+  if (candles1d && candles1d.length >= 15) {
+    const levels1d = buildLevelsWithHistory(candles1d, 2, 2, 0.8);
     for (const lvl of levels1d) {
       allCandidates.push({
         ...lvl,
-        strength_score: Number((lvl.strength_score * 1.5).toFixed(3)),
-        source: '1D',
+        strength_score: Number((lvl.strength_score * 1.6).toFixed(3)),
+        source: '1D_EXTREME',
       });
+    }
+    // Также добавляем чистые предыдущие дневные максимумы (Swing Highs) и минимумы (Swing Lows)
+    const pivots1d = findPivots(candles1d, 2, 2);
+    for (const p of pivots1d) {
+      if ((isShort && p.type === 'high') || (!isShort && p.type === 'low')) {
+        allCandidates.push({
+          price: Number(p.price.toPrecision(7)),
+          type: p.type === 'high' ? 'resistance' : 'support',
+          touches: 2,
+          bounces: 2,
+          breaks: 0,
+          bounce_rate: 1,
+          last_touch_index: p.index,
+          strength_score: 3.8,
+          source: isShort ? '1D_PREV_HIGH' : '1D_PREV_LOW',
+        });
+      }
     }
   }
 
-  // Filter levels strictly within [minDistPct, maxDistPct] so parabolic pumps never pick ancient levels 80% away
+  if (candles4h && candles4h.length >= 20) {
+    const levels4h = buildLevelsWithHistory(candles4h, 3, 3, 0.6);
+    for (const lvl of levels4h) {
+      allCandidates.push({ ...lvl, source: '4H_LEVEL' });
+    }
+    // Добавляем реальные предыдущие 4H максимумы (для Шорта) и минимумы (для Лонга)
+    const pivots4h = findPivots(candles4h, 3, 3);
+    for (const p of pivots4h) {
+      if ((isShort && p.type === 'high') || (!isShort && p.type === 'low')) {
+        allCandidates.push({
+          price: Number(p.price.toPrecision(7)),
+          type: p.type === 'high' ? 'resistance' : 'support',
+          touches: 2,
+          bounces: 2,
+          breaks: 0,
+          bounce_rate: 1,
+          last_touch_index: p.index,
+          strength_score: 3.2,
+          source: isShort ? '4H_PREV_HIGH' : '4H_PREV_LOW',
+        });
+      }
+    }
+  }
+
+  // Фильтруем кандидатов:
+  // - Для SHORT: только предыдущие максимумы / сопротивления ВЫШЕ referencePrice минимум на effectiveMinDistPct%
+  // - Для LONG: только предыдущие минимумы / поддержки НИЖЕ referencePrice минимум на effectiveMinDistPct%
   const validLevels = allCandidates.filter((lvl) => {
     if (!isShort) {
-      const distPct = ((currentPrice - lvl.price) / currentPrice) * 100.0;
-      return lvl.type === 'support' && distPct >= minDistPct && distPct <= maxDistPct;
+      const distPct = ((referencePrice - lvl.price) / referencePrice) * 100.0;
+      return lvl.type === 'support' && distPct >= effectiveMinDistPct && distPct <= maxDistPct;
     } else {
-      const distPct = ((lvl.price - currentPrice) / currentPrice) * 100.0;
-      return lvl.type === 'resistance' && distPct >= minDistPct && distPct <= maxDistPct;
+      const distPct = ((lvl.price - referencePrice) / referencePrice) * 100.0;
+      return lvl.type === 'resistance' && distPct >= effectiveMinDistPct && distPct <= maxDistPct;
     }
   });
 
+  // Сортируем по удалению от цены входа: сначала ближайший структурный предыдущий максимум/минимум (но не ближе effectiveMinDistPct!),
+  // а при близких ценах — выбираем более сильный уровень 1D/4H
   if (validLevels.length > 0) {
-    const best = validLevels.reduce((prev, cur) => {
-      if (cur.strength_score !== prev.strength_score) {
-        return cur.strength_score > prev.strength_score ? cur : prev;
-      }
-      return cur.bounces > prev.bounces ? cur : prev;
+    const sortedByDistance = [...validLevels].sort((a, b) =>
+      isShort ? a.price - b.price : b.price - a.price
+    );
+
+    // Выбираем первый значимый экстремум (DCA #1) среди ближайшего кластера предыдущих максимумов/минимумов
+    const firstAnchor = sortedByDistance[0];
+    const nearFirstCluster = sortedByDistance.filter(
+      (l) => (Math.abs(l.price - firstAnchor.price) / firstAnchor.price) * 100 <= 1.2
+    );
+    const bestFirst = nearFirstCluster.reduce((prev, cur) =>
+      cur.strength_score > prev.strength_score ? cur : prev
+    );
+
+    // Выбираем второй экстремум (DCA #2) строго дальше от bestFirst минимум на effectiveMinDistPct%
+    const secondCandidates = sortedByDistance.filter((l) => {
+      const distFromFirst = isShort
+        ? ((l.price - bestFirst.price) / bestFirst.price) * 100
+        : ((bestFirst.price - l.price) / bestFirst.price) * 100;
+      return distFromFirst >= effectiveMinDistPct;
     });
+
+    const secondPrice =
+      secondCandidates.length > 0
+        ? Number(secondCandidates[0].price.toPrecision(7))
+        : Number(
+            (
+              bestFirst.price *
+              (isShort ? 1 + effectiveMinDistPct / 100 : 1 - effectiveMinDistPct / 100)
+            ).toPrecision(7)
+          );
+
     return {
-      price: Number(best.price.toPrecision(7)),
-      strength_score: best.strength_score,
-      bounces: best.bounces,
-      breaks: best.breaks,
-      source: best.source || '4H/1D',
-      type: best.type,
+      price: Number(bestFirst.price.toPrecision(7)),
+      second_price: secondPrice,
+      strength_score: bestFirst.strength_score,
+      bounces: bestFirst.bounces,
+      breaks: bestFirst.breaks,
+      source: bestFirst.source || (isShort ? '4H_PREV_HIGH' : '4H_PREV_LOW'),
+      type: bestFirst.type,
     };
   }
 
-  const fallbackPrice = Number(
-    (currentPrice * (isShort ? 1.025 : 0.975)).toPrecision(7)
+  // Если цена на историческом экстремуме (нет предыдущих свечей выше/ниже в окне) — ставим шаг не ближе 3.5%
+  const fallbackStepPct = Math.max(0.035, effectiveMinDistPct / 100);
+  const fallbackPrice1 = Number(
+    (referencePrice * (isShort ? 1 + fallbackStepPct : 1 - fallbackStepPct)).toPrecision(7)
+  );
+  const fallbackPrice2 = Number(
+    (fallbackPrice1 * (isShort ? 1 + fallbackStepPct : 1 - fallbackStepPct)).toPrecision(7)
   );
   return {
-    price: fallbackPrice,
+    price: fallbackPrice1,
+    second_price: fallbackPrice2,
     strength_score: 0,
     bounces: 0,
     breaks: 0,
-    source: 'default_step',
+    source: isShort ? 'PREV_HIGH_STEP' : 'PREV_LOW_STEP',
     type: isShort ? 'resistance' : 'support',
+  };
+}
+
+/**
+ * ОТДЕЛЬНАЯ СТРАТЕГИЯ #2: GlobalHedgeStrategy (2-сторонние сделки LONG + SHORT в среднесрок и долгосрок)
+ * Работает независимо от быстрого скальпинга (ScalpingStrategy):
+ * - Анализирует глобальный канал 1D и 4H за всю историю
+ * - Открывает парную 2-стороннюю позицию только тогда, когда на 1D и 4H сформирован широкий среднесрочный/долгосрочный коридор
+ *   между глобальной поддержкой и глобальным сопротивлением (ширина коридора >= 3.5%), а цена находится внутри рабочего ядра канала (25%–75%).
+ */
+export interface GlobalHedgeEvaluation {
+  strategy_name: 'GlobalHedgeStrategy';
+  should_enter_hedge: boolean;
+  should_open_hedge: boolean;
+  channel_width_pct: number;
+  long_tp_price: number;
+  short_tp_price: number;
+  long_dca_price: number;
+  short_dca_price: number;
+  horizon: 'MEDIUM_TERM_4H' | 'LONG_TERM_1D';
+  horizon_label: 'MEDIUM_TERM_4H' | 'LONG_TERM_1D';
+  reason: string;
+}
+
+export function evaluateGlobalHedgeStrategy(
+  candles1h: OhlcvCandle[],
+  candles4h: OhlcvCandle[],
+  candles1d: OhlcvCandle[],
+  mtf: MultiTimeframeAnalysis,
+  btcIsSafe = true
+): GlobalHedgeEvaluation {
+  const currentPrice =
+    candles1h.length > 0
+      ? candles1h[candles1h.length - 1].close
+      : candles4h.length > 0
+      ? candles4h[candles4h.length - 1].close
+      : 0;
+
+  if (currentPrice <= 0 || candles4h.length < 30 || !mtf) {
+    return {
+      strategy_name: 'GlobalHedgeStrategy',
+      should_enter_hedge: false,
+      should_open_hedge: false,
+      channel_width_pct: 0,
+      long_tp_price: currentPrice * 1.025,
+      short_tp_price: currentPrice * 0.975,
+      long_dca_price: currentPrice * 0.965,
+      short_dca_price: currentPrice * 1.035,
+      horizon: 'MEDIUM_TERM_4H',
+      horizon_label: 'MEDIUM_TERM_4H',
+      reason: 'Недостаточно истории 4H/1D для среднесрочного 2-стороннего входа',
+    };
+  }
+
+  const globalSup = mtf.key_4h_support;
+  const globalRes = mtf.key_4h_resistance;
+  const channelWidthPct =
+    globalRes > globalSup ? ((globalRes - globalSup) / currentPrice) * 100.0 : 0;
+
+  // 2-сторонние сделки открываются в среднесрок и долгосрок в широком глобальном коридоре (>= 3.2%)
+  const posPct = Number.isFinite(mtf.pos_4h_pct) ? mtf.pos_4h_pct : 50;
+  const inEquilibriumZone = posPct >= 25.0 && posPct <= 75.0;
+  const safeRsiZone =
+    mtf.rsi_1d >= 26.0 &&
+    mtf.rsi_1d <= 72.0 &&
+    mtf.rsi_4h >= 28.0 &&
+    mtf.rsi_4h <= 70.0 &&
+    mtf.rsi_1h >= 28.0 &&
+    mtf.rsi_1h <= 70.0;
+  const noExtremeImpulse = btcIsSafe && !isKnifeDrop(candles1h) && !isPumpExhaustion(candles1h);
+
+  const shouldEnter =
+    channelWidthPct >= 3.2 && inEquilibriumZone && safeRsiZone && noExtremeImpulse;
+
+  // Среднесрочные / долгосрочные цели TP для каждой ноги внутри глобального канала 4H / 1D (от 1.8% до 4.5% движения цены)
+  const rawLongTarget = globalRes * 0.995;
+  const rawShortTarget = globalSup * 1.005;
+  const longTpPrice = Number(
+    Math.max(currentPrice * 1.018, Math.min(currentPrice * 1.045, rawLongTarget)).toPrecision(7)
+  );
+  const shortTpPrice = Number(
+    Math.min(currentPrice * 0.982, Math.max(currentPrice * 0.955, rawShortTarget)).toPrecision(7)
+  );
+
+  const longDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, false, 3.0);
+  const shortDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, true, 3.0);
+  const horizonLabel: 'MEDIUM_TERM_4H' | 'LONG_TERM_1D' =
+    channelWidthPct >= 6.0 ? 'LONG_TERM_1D' : 'MEDIUM_TERM_4H';
+
+  return {
+    strategy_name: 'GlobalHedgeStrategy',
+    should_enter_hedge: shouldEnter,
+    should_open_hedge: shouldEnter,
+    channel_width_pct: Number(channelWidthPct.toFixed(2)),
+    long_tp_price: longTpPrice,
+    short_tp_price: shortTpPrice,
+    long_dca_price: longDca.price,
+    short_dca_price: shortDca.price,
+    horizon: horizonLabel,
+    horizon_label: horizonLabel,
+    reason: shouldEnter
+      ? `GlobalHedgeStrategy (${horizonLabel === 'LONG_TERM_1D' ? 'Долгосрок 1D' : 'Среднесрок 4H'}): глобальный коридор [${globalSup} .. ${globalRes}] (${channelWidthPct.toFixed(1)}%), позиция в канале ${posPct.toFixed(0)}%`
+      : `Коридор ${channelWidthPct.toFixed(1)}% (поз. ${posPct.toFixed(0)}%) вне зоны среднесрочного 2-стороннего входа`,
   };
 }
 

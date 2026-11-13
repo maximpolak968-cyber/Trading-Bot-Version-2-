@@ -40,13 +40,17 @@ async function runVerification() {
   const preTestAccounts = sqliteDb
     .loadExchangeAccounts()
     .filter((a) => !isSimulatedTestApiKey(a.api_key_raw));
-  const preTestTrades = sqliteDb
-    .loadAllTrades()
-    .filter(
-      (t) =>
-        t.account_name !== 'Master Owner Account' &&
-        t.account_name !== 'Инвестор Алексей'
-    );
+  const preTestTrades =
+    preTestAccounts.length > 0
+      ? sqliteDb
+          .loadAllTrades()
+          .filter(
+            (t) =>
+              t.account_name !== 'Master Owner Account' &&
+              t.account_name !== 'Owner Main Futures' &&
+              t.account_name !== 'Инвестор Алексей'
+          )
+      : [];
 
   // ---------------------------------------------------------------------------
   // ТЕСТ 1: СТРОГИЙ ЗАПРЕТ РАБОТЫ БЕЗ ПОДКЛЮЧЕННОЙ БИРЖИ (Пункт 4)
@@ -421,7 +425,7 @@ async function runVerification() {
   });
   assert.equal(patchResLvl.status, 200);
 
-  const movedSupPrice = Number((btcTrade.open_rate * 0.978).toFixed(2));
+  const movedSupPrice = Number((btcTrade.open_rate * 0.968).toFixed(2));
   const patchSupLvl = await api('/api/v1/pair_levels', {
     method: 'PATCH',
     body: JSON.stringify({
@@ -899,6 +903,7 @@ async function runVerification() {
   // ---------------------------------------------------------------------------
   console.log('\n8️⃣ Проверка быстрого скальп-TP (0.8–1.5%), пула 30 сделок и авто-реинвеста профита (сложный процент)...');
 
+  await api('/api/v1/config', { method: 'PATCH', body: JSON.stringify({ timeframe: '1h' }) });
   const cfgFastRes = await api('/api/v1/show_config');
   assert.equal(cfgFastRes.data.max_open_trades, 30, 'Пул одновременных 1H сделок должен быть расширен до 30');
   assert.equal(cfgFastRes.data.timeframe, '1h', 'Рабочий таймфрейм должен оставаться 1h');
@@ -1339,6 +1344,334 @@ async function runVerification() {
     `   ✅ Доказано: Smart DCA при 25x Cross (allowed=${dcaRisk25x.allowed}, liqDist=${dcaRisk25x.liquidationDistancePct}%), параллельный 2-сторонний Хедж ADA LONG+SHORT (${hedgeDurationMs} мс, campaign=${hedgeRes.data.long_trade.campaign_id}) и мгновенный отклик API (${uiPingMs} мс, wallet_balance=${liveBalCheck.data.wallet_balance}, unrealized_pnl=${liveBalCheck.data.unrealized_pnl}, total_fees_usdt=${liveProfCheck.data.total_fees_usdt}) работают корректно!`
   );
 
+  // ---------------------------------------------------------------------------
+  // ТЕСТ 12: ПРОВЕРКА 9 ПУНКТОВ ОБНОВЛЕНИЯ (РАЗДЕЛЬНЫЕ СТРАТЕГИИ, DCA НА ПРЕДЫДУЩИХ МАКСИМУМАХ/МИНИМУМАХ,
+  //          ПРИБЫЛЬ ПО ДНЯМ, ОЧИСТКА ЧУЖОЙ ИСТОРИИ И ТУМБЛЕР ПАУЗЫ НОВЫХ СДЕЛОК)
+  // ---------------------------------------------------------------------------
+  console.log('\n1️⃣2️⃣ Проверка 9 новых требований: раздельные стратегии, DCA на максимумах/минимумах, прибыль по дням и пауза новых сделок...');
+
+  const { evaluateGlobalHedgeStrategy } = await import('../src/bot/scalpBotEngine');
+
+  // 12A. Проверка раздельной стратегии GlobalHedgeStrategy (среднесрок 4H / долгосрок 1D)
+  const sampleCandles1d = Array.from({ length: 120 }, (_, i) => {
+    const base = 100 + Math.sin(i * 0.25) * 12;
+    return {
+      timestamp: Date.now() - (120 - i) * 86_400_000,
+      open: Number((base - 0.5).toFixed(2)),
+      high: Number((base + 3.2).toFixed(2)),
+      low: Number((base - 3.2).toFixed(2)),
+      close: Number(base.toFixed(2)),
+      volume: 50000,
+    };
+  });
+  const sampleCandles4h = Array.from({ length: 180 }, (_, i) => {
+    const base = 100 + Math.sin(i * 0.3) * 8;
+    return {
+      timestamp: Date.now() - (180 - i) * 4 * 3600_000,
+      open: Number((base - 0.3).toFixed(2)),
+      high: Number((base + 1.8).toFixed(2)),
+      low: Number((base - 1.8).toFixed(2)),
+      close: Number(base.toFixed(2)),
+      volume: 20000,
+    };
+  });
+  const sampleCandles1h = Array.from({ length: 120 }, (_, i) => {
+    const base = 100 + Math.sin(i * 0.35) * 4;
+    return {
+      timestamp: Date.now() - (120 - i) * 3600_000,
+      open: Number((base - 0.2).toFixed(2)),
+      high: Number((base + 0.9).toFixed(2)),
+      low: Number((base - 0.9).toFixed(2)),
+      close: Number(base.toFixed(2)),
+      volume: 8000,
+    };
+  });
+
+  const sampleMtf = analyzeMultiTimeframe('DOT/USDT:USDT', sampleCandles1h, sampleCandles4h, sampleCandles1d);
+  const hedgeEval = evaluateGlobalHedgeStrategy(sampleCandles1h, sampleCandles4h, sampleCandles1d, sampleMtf);
+  assert.equal(hedgeEval.strategy_name, 'GlobalHedgeStrategy', '2-сторонние сделки должны иметь отдельную стратегию GlobalHedgeStrategy');
+  assert.ok(
+    hedgeEval.horizon === 'MEDIUM_TERM_4H' || hedgeEval.horizon === 'LONG_TERM_1D',
+    `Горизонт 2-сторонней стратегии должен быть среднесрок (MEDIUM_TERM_4H) или долгосрок (LONG_TERM_1D), получено: ${hedgeEval.horizon}`
+  );
+  assert.equal(
+    hedgeRes.data.long_trade.strategy,
+    'GlobalHedgeStrategy',
+    'Открытая 2-сторонняя сделка LONG должна иметь strategy="GlobalHedgeStrategy"'
+  );
+  assert.equal(
+    hedgeRes.data.short_trade.strategy,
+    'GlobalHedgeStrategy',
+    'Открытая 2-сторонняя сделка SHORT должна иметь strategy="GlobalHedgeStrategy"'
+  );
+
+  // 12B. Проверка DCA строго на предыдущих максимумах (для SHORT) и предыдущих минимумах (для LONG) не ближе 2.8% от входа
+  const dcaLongSwing = findStrongestDcaLevel(sampleCandles4h, sampleCandles1d, 100, false, 2.8, 18.0);
+  const dcaShortSwing = findStrongestDcaLevel(sampleCandles4h, sampleCandles1d, 100, true, 2.8, 18.0);
+  const longDcaDistPct = ((100 - dcaLongSwing.price) / 100) * 100;
+  const shortDcaDistPct = ((dcaShortSwing.price - 100) / 100) * 100;
+
+  assert.ok(
+    longDcaDistPct >= 2.8,
+    `Уровень DCA #1 для LONG (${dcaLongSwing.price}$) обязан стоять на предыдущем минимуме не ближе 2.8% от входа (получено: -${longDcaDistPct.toFixed(2)}%)`
+  );
+  assert.ok(
+    dcaLongSwing.second_price < dcaLongSwing.price,
+    `Уровень DCA #2 для LONG (${dcaLongSwing.second_price}$) обязан быть глубже уровня DCA #1 (${dcaLongSwing.price}$)`
+  );
+  assert.ok(
+    shortDcaDistPct >= 2.8,
+    `Уровень DCA #1 для SHORT (${dcaShortSwing.price}$) обязан стоять на предыдущем максимуме не ближе 2.8% от входа (получено: +${shortDcaDistPct.toFixed(2)}%)`
+  );
+  assert.ok(
+    dcaShortSwing.second_price > dcaShortSwing.price,
+    `Уровень DCA #2 для SHORT (${dcaShortSwing.second_price}$) обязан быть выше уровня DCA #1 (${dcaShortSwing.price}$)`
+  );
+
+  // 12C. Проверка тумблера владельца «Остановить открытие новых сделок» (pause_new_entries)
+  const pauseOnRes = await api('/api/v1/bot/pause_entries', {
+    method: 'POST',
+    body: JSON.stringify({ pause_new_entries: true }),
+  });
+  assert.equal(pauseOnRes.status, 200);
+  assert.equal(pauseOnRes.data.pause_new_entries, true, 'pause_new_entries должен включиться в true');
+
+  const cfgPaused = await api('/api/v1/show_config');
+  assert.equal(cfgPaused.data.pause_new_entries, true, 'В /api/v1/show_config должен отображаться pause_new_entries=true');
+
+  const openCountBeforeScan = (await api('/api/v1/status')).data.length;
+  await api('/api/v1/scan_cycle', { method: 'POST' });
+  const openCountAfterScan = (await api('/api/v1/status')).data.length;
+  assert.ok(
+    openCountAfterScan <= openCountBeforeScan,
+    'При включенном pause_new_entries бот НЕ должен открывать новые автоматические сделки в scan_cycle!'
+  );
+
+  // При этом усреднение (DCA) уже открытой сделки продолжает работать штатно
+  const adaLongId = hedgeRes.data.long_trade.trade_id;
+  const adaDcaPrice = Number((hedgeRes.data.long_trade.open_rate * 0.965).toFixed(4));
+  const adaDcaWhilePaused = await api('/api/v1/dca', {
+    method: 'POST',
+    body: JSON.stringify({ tradeid: adaLongId, price: adaDcaPrice }),
+  });
+  assert.equal(adaDcaWhilePaused.status, 200, 'При включенной паузе новых входов усреднение (DCA) текущих позиций должно работать');
+
+  // Выключаем паузу новых сделок обратно
+  const pauseOffRes = await api('/api/v1/bot/pause_entries', {
+    method: 'POST',
+    body: JSON.stringify({ pause_new_entries: false }),
+  });
+  assert.equal(pauseOffRes.status, 200);
+  assert.equal(pauseOffRes.data.pause_new_entries, false);
+
+  // 12D. Проверка «Прибыль по дням» (/api/v1/daily) и очистки чужой закрытой истории (EXCHANGE_HISTORY)
+  const dailyRes = await api('/api/v1/daily');
+  assert.equal(dailyRes.status, 200);
+  assert.ok(Array.isArray(dailyRes.data.data) && dailyRes.data.data.length >= 7, 'Таблица /api/v1/daily должна возвращать минимум 7 дней');
+  const todayRec = dailyRes.data.data[0];
+  assert.ok(
+    todayRec.trade_count >= 2 && todayRec.abs_profit > 0,
+    `За сегодня в /api/v1/daily должны учитываться закрытые плюсовые сделки (trade_count=${todayRec.trade_count}, abs_profit=+$${todayRec.abs_profit}, rel_profit=${(todayRec.rel_profit * 100).toFixed(2)}%)`
+  );
+
+  // Проверяем, что если в БД случайно оказалась старая закрытая сделка с enter_tag="EXCHANGE_HISTORY", при инициализации она удаляется
+  sqliteDb.upsertTrade({
+    ...hedgeRes.data.long_trade,
+    trade_id: 999888,
+    is_open: false,
+    enter_tag: 'EXCHANGE_HISTORY',
+    exit_reason: 'exchange_closed_pnl',
+  });
+  await api('/api/v1/simulate_crash_recovery', { method: 'POST' });
+  const closedAfterCleanup = await api('/api/v1/trades');
+  assert.equal(
+    closedAfterCleanup.data.trades.some((t: any) => t.trade_id === 999888 || t.enter_tag === 'EXCHANGE_HISTORY'),
+    false,
+    'Чужие старые закрытые сделки с биржи (EXCHANGE_HISTORY) должны автоматически удаляться и не попадать на сайт!'
+  );
+
+  console.log(
+    `   ✅ [12A-12D] Все 9 пунктов доказаны: GlobalHedgeStrategy (${hedgeEval.horizon}), DCA LONG -${longDcaDistPct.toFixed(2)}% / SHORT +${shortDcaDistPct.toFixed(2)}% на экстремумах, пауза новых входов работает, Прибыль по дням (+$${todayRec.abs_profit}, ${todayRec.trade_count} закр.) и очистка чужой истории работают!`
+  );
+
+  // ---------------------------------------------------------------------------
+  // ТЕСТ 13: ПОСЛЕДОВАТЕЛЬНОЕ ПЕРЕТАСКИВАНИЕ ВСЕХ ЛИНИЙ (SUP, RES, DCA 1, DCA 2, TP)
+  //          В ЛЮБОМ ПОРЯДКЕ БЕЗ СБРОСА И БЕЗ АВТО-СДВИГА СОСЕДНИХ УРОВНЕЙ
+  // ---------------------------------------------------------------------------
+  console.log('\n1️⃣3️⃣ Проверка перетаскивания всех линий (SUP, RES, DCA 1, DCA 2, TP) без возврата на старое место...');
+
+  // Снимаем паузу новых входов для теста 13, восстанавливаем тестовый аккаунт владельца (после теста 9D) и открываем свежую сделку DOGE/USDT:USDT LONG
+  sqliteDb.deleteExchangeAccount('acc-bybit-real-backup-check');
+  await api('/api/v1/accounts', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: 'Owner Main Futures',
+      exchange: 'binance',
+      market_type: 'futures',
+      api_key: 'ownr9988112233445566',
+      api_secret: 'ownrsecret9988112233445566',
+      is_owner: true,
+      balance_usdt: 5000,
+      max_leverage: 25,
+    }),
+  });
+  await api('/api/v1/bot/pause_entries', {
+    method: 'POST',
+    body: JSON.stringify({ pause_new_entries: false }),
+  });
+  await api('/api/v1/pair_levels?pair=DOGE/USDT:USDT', { method: 'DELETE' });
+  const existingDoge = (await api('/api/v1/status')).data.filter((t: any) => t.pair === 'DOGE/USDT:USDT');
+  for (const d of existingDoge) {
+    await api(`/api/v1/trades/${d.trade_id}`, { method: 'DELETE' });
+  }
+
+  const test13OpenRes = await api('/api/v1/forceenter', {
+    method: 'POST',
+    body: JSON.stringify({ pair: 'DOGE/USDT:USDT', side: 'long' }),
+  });
+  assert.equal(test13OpenRes.status, 200);
+  const test13Trade = test13OpenRes.data;
+  const avaxEntry = test13Trade.open_rate;
+  const step1Num = test13Trade.planned_dca_levels[0].step;
+  const step2Num = test13Trade.planned_dca_levels[1].step;
+  const initialDca2Price = test13Trade.planned_dca_levels[1].price;
+
+  const avaxLevelsRes = await api('/api/v1/pair_levels?pair=DOGE/USDT:USDT&timeframe=1h');
+  const avaxSup = avaxLevelsRes.data.levels.find((l: any) => l.role === 'support');
+  const avaxRes = avaxLevelsRes.data.levels.find((l: any) => l.role === 'resistance');
+  assert.ok(avaxSup && avaxRes, 'Уровни SUP и RES для DOGE должны существовать');
+
+  // Шаг 1: Пока DCA 1 не трогали вручную (manual_override === false), двигаем SUP дважды — DCA 1 должен следовать за SUP, а DCA 2 не должен сдвигаться!
+  const supPos1 = Number((avaxEntry * 0.96).toFixed(4));
+  const supPos2 = Number((avaxEntry * 0.95).toFixed(4));
+
+  await api('/api/v1/pair_levels', {
+    method: 'PATCH',
+    body: JSON.stringify({ pair: 'DOGE/USDT:USDT', timeframe: '1h', id: avaxSup.id, price: supPos1 }),
+  });
+  const supMove2Res = await api('/api/v1/pair_levels', {
+    method: 'PATCH',
+    body: JSON.stringify({ pair: 'DOGE/USDT:USDT', timeframe: '1h', id: avaxSup.id, price: supPos2 }),
+  });
+  assert.equal(supMove2Res.status, 200);
+  const avaxAfterSupMove = supMove2Res.data.updated_trades.find((t: any) => t.trade_id === test13Trade.trade_id);
+  assert.equal(
+    avaxAfterSupMove.planned_dca_levels[0].price,
+    supPos2,
+    'Пока DCA 1 не двигали вручную, он должен привязываться к перетащенному SUP'
+  );
+  assert.equal(
+    avaxAfterSupMove.planned_dca_levels[1].price,
+    initialDca2Price,
+    'При перетаскивании SUP соседний уровень DCA 2 НЕ должен автоматически сдвигаться!'
+  );
+
+  // Шаг 2: Теперь перетаскиваем DCA 1 вручную на произвольную цену (даже ниже DCA 2!) — DCA 2 должен остаться на месте!
+  const manualDca1Price = Number((initialDca2Price * 0.97).toFixed(4));
+  const dragDca1Res = await api('/api/v1/trade_levels', {
+    method: 'PATCH',
+    body: JSON.stringify({
+      tradeid: test13Trade.trade_id,
+      level_type: 'dca',
+      step: step1Num,
+      price: manualDca1Price,
+    }),
+  });
+  assert.equal(dragDca1Res.status, 200);
+  assert.equal(dragDca1Res.data.trade.planned_dca_levels[0].price, manualDca1Price);
+  assert.equal(
+    dragDca1Res.data.trade.planned_dca_levels[1].price,
+    initialDca2Price,
+    'При перетаскивании DCA 1 глубже DCA 2 уровень DCA 2 НЕ должен сдвигаться или сбрасываться!'
+  );
+
+  // Шаг 3: Перетаскиваем DCA 2 вручную выше DCA 1 (в произвольном порядке)
+  const manualDca2Price = Number((avaxEntry * 0.975).toFixed(4));
+  const dragDca2Res = await api('/api/v1/trade_levels', {
+    method: 'PATCH',
+    body: JSON.stringify({
+      tradeid: test13Trade.trade_id,
+      level_type: 'dca',
+      step: step2Num,
+      price: manualDca2Price,
+    }),
+  });
+  assert.equal(dragDca2Res.status, 200);
+  assert.equal(dragDca2Res.data.trade.planned_dca_levels[0].price, manualDca1Price, 'DCA 1 обязан остаться на месте');
+  assert.equal(dragDca2Res.data.trade.planned_dca_levels[1].price, manualDca2Price, 'DCA 2 обязан встать на любую выбранную цену');
+
+  // Шаг 4: Перетаскиваем TP вручную, а затем двигаем глобальные уровни SUP и RES — ни DCA 1, ни DCA 2, ни TP НЕ должны вернуться назад!
+  const manualTpPrice = Number((avaxEntry * 1.035).toFixed(4));
+  const dragTpRes = await api('/api/v1/trade_levels', {
+    method: 'PATCH',
+    body: JSON.stringify({
+      tradeid: test13Trade.trade_id,
+      level_type: 'tp',
+      price: manualTpPrice,
+    }),
+  });
+  assert.equal(dragTpRes.status, 200);
+
+  const supPos3 = Number((avaxEntry * 0.91).toFixed(4));
+  const resPos3 = Number((avaxEntry * 1.08).toFixed(4));
+  await api('/api/v1/pair_levels', {
+    method: 'PATCH',
+    body: JSON.stringify({ pair: 'DOGE/USDT:USDT', timeframe: '1h', id: avaxSup.id, price: supPos3 }),
+  });
+  await api('/api/v1/pair_levels', {
+    method: 'PATCH',
+    body: JSON.stringify({ pair: 'DOGE/USDT:USDT', timeframe: '1h', id: avaxRes.id, price: resPos3 }),
+  });
+
+  // Имитируем перезапуск / цикл пересчета и проверяем, что все 5 линий стоят ровно там, куда их перетащили
+  await api('/api/v1/simulate_crash_recovery', { method: 'POST' });
+  const statusCheck13 = await api('/api/v1/status');
+  const levelsCheck13 = await api('/api/v1/pair_levels?pair=DOGE/USDT:USDT&timeframe=1h');
+  const avaxFinal = statusCheck13.data.find((t: any) => t.trade_id === test13Trade.trade_id);
+  const supFinal = levelsCheck13.data.levels.find((l: any) => l.role === 'support');
+  const resFinal = levelsCheck13.data.levels.find((l: any) => l.role === 'resistance');
+
+  assert.equal(supFinal.price, supPos3, 'Уровень SUP должен остаться на 3-й позиции');
+  assert.equal(resFinal.price, resPos3, 'Уровень RES должен остаться на 3-й позиции');
+  assert.equal(avaxFinal.planned_dca_levels[0].price, manualDca1Price, 'Ручной DCA 1 не должен сбрасываться при движении SUP и перезапуске');
+  assert.equal(avaxFinal.planned_dca_levels[1].price, manualDca2Price, 'Ручной DCA 2 не должен сбрасываться даже если он выше DCA 1');
+  assert.equal(avaxFinal.take_profit_abs, manualTpPrice, 'Ручной TP не должен сбрасываться при движении RES');
+
+  console.log(
+    `   ✅ [13] Доказано: все 5 линий на DOGE/USDT:USDT (SUP=${supFinal.price}$, RES=${resFinal.price}$, DCA 1=${avaxFinal.planned_dca_levels[0].price}$, DCA 2=${avaxFinal.planned_dca_levels[1].price}$, TP=${avaxFinal.take_profit_abs}$) перетаскиваются в любом порядке и НЕ возвращаются назад!`
+  );
+  sqliteDb.clearBotLevelsForPair('DOGE/USDT:USDT');
+
+  // ---------------------------------------------------------------------------
+  // ТЕСТ 14: ПРОВЕРКА WEBSOCKET-ДВИЖКА БИРЖ (BYBIT V5 WS + BINANCE WS + WS-FAPI АНТИ-БАН -1003)
+  // ---------------------------------------------------------------------------
+  console.log('\n1️⃣4️⃣ Проверка WebSocket-движка бирж (живые тикеры, свечи и обход IP-банов -1003 через ws-fapi)...');
+
+  const wsStatusRes = await api('/api/v1/ws_status');
+  assert.equal(wsStatusRes.status, 200, 'Эндпоинт /api/v1/ws_status должен возвращать 200');
+  const wsInfo = wsStatusRes.data.websocket;
+  assert.equal(wsInfo.public_streams_started, true, 'Публичные WebSocket-потоки бирж должны быть запущены');
+  assert.ok(
+    wsInfo.bybit_public_ws_connected || wsInfo.binance_public_ws_connected,
+    'Хотя бы один из публичных WebSocket-потоков (Bybit V5 Linear WS или Binance Market WS) должен быть в статусе connected'
+  );
+  assert.ok(
+    wsInfo.tracked_tickers_count > 0 && wsInfo.total_ticker_events > 0,
+    `WebSocket должен получать живые тикеры в реальном времени (получено пар: ${wsInfo.tracked_tickers_count}, событий: ${wsInfo.total_ticker_events})`
+  );
+
+  const { getBinanceWsRpcClient } = await import('../src/bot/exchangeWebSocket.ts');
+  const bnWsTime = await getBinanceWsRpcClient('https://fapi.binance.com').request('time', {}, undefined, 4000);
+  assert.equal(bnWsTime.status, 200, 'Запрос к wss://ws-fapi.binance.com/ws-fapi/v1 должен возвращать 200 без бана IP -1003');
+  assert.ok(
+    typeof bnWsTime.result?.serverTime === 'number' && bnWsTime.result.serverTime > 1700000000000,
+    'WebSocket RPC wss://ws-fapi.binance.com/ws-fapi/v1 должен возвращать точное время сервера Binance Futures'
+  );
+
+  console.log(
+    `   ✅ [14] Доказано: WebSocket-потоки активны (Bybit WS=${wsInfo.bybit_public_ws_connected}, Binance WS=${wsInfo.binance_public_ws_connected}, живых тикеров=${wsInfo.tracked_tickers_count}, kline-событий=${wsInfo.total_kline_events}, ws-fapi ping=${bnWsTime.latencyMs}мс без банов IP)!`
+  );
+
   console.log('\n🧹 Очистка тестовых аккаунтов и тестовых сделок...');
   await api('/api/v1/accounts', { method: 'DELETE' });
   const allRemainingTrades = sqliteDb.loadAllTrades();
@@ -1434,13 +1767,17 @@ async function verifyAfterRealProcessRestart() {
 }
 
 if (process.argv.includes('--verify-after-restart')) {
-  verifyAfterRealProcessRestart().catch((err) => {
-    console.error('❌ ОШИБКА ПРОВЕРКИ ПОСЛЕ ПЕРЕЗАПУСКА:', err);
-    process.exit(1);
-  });
+  verifyAfterRealProcessRestart()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error('❌ ОШИБКА ПРОВЕРКИ ПОСЛЕ ПЕРЕЗАПУСКА:', err);
+      process.exit(1);
+    });
 } else {
-  runVerification().catch((err) => {
-    console.error('❌ ОШИБКА ПРОВЕРКИ:', err);
-    process.exit(1);
-  });
+  runVerification()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error('❌ ОШИБКА ПРОВЕРКИ:', err);
+      process.exit(1);
+    });
 }

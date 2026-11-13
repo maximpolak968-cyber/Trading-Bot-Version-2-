@@ -99,6 +99,8 @@ interface DraggableLevelTarget {
   label: string;
   price: number;
   y: number;
+  badgeX?: number;
+  badgeW?: number;
 }
 
 interface CanvasDeleteHitBox {
@@ -383,7 +385,7 @@ function drawHorizontalLevel(
     deleteHitBoxes,
   } = opts;
 
-  if (y < plotTop + 2 || y > plotBottom - 2) return;
+  if (y < plotTop + 2 || y > plotBottom - 2) return { boxX: plotLeft + 10, boxW: 60 };
 
   ctx.save();
 
@@ -461,6 +463,7 @@ function drawHorizontalLevel(
   }
 
   ctx.restore();
+  return { boxX, boxW };
 }
 
 export const CandleChart: React.FC<CandleChartProps> = ({
@@ -1340,16 +1343,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
         const isActive =
           hoveredLevelKey === tKey || (draggingLevel && draggingLevel.target.key === tKey);
 
-        nextDraggableTargets.push({
-          key: tKey,
-          kind: 'bot_level',
-          botLevelId: bl.id,
-          label: bl.label,
-          price: activePrice,
-          y: lvlY,
-        });
-
-        drawHorizontalLevel(ctx, {
+        const botBadgeInfo = drawHorizontalLevel(ctx, {
           y: lvlY,
           plotLeft,
           plotRight,
@@ -1365,10 +1359,21 @@ export const CandleChart: React.FC<CandleChartProps> = ({
           axisTagBg: '#0284c7',
           lineWidth: 1.3,
           dash: [6, 4],
-          badgeX: plotLeft + 14 + idx * 120,
+          badgeX: plotLeft + 14 + idx * 145,
           isHoveredOrDragged: Boolean(isActive),
           deletableId: bl.id,
           deleteHitBoxes: nextDeleteHitBoxes,
+        });
+
+        nextDraggableTargets.push({
+          key: tKey,
+          kind: 'bot_level',
+          botLevelId: bl.id,
+          label: bl.label,
+          price: activePrice,
+          y: lvlY,
+          badgeX: botBadgeInfo.boxX,
+          badgeW: botBadgeInfo.boxW,
         });
       });
 
@@ -1436,7 +1441,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
 
         // 2) Bot's Planned DCA Averaging Limit Levels (↕ DCA 1, ↕ DCA 2 — draggable!)
         if (Array.isArray(t.planned_dca_levels)) {
-          t.planned_dca_levels.forEach((lvl) => {
+          t.planned_dca_levels.forEach((lvl, dcaIdx) => {
             const tKey = `dca-${t.trade_id}-${lvl.step}`;
             const activePrice =
               draggingLevel && draggingLevel.target.key === tKey
@@ -1447,17 +1452,9 @@ export const CandleChart: React.FC<CandleChartProps> = ({
               hoveredLevelKey === tKey || (draggingLevel && draggingLevel.target.key === tKey);
             const distPct = (((activePrice - t.open_rate) / t.open_rate) * 100).toFixed(2);
 
-            nextDraggableTargets.push({
-              key: tKey,
-              kind: 'dca',
-              tradeId: t.trade_id,
-              step: lvl.step,
-              label: `DCA ${lvl.step}`,
-              price: activePrice,
-              y: lvlY,
-            });
-
-            drawHorizontalLevel(ctx, {
+            const dcaBadgeX =
+              dcaIdx === 0 ? Math.max(plotLeft + 260, plotRight - 220) : undefined;
+            const dcaBadgeInfo = drawHorizontalLevel(ctx, {
               y: lvlY,
               plotLeft,
               plotRight,
@@ -1473,7 +1470,20 @@ export const CandleChart: React.FC<CandleChartProps> = ({
               axisTagBg: '#d97706',
               lineWidth: 1.4,
               dash: [6, 4],
+              badgeX: dcaBadgeX,
               isHoveredOrDragged: Boolean(isActive),
+            });
+
+            nextDraggableTargets.push({
+              key: tKey,
+              kind: 'dca',
+              tradeId: t.trade_id,
+              step: lvl.step,
+              label: `DCA ${lvl.step}`,
+              price: activePrice,
+              y: lvlY,
+              badgeX: dcaBadgeInfo.boxX,
+              badgeW: dcaBadgeInfo.boxW,
             });
           });
         }
@@ -1494,16 +1504,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
           const tpPct = (rawRatio * 100 * (t.leverage || 1)).toFixed(2);
           const tpUsd = (t.stake_amount * rawRatio * (t.leverage || 1)).toFixed(2);
 
-          nextDraggableTargets.push({
-            key: tKey,
-            kind: 'tp',
-            tradeId: t.trade_id,
-            label: 'TP',
-            price: activeTpPrice,
-            y: tpY,
-          });
-
-          drawHorizontalLevel(ctx, {
+          const tpBadgeInfo = drawHorizontalLevel(ctx, {
             y: tpY,
             plotLeft,
             plotRight,
@@ -1522,6 +1523,17 @@ export const CandleChart: React.FC<CandleChartProps> = ({
             lineWidth: 1.6,
             dash: [5, 3],
             isHoveredOrDragged: Boolean(isActive),
+          });
+
+          nextDraggableTargets.push({
+            key: tKey,
+            kind: 'tp',
+            tradeId: t.trade_id,
+            label: 'TP',
+            price: activeTpPrice,
+            y: tpY,
+            badgeX: tpBadgeInfo.boxX,
+            badgeW: tpBadgeInfo.boxW,
           });
         }
 
@@ -2256,13 +2268,40 @@ export const CandleChart: React.FC<CandleChartProps> = ({
   // Find if cursor is over a draggable horizontal level (TP, SL, DCA 1, DCA 2, LVL 1, LVL 2)
   const findHitLevel = (x: number, y: number): DraggableLevelTarget | null => {
     if (x < chartGeometry.plotLeft || x > chartGeometry.plotRight) return null;
+    // 1. Direct badge hit-test: if user clicks directly on a pill badge (e.g. SUP on left vs DCA 1 on right), always pick that badge
+    for (let i = draggableTargetsRef.current.length - 1; i >= 0; i--) {
+      const target = draggableTargetsRef.current[i];
+      if (
+        target.badgeX !== undefined &&
+        target.badgeW !== undefined &&
+        x >= target.badgeX - 4 &&
+        x <= target.badgeX + target.badgeW + 4 &&
+        Math.abs(target.y - y) <= 10
+      ) {
+        return target;
+      }
+    }
+    // 2. Line proximity hit-test: if two lines overlap in Y, pick the one whose badge is horizontally closer to cursor X
     let best: DraggableLevelTarget | null = null;
     let bestDist = 8;
+    let bestXDist = Infinity;
     for (const target of draggableTargetsRef.current) {
       const dist = Math.abs(target.y - y);
-      if (dist <= bestDist) {
-        bestDist = dist;
-        best = target;
+      if (dist <= 8) {
+        const badgeCenterX =
+          target.badgeX !== undefined && target.badgeW !== undefined
+            ? target.badgeX + target.badgeW / 2
+            : chartGeometry.plotRight - 60;
+        const xDist = Math.abs(x - badgeCenterX);
+        if (
+          best === null ||
+          dist < bestDist - 1.5 ||
+          (Math.abs(dist - bestDist) <= 1.5 && xDist < bestXDist)
+        ) {
+          bestDist = dist;
+          bestXDist = xDist;
+          best = target;
+        }
       }
     }
     return best;
