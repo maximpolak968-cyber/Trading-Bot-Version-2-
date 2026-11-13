@@ -558,13 +558,26 @@ export const CandleChart: React.FC<CandleChartProps> = ({
   const [dragMode, setDragMode] = useState<
     'none' | 'pan' | 'priceAxis' | 'slider' | 'level' | 'drawingPoint'
   >('none');
-  const [dragStartX, setDragStartX] = useState(0);
-  const [dragStartY, setDragStartY] = useState(0);
   const [draggingLevel, setDraggingLevel] = useState<{
     target: DraggableLevelTarget;
     currentPrice: number;
   } | null>(null);
   const [draggingDrawingPoint, setDraggingDrawingPoint] = useState<{
+    drawingId: string;
+    pointIndex: number;
+    points: ChartDrawingPoint[];
+  } | null>(null);
+
+  // Synchronous refs so fast mousemove -> mouseup never sees stale React closures
+  const dragModeRef = useRef<
+    'none' | 'pan' | 'priceAxis' | 'slider' | 'level' | 'drawingPoint'
+  >('none');
+  const dragStartRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const draggingLevelRef = useRef<{
+    target: DraggableLevelTarget;
+    currentPrice: number;
+  } | null>(null);
+  const draggingDrawingPointRef = useRef<{
     drawingId: string;
     pointIndex: number;
     points: ChartDrawingPoint[];
@@ -1379,7 +1392,8 @@ export const CandleChart: React.FC<CandleChartProps> = ({
 
       // 8C. Active Open & Averaged Trades on this pair
       const pairOpenTrades = trades.filter((t) => t.is_open && t.pair === pair);
-      for (const t of pairOpenTrades) {
+      for (let tradeIdx = 0; tradeIdx < pairOpenTrades.length; tradeIdx++) {
+        const t = pairOpenTrades[tradeIdx];
         const isShort = t.is_short;
         const dcaCount = t.dca_count || 0;
         const sideEng = isShort ? 'SHORT' : 'LONG';
@@ -1452,8 +1466,10 @@ export const CandleChart: React.FC<CandleChartProps> = ({
               hoveredLevelKey === tKey || (draggingLevel && draggingLevel.target.key === tKey);
             const distPct = (((activePrice - t.open_rate) / t.open_rate) * 100).toFixed(2);
 
-            const dcaBadgeX =
-              dcaIdx === 0 ? Math.max(plotLeft + 260, plotRight - 220) : undefined;
+            const dcaBadgeX = Math.max(
+              plotLeft + 210,
+              plotRight - 220 - dcaIdx * 105 - tradeIdx * 95
+            );
             const dcaBadgeInfo = drawHorizontalLevel(ctx, {
               y: lvlY,
               plotLeft,
@@ -1503,6 +1519,10 @@ export const CandleChart: React.FC<CandleChartProps> = ({
             : (activeTpPrice - t.open_rate) / t.open_rate;
           const tpPct = (rawRatio * 100 * (t.leverage || 1)).toFixed(2);
           const tpUsd = (t.stake_amount * rawRatio * (t.leverage || 1)).toFixed(2);
+          const tpBadgeX =
+            pairOpenTrades.length > 1 && tradeIdx > 0
+              ? Math.max(plotLeft + 210, plotRight - 135 - tradeIdx * 135)
+              : undefined;
 
           const tpBadgeInfo = drawHorizontalLevel(ctx, {
             y: tpY,
@@ -1514,6 +1534,8 @@ export const CandleChart: React.FC<CandleChartProps> = ({
             priceText: formatAxisPrice(activeTpPrice),
             badgeText: isActive
               ? `↕ TP (${Number(tpUsd) >= 0 ? '+' : ''}${tpUsd}$ | ${tpPct}%)`
+              : pairOpenTrades.length > 1
+              ? `↕ TP ${sideEng[0]} (${Number(tpPct) >= 0 ? '+' : ''}${tpPct}%)`
               : `↕ TP (${Number(tpPct) >= 0 ? '+' : ''}${tpPct}%)`,
             lineColor: '#10b981',
             badgeBg: 'rgba(6, 46, 34, 0.95)',
@@ -1522,6 +1544,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
             axisTagBg: '#10b981',
             lineWidth: 1.6,
             dash: [5, 3],
+            badgeX: tpBadgeX,
             isHoveredOrDragged: Boolean(isActive),
           });
 
@@ -2419,13 +2442,16 @@ export const CandleChart: React.FC<CandleChartProps> = ({
     if (hitPoint) {
       const targetDrw = drawings.find((d) => d.id === hitPoint.drawingId);
       if (targetDrw) {
-        setSelectedDrawingId(targetDrw.id);
-        setDragMode('drawingPoint');
-        setDraggingDrawingPoint({
+        const nextDrwPt = {
           drawingId: targetDrw.id,
           pointIndex: hitPoint.pointIndex,
           points: [...targetDrw.points],
-        });
+        };
+        setSelectedDrawingId(targetDrw.id);
+        dragModeRef.current = 'drawingPoint';
+        draggingDrawingPointRef.current = nextDrwPt;
+        setDragMode('drawingPoint');
+        setDraggingDrawingPoint(nextDrwPt);
         return;
       }
     }
@@ -2433,20 +2459,24 @@ export const CandleChart: React.FC<CandleChartProps> = ({
     // 5. Check if clicking a draggable horizontal level (TP, SL, DCA, or Bot LVL)
     const hitLevel = findHitLevel(x, y);
     if (hitLevel && !lockAllDrawings) {
-      setDragMode('level');
-      setDraggingLevel({
+      const nextLvl = {
         target: hitLevel,
         currentPrice: hitLevel.price,
-      });
+      };
+      dragModeRef.current = 'level';
+      draggingLevelRef.current = nextLvl;
+      setDragMode('level');
+      setDraggingLevel(nextLvl);
       return;
     }
 
-    setDragStartX(e.clientX);
-    setDragStartY(e.clientY);
+    dragStartRef.current = { x: e.clientX, y: e.clientY };
 
     if (x > chartGeometry.plotRight) {
+      dragModeRef.current = 'priceAxis';
       setDragMode('priceAxis');
     } else {
+      dragModeRef.current = 'pan';
       setDragMode('pan');
     }
   };
@@ -2457,7 +2487,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
     const y = e.clientY - rect.top;
     setMousePos({ x, y });
 
-    if (dragMode !== 'none') return;
+    if (dragModeRef.current !== 'none') return;
 
     const delBox = findHitDeleteBox(x, y);
     setHoveredDeleteId(delBox ? delBox.id : null);
@@ -2477,116 +2507,152 @@ export const CandleChart: React.FC<CandleChartProps> = ({
     }
   };
 
-  // Global window drag listener for smooth panning, price axis scaling, slider, level dragging, and drawing point dragging
-  useEffect(() => {
-    if (dragMode === 'none') return;
+  const chartGeometryRef = useRef(chartGeometry);
+  chartGeometryRef.current = chartGeometry;
 
+  const zoomStateRef = useRef({ zoomStartPct, zoomEndPct, priceScaleMult });
+  zoomStateRef.current = { zoomStartPct, zoomEndPct, priceScaleMult };
+
+  const dragCallbacksRef = useRef({
+    loadOlderHistory,
+    resolvePointAtCursor,
+    onUpdateTradeLevel,
+    onUpdateBotLevel,
+    onUpdateDrawing,
+  });
+  dragCallbacksRef.current = {
+    loadOlderHistory,
+    resolvePointAtCursor,
+    onUpdateTradeLevel,
+    onUpdateBotLevel,
+    onUpdateDrawing,
+  };
+
+  // Mount-once global window drag listener reading/writing synchronous refs so fast mouse drags never lose state
+  useEffect(() => {
     const onWindowMouseMove = (e: MouseEvent) => {
+      const mode = dragModeRef.current;
+      if (mode === 'none') return;
       e.preventDefault();
 
-      if (dragMode === 'drawingPoint' && draggingDrawingPoint && canvasRef.current) {
+      const geom = chartGeometryRef.current;
+      const cbs = dragCallbacksRef.current;
+
+      if (mode === 'drawingPoint' && draggingDrawingPointRef.current && canvasRef.current) {
         const rect = canvasRef.current.getBoundingClientRect();
-        const x = Math.max(
-          chartGeometry.plotLeft,
-          Math.min(chartGeometry.plotRight, e.clientX - rect.left)
-        );
-        const y = Math.max(
-          chartGeometry.plotTop + 4,
-          Math.min(chartGeometry.plotBottom - 4, e.clientY - rect.top)
-        );
-        const updatedPt = resolvePointAtCursor(x, y);
-        setDraggingDrawingPoint((prev) => {
-          if (!prev) return null;
-          const nextPts = prev.points.map((p, idx) =>
-            idx === prev.pointIndex ? updatedPt : p
-          );
-          return { ...prev, points: nextPts };
-        });
+        const x = Math.max(geom.plotLeft, Math.min(geom.plotRight, e.clientX - rect.left));
+        const y = Math.max(geom.plotTop + 4, Math.min(geom.plotBottom - 4, e.clientY - rect.top));
+        const updatedPt = cbs.resolvePointAtCursor(x, y);
+        const prev = draggingDrawingPointRef.current;
+        const nextPts = prev.points.map((p, idx) => (idx === prev.pointIndex ? updatedPt : p));
+        const nextState = { ...prev, points: nextPts };
+        draggingDrawingPointRef.current = nextState;
+        setDraggingDrawingPoint(nextState);
         return;
       }
 
-      if (dragMode === 'level' && draggingLevel && canvasRef.current) {
+      if (mode === 'level' && draggingLevelRef.current && canvasRef.current) {
         const rect = canvasRef.current.getBoundingClientRect();
-        const y = Math.max(
-          chartGeometry.plotTop + 4,
-          Math.min(chartGeometry.plotBottom - 4, e.clientY - rect.top)
-        );
-        const rawPrice = chartGeometry.yToPrice(y);
+        const y = Math.max(geom.plotTop + 4, Math.min(geom.plotBottom - 4, e.clientY - rect.top));
+        const rawPrice = geom.yToPrice(y);
         const cleanPrice = roundDraggedPrice(rawPrice);
         if (cleanPrice > 0) {
-          setDraggingLevel((prev) => (prev ? { ...prev, currentPrice: cleanPrice } : null));
+          const prev = draggingLevelRef.current;
+          const nextState = { ...prev, currentPrice: cleanPrice };
+          draggingLevelRef.current = nextState;
+          setDraggingLevel(nextState);
         }
         return;
       }
 
-      if (dragMode === 'priceAxis') {
-        const dy = e.clientY - dragStartY;
-        setPriceScaleMult((prev) => Math.max(0.15, Math.min(6, prev * (1 + dy * 0.005))));
-        setDragStartY(e.clientY);
+      if (mode === 'priceAxis') {
+        const dy = e.clientY - dragStartRef.current.y;
+        const nextScale = Math.max(
+          0.15,
+          Math.min(6, zoomStateRef.current.priceScaleMult * (1 + dy * 0.005))
+        );
+        zoomStateRef.current.priceScaleMult = nextScale;
+        dragStartRef.current.y = e.clientY;
+        setPriceScaleMult(nextScale);
         return;
       }
 
-      if (dragMode === 'slider') {
+      if (mode === 'slider') {
         const sliderEl = sliderRef.current;
         if (!sliderEl) return;
         const rect = sliderEl.getBoundingClientRect();
         const pct = ((e.clientX - rect.left) / Math.max(1, rect.width)) * 100;
-        const span = Math.max(2, zoomEndPct - zoomStartPct);
+        const span = Math.max(2, zoomStateRef.current.zoomEndPct - zoomStateRef.current.zoomStartPct);
         const nextStart = Math.max(0, Math.min(MAX_FUTURE_PCT - span, pct - span / 2));
+        const nextEnd = nextStart + span;
+        zoomStateRef.current.zoomStartPct = nextStart;
+        zoomStateRef.current.zoomEndPct = nextEnd;
         setZoomStartPct(nextStart);
-        setZoomEndPct(nextStart + span);
+        setZoomEndPct(nextEnd);
         if (nextStart <= 18) {
-          loadOlderHistory();
+          cbs.loadOlderHistory();
         }
         return;
       }
 
-      if (dragMode === 'pan') {
-        const dx = e.clientX - dragStartX;
-        const dy = e.clientY - dragStartY;
-        const span = Math.max(2, zoomEndPct - zoomStartPct);
-        const pctShift = (dx / chartGeometry.plotWidth) * span;
-        const nextStart = Math.max(0, Math.min(96, zoomStartPct - pctShift));
+      if (mode === 'pan') {
+        const dx = e.clientX - dragStartRef.current.x;
+        const dy = e.clientY - dragStartRef.current.y;
+        const span = Math.max(2, zoomStateRef.current.zoomEndPct - zoomStateRef.current.zoomStartPct);
+        const pctShift = (dx / geom.plotWidth) * span;
+        const nextStart = Math.max(0, Math.min(96, zoomStateRef.current.zoomStartPct - pctShift));
         const nextEnd = Math.min(MAX_FUTURE_PCT, nextStart + span);
+        zoomStateRef.current.zoomStartPct = nextStart;
+        zoomStateRef.current.zoomEndPct = nextEnd;
         setZoomStartPct(nextStart);
         setZoomEndPct(nextEnd);
 
-        if (e.shiftKey || Math.abs(priceScaleMult - 1) > 0.02) {
+        if (e.shiftKey || Math.abs(zoomStateRef.current.priceScaleMult - 1) > 0.02) {
           setPricePanOffset((prev) => prev + dy * 0.0025);
         }
 
-        setDragStartX(e.clientX);
-        setDragStartY(e.clientY);
+        dragStartRef.current = { x: e.clientX, y: e.clientY };
 
         if (nextStart <= 18 && dx > 0) {
-          loadOlderHistory();
+          cbs.loadOlderHistory();
         }
       }
     };
 
     const onWindowMouseUp = () => {
-      if (dragMode === 'drawingPoint' && draggingDrawingPoint) {
-        onUpdateDrawing?.(draggingDrawingPoint.drawingId, {
-          points: draggingDrawingPoint.points,
+      const mode = dragModeRef.current;
+      if (mode === 'none') return;
+
+      const cbs = dragCallbacksRef.current;
+      const activeDrawingPoint = draggingDrawingPointRef.current;
+      const activeLevel = draggingLevelRef.current;
+
+      dragModeRef.current = 'none';
+      draggingDrawingPointRef.current = null;
+      draggingLevelRef.current = null;
+
+      if (mode === 'drawingPoint' && activeDrawingPoint) {
+        cbs.onUpdateDrawing?.(activeDrawingPoint.drawingId, {
+          points: activeDrawingPoint.points,
         });
         setDraggingDrawingPoint(null);
       }
 
-      if (dragMode === 'level' && draggingLevel) {
-        const { target, currentPrice } = draggingLevel;
+      if (mode === 'level' && activeLevel) {
+        const { target, currentPrice } = activeLevel;
         if (Math.abs(currentPrice - target.price) > 1e-9) {
           if (
             (target.kind === 'tp' || target.kind === 'sl' || target.kind === 'dca') &&
             target.tradeId !== undefined
           ) {
-            onUpdateTradeLevel?.({
+            cbs.onUpdateTradeLevel?.({
               tradeId: target.tradeId,
               levelType: target.kind,
               step: target.step,
               price: currentPrice,
             });
           } else if (target.kind === 'bot_level' && target.botLevelId) {
-            onUpdateBotLevel?.(target.botLevelId, currentPrice);
+            cbs.onUpdateBotLevel?.(target.botLevelId, currentPrice);
           }
         }
         setDraggingLevel(null);
@@ -2600,22 +2666,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
       window.removeEventListener('mousemove', onWindowMouseMove);
       window.removeEventListener('mouseup', onWindowMouseUp);
     };
-  }, [
-    dragMode,
-    dragStartX,
-    dragStartY,
-    chartGeometry,
-    zoomStartPct,
-    zoomEndPct,
-    priceScaleMult,
-    draggingLevel,
-    draggingDrawingPoint,
-    loadOlderHistory,
-    resolvePointAtCursor,
-    onUpdateTradeLevel,
-    onUpdateBotLevel,
-    onUpdateDrawing,
-  ]);
+  }, []);
 
   // Native non-passive wheel listener to zoom/pan smoothly without scrolling the browser page
   useEffect(() => {
@@ -3572,7 +3623,6 @@ export const CandleChart: React.FC<CandleChartProps> = ({
             ref={canvasRef}
             onMouseMove={handleMouseMove}
             onMouseDown={handleMouseDown}
-            onMouseUp={() => setDragMode('none')}
             onDoubleClick={() => {
               setPriceScaleMult(1);
               setPricePanOffset(0);
@@ -3621,6 +3671,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
           ref={sliderRef}
           onMouseDown={(e) => {
             e.preventDefault();
+            dragModeRef.current = 'slider';
             setDragMode('slider');
           }}
           className="relative h-[22px] w-full bg-[#161a25] border border-[#2a2e39] rounded-[3px] overflow-hidden cursor-ew-resize select-none"

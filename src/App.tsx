@@ -203,6 +203,10 @@ export default function App() {
 
   const lastLevelMutationTsRef = useRef<number>(0);
   const pendingLevelMutationsRef = useRef<number>(0);
+  const openTradesRef = useRef<FreqtradeTrade[]>([]);
+  openTradesRef.current = openTrades;
+  const botLevelsRef = useRef<BotChartLevel[]>([]);
+  botLevelsRef.current = botLevels;
 
   const fetchPairBotLevels = useCallback(
     async (pairArg = selectedPair, tfArg = timeframe) => {
@@ -593,7 +597,8 @@ export default function App() {
     await fetchCandles();
   };
 
-  const handleUpdateTradeLevel = async (payload: TradeLevelUpdatePayload) => {
+  const handleUpdateTradeLevel = useCallback(async (payload: TradeLevelUpdatePayload) => {
+    const prevTradeSnapshot = openTradesRef.current.find((t) => t.trade_id === payload.tradeId);
     lastLevelMutationTsRef.current = Date.now();
     pendingLevelMutationsRef.current += 1;
     // Optimistic update so the dragged level stays at the exact dropped price without snapping back
@@ -627,7 +632,10 @@ export default function App() {
     try {
       const res = await fetch('/api/v1/trade_levels', {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
         body: JSON.stringify({
           tradeid: payload.tradeId,
           level_type: payload.levelType,
@@ -651,22 +659,40 @@ export default function App() {
               : payload.levelType === 'sl'
               ? 'SL'
               : `DCA ${payload.step || 1}`;
-          if (data.clamped_to_breakeven && data.warning) {
-            setStatusNotification(`🛡️ ${data.warning}`);
+          if (data.warning) {
+            setStatusNotification(`⚠️ ${data.warning}`);
           } else {
             setStatusNotification(
               `Бот обновил ${lvlName} по ${updatedTrade.pair.split('/')[0]}: ${data.previous_price}$ ➔ ${data.new_price}$ (бот отталкивается от вашего уровня)`
             );
           }
         }
+      } else {
+        if (prevTradeSnapshot) {
+          setOpenTrades((prev) =>
+            prev.map((t) => (t.trade_id === prevTradeSnapshot.trade_id ? prevTradeSnapshot : t))
+          );
+        }
+        const errData = await res.json().catch(() => ({}));
+        setStatusNotification(
+          `Ошибка сохранения уровня: ${errData?.error || `HTTP ${res.status}`}`
+        );
       }
+    } catch {
+      if (prevTradeSnapshot) {
+        setOpenTrades((prev) =>
+          prev.map((t) => (t.trade_id === prevTradeSnapshot.trade_id ? prevTradeSnapshot : t))
+        );
+      }
+      setStatusNotification('Ошибка сети при сохранении уровня сделки');
     } finally {
       pendingLevelMutationsRef.current = Math.max(0, pendingLevelMutationsRef.current - 1);
       lastLevelMutationTsRef.current = Date.now();
     }
-  };
+  }, [authToken]);
 
-  const handleUpdateBotLevel = async (id: string, price: number) => {
+  const handleUpdateBotLevel = useCallback(async (id: string, price: number) => {
+    const prevLevelSnapshot = botLevelsRef.current.find((lvl) => lvl.id === id);
     lastLevelMutationTsRef.current = Date.now();
     pendingLevelMutationsRef.current += 1;
     // Optimistic update so the dragged SUP/RES level stays immediately at the dropped price
@@ -677,7 +703,10 @@ export default function App() {
     try {
       const res = await fetch('/api/v1/pair_levels', {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
         body: JSON.stringify({ pair: selectedPair, timeframe, id, price }),
       });
       if (res.ok) {
@@ -699,58 +728,110 @@ export default function App() {
             `Бот обновил уровень ${data.level.label} (${selectedPair.split('/')[0]}): ${data.previous_price}$ ➔ ${data.level.price}$`
           );
         }
+      } else {
+        if (prevLevelSnapshot) {
+          setBotLevels((prev) =>
+            prev.map((lvl) => (lvl.id === prevLevelSnapshot.id ? prevLevelSnapshot : lvl))
+          );
+        }
+        const errData = await res.json().catch(() => ({}));
+        setStatusNotification(
+          `Ошибка сохранения уровня: ${errData?.error || `HTTP ${res.status}`}`
+        );
+      }
+    } catch {
+      if (prevLevelSnapshot) {
+        setBotLevels((prev) =>
+          prev.map((lvl) => (lvl.id === prevLevelSnapshot.id ? prevLevelSnapshot : lvl))
+        );
+      }
+      setStatusNotification('Ошибка сети при сохранении уровня на графике');
+    } finally {
+      pendingLevelMutationsRef.current = Math.max(0, pendingLevelMutationsRef.current - 1);
+      lastLevelMutationTsRef.current = Date.now();
+    }
+  }, [authToken, selectedPair, timeframe]);
+
+  const handleAddBotLevel = useCallback(async (price: number) => {
+    lastLevelMutationTsRef.current = Date.now();
+    pendingLevelMutationsRef.current += 1;
+    try {
+      const res = await fetch('/api/v1/pair_levels', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
+        body: JSON.stringify({ pair: selectedPair, timeframe, price }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        lastLevelMutationTsRef.current = Date.now();
+        if (data.levels) setBotLevels(data.levels);
+        if (data.level) {
+          setStatusNotification(
+            `Добавлен уровень бота ${data.level.label} @ ${data.level.price}$ (${selectedPair.split('/')[0]})`
+          );
+        }
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        setStatusNotification(
+          `Ошибка добавления уровня: ${errData?.error || `HTTP ${res.status}`}`
+        );
+      }
+    } catch {
+      setStatusNotification('Ошибка сети при добавлении уровня');
+    } finally {
+      pendingLevelMutationsRef.current = Math.max(0, pendingLevelMutationsRef.current - 1);
+      lastLevelMutationTsRef.current = Date.now();
+    }
+  }, [authToken, selectedPair, timeframe]);
+
+  const handleDeleteBotLevel = useCallback(async (id: string) => {
+    lastLevelMutationTsRef.current = Date.now();
+    pendingLevelMutationsRef.current += 1;
+    try {
+      const res = await fetch(
+        `/api/v1/pair_levels/${encodeURIComponent(id)}?pair=${encodeURIComponent(selectedPair)}&timeframe=${encodeURIComponent(timeframe)}`,
+        {
+          method: 'DELETE',
+          headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+        }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        lastLevelMutationTsRef.current = Date.now();
+        setBotLevels(data.levels || []);
+        setStatusNotification(
+          `Удалён уровень бота (${selectedPair.split('/')[0]}) — бот больше не использует его`
+        );
       }
     } finally {
       pendingLevelMutationsRef.current = Math.max(0, pendingLevelMutationsRef.current - 1);
       lastLevelMutationTsRef.current = Date.now();
     }
-  };
+  }, [authToken, selectedPair, timeframe]);
 
-  const handleAddBotLevel = async (price: number) => {
-    const res = await fetch('/api/v1/pair_levels', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pair: selectedPair, timeframe, price }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (data.levels) setBotLevels(data.levels);
-      if (data.level) {
-        setStatusNotification(
-          `Добавлен уровень бота ${data.level.label} @ ${data.level.price}$ (${selectedPair.split('/')[0]})`
-        );
+  const handleClearAllBotLevels = useCallback(async () => {
+    lastLevelMutationTsRef.current = Date.now();
+    pendingLevelMutationsRef.current += 1;
+    try {
+      const res = await fetch(`/api/v1/pair_levels?pair=${encodeURIComponent(selectedPair)}`, {
+        method: 'DELETE',
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+      });
+      if (res.ok) {
+        lastLevelMutationTsRef.current = Date.now();
+        setBotLevels([]);
+        setStatusNotification(`Все уровни бота (LVL) по ${selectedPair.split('/')[0]} удалены`);
       }
+    } finally {
+      pendingLevelMutationsRef.current = Math.max(0, pendingLevelMutationsRef.current - 1);
+      lastLevelMutationTsRef.current = Date.now();
     }
-    await fetchBotState();
-  };
+  }, [authToken, selectedPair]);
 
-  const handleDeleteBotLevel = async (id: string) => {
-    const res = await fetch(
-      `/api/v1/pair_levels/${encodeURIComponent(id)}?pair=${encodeURIComponent(selectedPair)}&timeframe=${encodeURIComponent(timeframe)}`,
-      { method: 'DELETE' }
-    );
-    if (res.ok) {
-      const data = await res.json();
-      setBotLevels(data.levels || []);
-      setStatusNotification(
-        `Удалён уровень бота (${selectedPair.split('/')[0]}) — бот больше не использует его`
-      );
-    }
-    await fetchBotState();
-  };
-
-  const handleClearAllBotLevels = async () => {
-    const res = await fetch(`/api/v1/pair_levels?pair=${encodeURIComponent(selectedPair)}`, {
-      method: 'DELETE',
-    });
-    if (res.ok) {
-      setBotLevels([]);
-      setStatusNotification(`Все уровни бота (LVL) по ${selectedPair.split('/')[0]} удалены`);
-    }
-    await fetchBotState();
-  };
-
-  const handleAddDrawing = async (drawing: Omit<ChartDrawingObject, 'id' | 'created_at'>) => {
+  const handleAddDrawing = useCallback(async (drawing: Omit<ChartDrawingObject, 'id' | 'created_at'>) => {
     const res = await fetch('/api/v1/chart_drawings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -763,9 +844,9 @@ export default function App() {
         setStatusNotification('Линейка зафиксирована на графике (удаление по кнопке × на замере)');
       }
     }
-  };
+  }, []);
 
-  const handleUpdateDrawing = async (id: string, patch: Partial<ChartDrawingObject>) => {
+  const handleUpdateDrawing = useCallback(async (id: string, patch: Partial<ChartDrawingObject>) => {
     setDrawings((prev) => prev.map((d) => (d.id === id ? { ...d, ...patch } : d)));
     const res = await fetch(`/api/v1/chart_drawings/${encodeURIComponent(id)}`, {
       method: 'PATCH',
@@ -776,7 +857,7 @@ export default function App() {
       const data = await res.json();
       if (data.drawings) setDrawings(data.drawings);
     }
-  };
+  }, [selectedPair]);
 
   const handleDeleteDrawing = async (id: string) => {
     const res = await fetch(

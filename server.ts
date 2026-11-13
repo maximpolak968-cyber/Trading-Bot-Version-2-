@@ -1596,8 +1596,12 @@ async function getOrComputeMtfBotLevels(
 
   // All manual levels configured or dragged by the user on this pair apply across all timeframes and bot cycles
   const manualLevels = allForPair.filter((l) => l.manual_override && !l.deleted);
-  const hasManualSupport = manualLevels.some((l) => l.role === 'support');
-  const hasManualResistance = manualLevels.some((l) => l.role === 'resistance');
+  const hasManualGlobalSupport = manualLevels.some(
+    (l) => l.id.startsWith('tf-sup-') || l.id.startsWith('mtf-sup-')
+  );
+  const hasManualGlobalResistance = manualLevels.some(
+    (l) => l.id.startsWith('tf-res-') || l.id.startsWith('mtf-res-')
+  );
 
   try {
     // Top-Down 1D -> 4H Global Level Analysis across full available history (up to 1000 bars)
@@ -1667,7 +1671,7 @@ async function getOrComputeMtfBotLevels(
 
     const globalTag = normTf === '1d' ? '1D GLOBAL' : '1D/4H GLOBAL';
 
-    if (!hasManualSupport && !savedSup?.deleted) {
+    if (!hasManualGlobalSupport && !savedSup?.deleted) {
       if (globalSup > 0) {
         const scoreTxt = sh ? ` ${sh.strength_score.toFixed(1)}★` : '';
         const lvl: BotChartLevel = {
@@ -1693,7 +1697,7 @@ async function getOrComputeMtfBotLevels(
       }
     }
 
-    if (!hasManualResistance && !savedRes?.deleted) {
+    if (!hasManualGlobalResistance && !savedRes?.deleted) {
       if (globalRes > 0) {
         const scoreTxt = rh ? ` ${rh.strength_score.toFixed(1)}★` : '';
         const lvl: BotChartLevel = {
@@ -2012,8 +2016,12 @@ async function syncPositionsAndHistoryFromExchanges(
                   botConfig.timeframe,
                   forceReanalyzeOpen
                 ).catch(() => [] as BotChartLevel[]);
-                const manualSup = refreshedLvls.find((l) => l.role === 'support' && l.manual_override);
-                const manualRes = refreshedLvls.find((l) => l.role === 'resistance' && l.manual_override);
+                const manualSup = refreshedLvls.find(
+                  (l) => l.role === 'support' && l.manual_override && !l.id.startsWith('lvl-')
+                );
+                const manualRes = refreshedLvls.find(
+                  (l) => l.role === 'resistance' && l.manual_override && !l.id.startsWith('lvl-')
+                );
                 const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d);
                 const strongDca = findStrongestDcaLevel(
                   c4h,
@@ -3001,10 +3009,15 @@ async function runScalpBotCycle(waitForActive = false) {
                 const existingNextPlanned = (trade.planned_dca_levels || []).find(
                   (l) => l.step === nextStep + 1 && l.manual_override && l.price > 0
                 );
+                const existingStep2Planned = (trade.planned_dca_levels || []).find(
+                  (l) => l.step === nextStep + 2 && l.manual_override && l.price > 0
+                );
                 const nextDca1 = existingNextPlanned
                   ? roundPrice(existingNextPlanned.price)
                   : roundPrice(nextStrongDca.price);
-                const nextDca2 = existingNextPlanned
+                const nextDca2 = existingStep2Planned
+                  ? roundPrice(existingStep2Planned.price)
+                  : existingNextPlanned
                   ? roundPrice(
                       trade.is_short
                         ? Math.max(nextStrongDca.second_price, nextDca1 * 1.032)
@@ -3012,7 +3025,7 @@ async function runScalpBotCycle(waitForActive = false) {
                     )
                   : roundPrice(nextStrongDca.second_price);
                 trade.next_dca_price = nextDca1;
-                trade.dca_manual_override = Boolean(existingNextPlanned);
+                trade.dca_manual_override = Boolean(existingNextPlanned || existingStep2Planned);
                 trade.planned_dca_levels = [
                   {
                     step: nextStep + 1,
@@ -3027,12 +3040,14 @@ async function runScalpBotCycle(waitForActive = false) {
                   },
                   {
                     step: nextStep + 2,
-                    label: `DCA ${nextStep + 2}`,
+                    label: existingStep2Planned
+                      ? existingStep2Planned.label || `DCA ${nextStep + 2} (USER)`
+                      : `DCA ${nextStep + 2}`,
                     price: nextDca2,
                     stake_amount: addStake,
                     amount: Number(((addStake * (trade.leverage || 25)) / Math.max(1e-8, nextDca2)).toFixed(4)),
                     distance_pct: Number((((nextDca2 - newAvgOpenRate) / newAvgOpenRate) * 100).toFixed(2)),
-                    manual_override: false,
+                    manual_override: Boolean(existingStep2Planned),
                   },
                 ];
 
@@ -5445,10 +5460,15 @@ async function startServer() {
       const existingNextPlanned = (trade.planned_dca_levels || []).find(
         (l) => l.step === nextStep + 1 && l.manual_override && l.price > 0
       );
+      const existingStep2Planned = (trade.planned_dca_levels || []).find(
+        (l) => l.step === nextStep + 2 && l.manual_override && l.price > 0
+      );
       const nextDca1 = existingNextPlanned
         ? roundPrice(existingNextPlanned.price)
         : roundPrice(nextStrongDca.price);
-      const nextDca2 = existingNextPlanned
+      const nextDca2 = existingStep2Planned
+        ? roundPrice(existingStep2Planned.price)
+        : existingNextPlanned
         ? roundPrice(
             trade.is_short
               ? Math.max(nextStrongDca.second_price, nextDca1 * 1.032)
@@ -5456,7 +5476,7 @@ async function startServer() {
           )
         : roundPrice(nextStrongDca.second_price);
       trade.next_dca_price = nextDca1;
-      trade.dca_manual_override = Boolean(existingNextPlanned);
+      trade.dca_manual_override = Boolean(existingNextPlanned || existingStep2Planned);
       trade.planned_dca_levels = [
         {
           step: nextStep + 1,
@@ -5471,12 +5491,14 @@ async function startServer() {
         },
         {
           step: nextStep + 2,
-          label: `DCA ${nextStep + 2}`,
+          label: existingStep2Planned
+            ? existingStep2Planned.label || `DCA ${nextStep + 2} (USER)`
+            : `DCA ${nextStep + 2}`,
           price: nextDca2,
           stake_amount: addStake,
           amount: Number(((addStake * leverage) / Math.max(1e-8, nextDca2)).toFixed(4)),
           distance_pct: Number((((nextDca2 - newAvgOpenRate) / newAvgOpenRate) * 100).toFixed(2)),
-          manual_override: false,
+          manual_override: Boolean(existingStep2Planned),
         },
       ];
 
@@ -5629,10 +5651,9 @@ async function startServer() {
           ? requestedPrice > minProfitableTp
           : requestedPrice < minProfitableTp;
 
+        effectivePrice = requestedPrice;
         if (wouldCloseInLossOrFeeMinus) {
-          effectivePrice = minProfitableTp;
-          clampedToBreakeven = true;
-          clampWarning = `Защита от закрытия в минус: TP скорректирован до минимального плюсового уровня ${minProfitableTp}$ (покрывает среднюю цену ${trade.open_rate}$ + комиссии Taker 0.06% на вход, DCA и выход = ${trade.fee_total}$).`;
+          clampWarning = `TP установлен вручную на ${effectivePrice}$ (ниже зоны безубытка ${minProfitableTp}$ с учётом комиссий).`;
         }
 
         trade.take_profit_abs = effectivePrice;
@@ -5649,10 +5670,8 @@ async function startServer() {
         }
         appendLog(
           'freqtrade.bot.levels',
-          clampedToBreakeven ? 'WARNING' : 'INFO',
-          clampedToBreakeven
-            ? `🛡️ [${trade.pair}] Попытка поставить TP (${requestedPrice}$) в зону убытка/комиссии! Авто-коррекция TP до безубытка+профит: ${trade.take_profit_abs}$ (чистый ROI: +${trade.take_profit_pct}%).`
-            : `[${trade.pair}] TP изменен вручную на графике: ${prevPrice}$ ➔ ${trade.take_profit_abs}$ (чистый ROI: +${trade.take_profit_pct}%). Синхронизировано с биржей и trades.sqlite.`
+          wouldCloseInLossOrFeeMinus ? 'WARNING' : 'INFO',
+          `[${trade.pair}] TP изменен вручную на графике: ${prevPrice}$ ➔ ${trade.take_profit_abs}$ (ROI: ${trade.take_profit_pct}%). Синхронизировано с биржей и trades.sqlite.`
         );
       } else if (level_type === 'sl') {
         prevPrice = trade.stop_loss_abs;
@@ -5872,9 +5891,14 @@ async function startServer() {
     target.manual_override = true;
     target.updated_at = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
-    // Keep the level's explicit role ('support' for SUP, 'resistance' for RES) unless explicitly overridden in req.body.role
+    // Keep global SUP/RES explicit role, while allowing user-added LVL lines to adapt role when dragged across live price
+    const isCustomManualLvl = target.id.startsWith('lvl-');
+    const livePairPrice = tickerCache.get(cleanPair)?.price || 0;
     if (role === 'support' || role === 'resistance') {
       target.role = role;
+    } else if (isCustomManualLvl && livePairPrice > 0) {
+      target.role = newPrice >= livePairPrice ? 'resistance' : 'support';
+      target.label = target.label.replace(/\((SUP|RES)\)/i, `(${target.role === 'resistance' ? 'RES' : 'SUP'})`);
     } else if (target.id.includes('-sup-') || target.label.toUpperCase().includes('SUP')) {
       target.role = 'support';
     } else if (target.id.includes('-res-') || target.label.toUpperCase().includes('RES')) {
@@ -5898,55 +5922,35 @@ async function startServer() {
         updated_at: target.updated_at,
       });
 
-      // Remove any old non-manual auto-levels of the same role for this pair so they never reappear on reload or other timeframes
-      sqliteDb.replaceAutoBotLevelsWithManual(cleanPair, target.role, target.id);
+      // Only clean up sibling auto-levels when user drags a global SUP/RES line itself (never when dragging a separate MANUAL LVL)
+      if (!isCustomManualLvl) {
+        sqliteDb.replaceAutoBotLevelsWithManual(cleanPair, target.role, target.id);
 
-      // Синхронизируем передвинутый уровень бота (SUP / RES) со всеми открытыми сделками по этой паре:
-      // - Если DCA 1 еще НЕ передвигали вручную (!dca1.manual_override), то DCA 1 привязывается к SUP (для LONG) или RES (для SHORT).
-      // - Если DCA 1 уже был передвинут вручную (dca1.manual_override === true), он двигается полностью независимо и НЕ перезаписывается!
-      // - DCA 2 никогда не сбрасывается и не сдвигается при перетаскивании SUP / RES.
-      for (const t of tradesStore) {
-        if (t.is_open && t.pair === cleanPair) {
-          recalculateTradeMetrics(t, false);
-          const minProfTp = t.min_profitable_tp || t.breakeven_price || t.open_rate;
-          const dca1 = t.planned_dca_levels?.[0];
-          if (target.role === 'support') {
-            t.support_level = newPrice;
-            if (!t.is_short) {
-              // LONG: привязываем DCA 1 к SUP только если DCA 1 не трогали вручную
-              if (!dca1?.manual_override) {
+        // Привязываем DCA 1 (если его ещё не трогали вручную) к перетащенному глобальному SUP/RES; TP оставляем независимым
+        for (const t of tradesStore) {
+          if (t.is_open && t.pair === cleanPair) {
+            recalculateTradeMetrics(t, false);
+            const dca1 = t.planned_dca_levels?.[0];
+            if (target.role === 'support') {
+              t.support_level = newPrice;
+              if (!t.is_short && !dca1?.manual_override) {
                 t.next_dca_price = newPrice;
                 if (dca1) {
                   dca1.price = newPrice;
                 }
               }
             } else {
-              // SHORT: уровень поддержки служит структурной целью Take Profit (если TP не трогали вручную)
-              if (!t.tp_manual_override) {
-                const candidateTp = roundPrice(newPrice * 1.002);
-                t.take_profit_abs = Math.min(candidateTp, minProfTp);
-              }
-            }
-          } else {
-            t.resistance_level = newPrice;
-            if (!t.is_short) {
-              // LONG: уровень сопротивления служит структурной целью Take Profit (если TP не трогали вручную)
-              if (!t.tp_manual_override) {
-                const candidateTp = roundPrice(newPrice * 0.998);
-                t.take_profit_abs = Math.max(candidateTp, minProfTp);
-              }
-            } else {
-              // SHORT: привязываем DCA 1 к RES только если DCA 1 не трогали вручную
-              if (!dca1?.manual_override) {
+              t.resistance_level = newPrice;
+              if (t.is_short && !dca1?.manual_override) {
                 t.next_dca_price = newPrice;
                 if (dca1) {
                   dca1.price = newPrice;
                 }
               }
             }
+            recalculateTradeMetrics(t, false);
+            sqliteDb.upsertTrade(t);
           }
-          recalculateTradeMetrics(t, false);
-          sqliteDb.upsertTrade(t);
         }
       }
     });
