@@ -1356,6 +1356,69 @@ export const CandleChart: React.FC<CandleChartProps> = ({
         const isActive =
           hoveredLevelKey === tKey || (draggingLevel && draggingLevel.target.key === tKey);
 
+        const isGlobalRole =
+          bl.timeframe_role === 'GLOBAL_1W_1D' ||
+          bl.label.includes('GLOBAL') ||
+          bl.source?.includes('GLOBAL');
+        const isLocal1dRole =
+          bl.timeframe_role === 'LOCAL_1D' ||
+          bl.label.includes('1D LOCAL') ||
+          bl.source === '1D_LOCAL';
+        const isStructRole =
+          bl.timeframe_role === 'STRUCT_4H' ||
+          bl.label.includes('STRUCT') ||
+          bl.source === '4H_STRUCT';
+
+        const lineColor = isLocal1dRole
+          ? '#f59e0b'
+          : isStructRole
+          ? '#2dd4bf'
+          : isGlobalRole
+          ? '#a855f7'
+          : '#38bdf8';
+        const badgeBg = isLocal1dRole
+          ? 'rgba(69, 39, 9, 0.92)'
+          : isStructRole
+          ? 'rgba(13, 56, 52, 0.92)'
+          : isGlobalRole
+          ? 'rgba(46, 16, 101, 0.94)'
+          : 'rgba(12, 45, 72, 0.94)';
+        const badgeTextColor = isLocal1dRole
+          ? '#fef3c7'
+          : isStructRole
+          ? '#ccfbf1'
+          : isGlobalRole
+          ? '#f3e8ff'
+          : '#e0f2fe';
+        const axisTagBg = isLocal1dRole
+          ? '#d97706'
+          : isStructRole
+          ? '#0d9488'
+          : isGlobalRole
+          ? '#7c3aed'
+          : '#0284c7';
+
+        // Draw subtle ATR S/R zone band behind level when zone_low / zone_high are present
+        if (
+          bl.zone_low &&
+          bl.zone_high &&
+          bl.zone_high > bl.zone_low &&
+          !(draggingLevel && draggingLevel.target.key === tKey)
+        ) {
+          const zTopY = Math.max(plotTop, priceToY(bl.zone_high));
+          const zBotY = Math.min(plotBottom, priceToY(bl.zone_low));
+          if (zBotY > zTopY) {
+            ctx.save();
+            ctx.fillStyle = isLocal1dRole
+              ? 'rgba(245, 158, 11, 0.08)'
+              : isStructRole
+              ? 'rgba(45, 212, 191, 0.06)'
+              : 'rgba(168, 85, 247, 0.10)';
+            ctx.fillRect(plotLeft, zTopY, plotWidth, zBotY - zTopY);
+            ctx.restore();
+          }
+        }
+
         const botBadgeInfo = drawHorizontalLevel(ctx, {
           y: lvlY,
           plotLeft,
@@ -1365,14 +1428,14 @@ export const CandleChart: React.FC<CandleChartProps> = ({
           rightPriceAxisWidth,
           priceText: formatAxisPrice(activePrice),
           badgeText: `↕ ${bl.label}`,
-          lineColor: '#38bdf8',
-          badgeBg: 'rgba(12, 45, 72, 0.94)',
-          badgeBorder: '#38bdf8',
-          badgeTextColor: '#e0f2fe',
-          axisTagBg: '#0284c7',
-          lineWidth: 1.3,
-          dash: [6, 4],
-          badgeX: plotLeft + 14 + idx * 145,
+          lineColor,
+          badgeBg,
+          badgeBorder: lineColor,
+          badgeTextColor,
+          axisTagBg,
+          lineWidth: isGlobalRole ? 1.5 : 1.15,
+          dash: isStructRole ? [3, 4] : isLocal1dRole ? [5, 4] : [7, 4],
+          badgeX: plotLeft + 14 + (idx % 3) * 165,
           isHoveredOrDragged: Boolean(isActive),
           deletableId: bl.id,
           deleteHitBoxes: nextDeleteHitBoxes,

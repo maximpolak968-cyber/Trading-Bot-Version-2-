@@ -66,6 +66,12 @@ export interface BotChartLevel {
   source?: string;
   manual_override?: boolean;
   updated_at: string;
+  zone_low?: number;
+  zone_high?: number;
+  mirror_retests?: number;
+  false_breakouts?: number;
+  consolidation_bars?: number;
+  timeframe_role?: string;
 }
 
 export type SupportedExchange = 'binance' | 'bybit' | 'okx' | 'bitget' | 'bingx';

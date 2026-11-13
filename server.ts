@@ -1028,6 +1028,12 @@ interface BotChartLevel {
   source?: string;
   manual_override?: boolean;
   updated_at: string;
+  zone_low?: number;
+  zone_high?: number;
+  mirror_retests?: number;
+  false_breakouts?: number;
+  consolidation_bars?: number;
+  timeframe_role?: string;
 }
 
 interface FreqtradeTrade {
@@ -1604,57 +1610,46 @@ async function getOrComputeMtfBotLevels(
   );
 
   try {
-    // Top-Down 1D -> 4H Global Level Analysis across full available history (up to 1000 bars)
-    const [{ candles: c1d }, { candles: c4h }, { candles: tfCandles }] = await Promise.all([
-      fetchRealCandles(cleanPair, '1d', 1000),
-      fetchRealCandles(cleanPair, '4h', 1000),
-      normTf === '4h' || normTf === '1d'
-        ? Promise.resolve({ candles: [] as RawCandle[] })
-        : fetchRealCandles(cleanPair, normTf, 500),
-    ]);
+    // Top-Down 1W (Macro) -> 1D (Refinement & Local) -> 4H/1H (Structural points only)
+    const [{ candles: c1w }, { candles: c1d }, { candles: c4h }, { candles: tfCandles }] =
+      await Promise.all([
+        fetchRealCandles(cleanPair, '1w', 300),
+        fetchRealCandles(cleanPair, '1d', 1000),
+        fetchRealCandles(cleanPair, '4h', 1000),
+        normTf === '4h' || normTf === '1d' || normTf === '1w'
+          ? Promise.resolve({ candles: [] as RawCandle[] })
+          : fetchRealCandles(cleanPair, normTf, 500),
+      ]);
 
     const activeCandles =
-      normTf === '1d' ? c1d : normTf === '4h' ? c4h : tfCandles.length > 0 ? tfCandles : c4h;
-    const ms1d = detectMarketStructure(c1d, Math.max(30, c1d.length), true);
-    const ms4h = detectMarketStructure(c4h, Math.max(30, c4h.length), true);
-    const msActive =
-      normTf === '1d'
-        ? ms1d
+      normTf === '1w'
+        ? c1w
+        : normTf === '1d'
+        ? c1d
         : normTf === '4h'
-        ? ms4h
-        : detectMarketStructure(activeCandles, Math.max(30, activeCandles.length), false);
+        ? c4h
+        : tfCandles.length > 0
+        ? tfCandles
+        : c4h;
 
-    // Выбираем самые низкие/высокие глобальные уровни SUP и RES по всей доступной истории 1D и 4H
-    const globalSup =
-      normTf === '1d'
-        ? ms1d.nearest_support
-        : ms1d.nearest_support > 0 && ms4h.nearest_support > 0
-        ? Math.min(ms1d.nearest_support, ms4h.nearest_support)
-        : ms1d.nearest_support > 0
-        ? ms1d.nearest_support
-        : ms4h.nearest_support > 0
-        ? ms4h.nearest_support
-        : msActive.nearest_support;
+    const liveRefPrice =
+      tickerCache.get(cleanPair)?.price ||
+      (activeCandles.length > 0 ? activeCandles[activeCandles.length - 1].close : 0) ||
+      (c1d.length > 0 ? c1d[c1d.length - 1].close : 0);
 
-    const globalRes =
-      normTf === '1d'
-        ? ms1d.nearest_resistance
-        : ms1d.nearest_resistance > 0 && ms4h.nearest_resistance > 0
-        ? Math.max(ms1d.nearest_resistance, ms4h.nearest_resistance)
-        : ms1d.nearest_resistance > 0
-        ? ms1d.nearest_resistance
-        : ms4h.nearest_resistance > 0
-        ? ms4h.nearest_resistance
-        : msActive.nearest_resistance;
+    const mtf = analyzeMultiTimeframe(
+      cleanPair,
+      normTf === '1d' || normTf === '1w' ? c4h : activeCandles,
+      c4h,
+      c1d,
+      undefined,
+      c1w
+    );
 
-    const sh =
-      (ms1d.nearest_support > 0 && globalSup === ms1d.nearest_support
-        ? ms1d.support_history
-        : ms4h.support_history) || msActive.support_history;
-    const rh =
-      (ms1d.nearest_resistance > 0 && globalRes === ms1d.nearest_resistance
-        ? ms1d.resistance_history
-        : ms4h.resistance_history) || msActive.resistance_history;
+    const globalSup = mtf.key_4h_support;
+    const globalRes = mtf.key_4h_resistance;
+    const sh = mtf.support_history;
+    const rh = mtf.resistance_history;
 
     const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
     const generated: BotChartLevel[] = [...manualLevels];
@@ -1669,15 +1664,38 @@ async function getOrComputeMtfBotLevels(
       (l) => l.id === resId || (l.id === `mtf-res-${cleanPair}` && normTf === '4h')
     );
 
-    const globalTag = normTf === '1d' ? '1D GLOBAL' : '1D/4H GLOBAL';
+    const globalTag = sh?.refined_from_1w || rh?.refined_from_1w ? '1W/1D GLOBAL' : '1D GLOBAL';
+
+    const buildBadgeStats = (
+      hist: ReturnType<typeof analyzeMultiTimeframe>['support_history'] | undefined
+    ) => {
+      if (!hist) return '';
+      const scoreTxt = ` ${hist.strength_score.toFixed(1)}★`;
+      const mirrorTxt = hist.mirror_retests && hist.mirror_retests > 0 ? ' ⇄S/R' : '';
+      return `${scoreTxt}${mirrorTxt}`;
+    };
+
+    const syncAutoLevel = (
+      lvl: BotChartLevel,
+      savedRow?: (typeof allForPair)[number]
+    ) => {
+      generated.push(lvl);
+      const priceChanged =
+        !savedRow ||
+        Math.abs(savedRow.price - lvl.price) / Math.max(1e-8, lvl.price) > 0.0005;
+      const metaChanged =
+        !savedRow || savedRow.label !== lvl.label || savedRow.source !== lvl.source;
+      if (priceChanged || metaChanged) {
+        sqliteDb.upsertBotLevel({ ...lvl, deleted: false });
+      }
+    };
 
     if (!hasManualGlobalSupport && !savedSup?.deleted) {
       if (globalSup > 0) {
-        const scoreTxt = sh ? ` ${sh.strength_score.toFixed(1)}★` : '';
         const lvl: BotChartLevel = {
           id: savedSup?.id || supId,
           pair: cleanPair,
-          label: `${globalTag} SUP${scoreTxt}`,
+          label: `${globalTag} SUP${buildBadgeStats(sh)}`,
           role: 'support',
           price: roundPrice(globalSup),
           touches: sh?.touches || 3,
@@ -1687,11 +1705,14 @@ async function getOrComputeMtfBotLevels(
           source: globalTag,
           manual_override: false,
           updated_at: nowStr,
+          zone_low: sh?.zone_low ? roundPrice(sh.zone_low) : undefined,
+          zone_high: sh?.zone_high ? roundPrice(sh.zone_high) : undefined,
+          mirror_retests: sh?.mirror_retests || 0,
+          false_breakouts: sh?.false_breakouts || 0,
+          consolidation_bars: sh?.consolidation_bars || 0,
+          timeframe_role: 'GLOBAL_1W_1D',
         };
-        generated.push(lvl);
-        if (!savedSup || Math.abs(savedSup.price - lvl.price) / Math.max(1e-8, lvl.price) > 0.0005) {
-          sqliteDb.upsertBotLevel({ ...lvl, deleted: false });
-        }
+        syncAutoLevel(lvl, savedSup);
       } else if (savedSup && !savedSup.deleted) {
         if (!generated.some((g) => g.id === savedSup.id)) generated.push(savedSup);
       }
@@ -1699,11 +1720,10 @@ async function getOrComputeMtfBotLevels(
 
     if (!hasManualGlobalResistance && !savedRes?.deleted) {
       if (globalRes > 0) {
-        const scoreTxt = rh ? ` ${rh.strength_score.toFixed(1)}★` : '';
         const lvl: BotChartLevel = {
           id: savedRes?.id || resId,
           pair: cleanPair,
-          label: `${globalTag} RES${scoreTxt}`,
+          label: `${globalTag} RES${buildBadgeStats(rh)}`,
           role: 'resistance',
           price: roundPrice(globalRes),
           touches: rh?.touches || 3,
@@ -1713,13 +1733,107 @@ async function getOrComputeMtfBotLevels(
           source: globalTag,
           manual_override: false,
           updated_at: nowStr,
+          zone_low: rh?.zone_low ? roundPrice(rh.zone_low) : undefined,
+          zone_high: rh?.zone_high ? roundPrice(rh.zone_high) : undefined,
+          mirror_retests: rh?.mirror_retests || 0,
+          false_breakouts: rh?.false_breakouts || 0,
+          consolidation_bars: rh?.consolidation_bars || 0,
+          timeframe_role: 'GLOBAL_1W_1D',
         };
-        generated.push(lvl);
-        if (!savedRes || Math.abs(savedRes.price - lvl.price) / Math.max(1e-8, lvl.price) > 0.0005) {
-          sqliteDb.upsertBotLevel({ ...lvl, deleted: false });
-        }
+        syncAutoLevel(lvl, savedRes);
       } else if (savedRes && !savedRes.deleted) {
         if (!generated.some((g) => g.id === savedRes.id)) generated.push(savedRes);
+      }
+    }
+
+    // Add up to 2 key intermediate 1D LOCAL levels (3-5+ day consolidations, 1D mirror retests — like DOT ~5.18)
+    const isFarFromExisting = (p: number, minDistPct: number) =>
+      generated.every(
+        (existing) =>
+          (Math.abs(existing.price - p) / Math.max(1e-8, existing.price)) * 100 >= minDistPct
+      );
+
+    const local1dCandidates = (mtf.local_1d_levels || []).filter((l) => {
+      if (liveRefPrice <= 0) return true;
+      const ratio = l.price / liveRefPrice;
+      return ratio >= 0.55 && ratio <= 1.65;
+    });
+
+    let addedLocalCount = 0;
+    for (const loc of local1dCandidates) {
+      if (addedLocalCount >= 2) break;
+      const locPrice = roundPrice(loc.price);
+      if (!isFarFromExisting(locPrice, 2.0)) continue;
+
+      const slotIdx = addedLocalCount + 1;
+      const locId = `tf-local${slotIdx}-${cleanPair}-${normTf}`;
+      const savedLoc = allForPair.find((l) => l.id === locId);
+      if (savedLoc?.deleted || savedLoc?.manual_override) continue;
+
+      const role: 'support' | 'resistance' =
+        liveRefPrice > 0 && locPrice > liveRefPrice ? 'resistance' : 'support';
+      const mirrorTxt = loc.mirror_retests && loc.mirror_retests > 0 ? ' ⇄S/R' : '';
+      const lvl: BotChartLevel = {
+        id: locId,
+        pair: cleanPair,
+        label: `1D LOCAL ${role === 'resistance' ? 'RES' : 'SUP'} ${loc.strength_score.toFixed(1)}★${mirrorTxt}`,
+        role,
+        price: locPrice,
+        touches: loc.touches,
+        bounces: loc.bounces,
+        breaks: loc.breaks,
+        strength_score: loc.strength_score,
+        source: '1D_LOCAL',
+        manual_override: false,
+        updated_at: nowStr,
+        zone_low: loc.zone_low ? roundPrice(loc.zone_low) : undefined,
+        zone_high: loc.zone_high ? roundPrice(loc.zone_high) : undefined,
+        mirror_retests: loc.mirror_retests || 0,
+        false_breakouts: loc.false_breakouts || 0,
+        consolidation_bars: loc.consolidation_bars || 0,
+        timeframe_role: 'LOCAL_1D',
+      };
+      syncAutoLevel(lvl, savedLoc);
+      addedLocalCount++;
+    }
+
+    // On lower timeframes (< 1D), optionally show nearest 4H structural point (NOT global level) if distinct
+    if (normTf !== '1d' && normTf !== '1w' && mtf.structural_4h_levels?.length) {
+      const nearestStructSup = mtf.structural_4h_levels
+        .filter((l) => liveRefPrice > 0 && l.price < liveRefPrice * 0.992 && l.price >= liveRefPrice * 0.85)
+        .sort((a, b) => b.price - a.price)[0];
+      const nearestStructRes = mtf.structural_4h_levels
+        .filter((l) => liveRefPrice > 0 && l.price > liveRefPrice * 1.008 && l.price <= liveRefPrice * 1.15)
+        .sort((a, b) => a.price - b.price)[0];
+
+      const structItems: Array<{ id: string; role: 'support' | 'resistance'; lvl: typeof nearestStructSup }> = [
+        { id: `tf-struct-sup-${cleanPair}-${normTf}`, role: 'support', lvl: nearestStructSup },
+        { id: `tf-struct-res-${cleanPair}-${normTf}`, role: 'resistance', lvl: nearestStructRes },
+      ];
+      for (const sItem of structItems) {
+        if (!sItem.lvl) continue;
+        const sPrice = roundPrice(sItem.lvl.price);
+        if (!isFarFromExisting(sPrice, 1.5)) continue;
+        const savedS = allForPair.find((l) => l.id === sItem.id);
+        if (savedS?.deleted || savedS?.manual_override) continue;
+        const lvl: BotChartLevel = {
+          id: sItem.id,
+          pair: cleanPair,
+          label: `4H STRUCT ${sItem.role === 'resistance' ? 'RES' : 'SUP'}`,
+          role: sItem.role,
+          price: sPrice,
+          touches: sItem.lvl.touches,
+          bounces: sItem.lvl.bounces,
+          breaks: sItem.lvl.breaks,
+          strength_score: sItem.lvl.strength_score,
+          source: '4H_STRUCT',
+          manual_override: false,
+          updated_at: nowStr,
+          zone_low: sItem.lvl.zone_low ? roundPrice(sItem.lvl.zone_low) : undefined,
+          zone_high: sItem.lvl.zone_high ? roundPrice(sItem.lvl.zone_high) : undefined,
+          timeframe_role: 'STRUCT_4H',
+        };
+        syncAutoLevel(lvl, savedS);
       }
     }
 
@@ -2019,11 +2133,13 @@ async function syncPositionsAndHistoryFromExchanges(
 
           if (!existingOpen.dca_manual_override && (!hasExistingPlannedDca || forceReanalyzeOpen)) {
             try {
-              const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
-                fetchRealCandles(pos.pair, '1d', 1000),
-                fetchRealCandles(pos.pair, '4h', 1000),
-                fetchRealCandles(pos.pair, '1h', 200),
-              ]);
+              const [{ candles: c1w }, { candles: c1d }, { candles: c4h }, { candles: c1h }] =
+                await Promise.all([
+                  fetchRealCandles(pos.pair, '1w', 300),
+                  fetchRealCandles(pos.pair, '1d', 1000),
+                  fetchRealCandles(pos.pair, '4h', 1000),
+                  fetchRealCandles(pos.pair, '1h', 200),
+                ]);
               if (c4h.length >= 20) {
                 const refreshedLvls = await getOrComputeMtfBotLevels(
                   pos.pair,
@@ -2036,14 +2152,15 @@ async function syncPositionsAndHistoryFromExchanges(
                 const manualRes = refreshedLvls.find(
                   (l) => l.role === 'resistance' && l.manual_override && !l.id.startsWith('lvl-')
                 );
-                const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d);
+                const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d, undefined, c1w);
                 const strongDca = findStrongestDcaLevel(
                   c4h,
                   c1d,
                   existingOpen.open_rate,
                   existingOpen.is_short,
                   2.8,
-                  95.0
+                  95.0,
+                  c1w
                 );
                 existingOpen.support_level = manualSup
                   ? roundPrice(manualSup.price)
@@ -2149,11 +2266,13 @@ async function syncPositionsAndHistoryFromExchanges(
           let hasManualRes = false;
 
           try {
-            const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
-              fetchRealCandles(pos.pair, '1d', 1000),
-              fetchRealCandles(pos.pair, '4h', 1000),
-              fetchRealCandles(pos.pair, '1h', 200),
-            ]);
+            const [{ candles: c1w }, { candles: c1d }, { candles: c4h }, { candles: c1h }] =
+              await Promise.all([
+                fetchRealCandles(pos.pair, '1w', 300),
+                fetchRealCandles(pos.pair, '1d', 1000),
+                fetchRealCandles(pos.pair, '4h', 1000),
+                fetchRealCandles(pos.pair, '1h', 200),
+              ]);
             const refreshedLvls = await getOrComputeMtfBotLevels(
               pos.pair,
               botConfig.timeframe,
@@ -2165,7 +2284,7 @@ async function syncPositionsAndHistoryFromExchanges(
             hasManualRes = Boolean(manualRes);
 
             if (c4h.length >= 20) {
-              const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d);
+              const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d, undefined, c1w);
               d1TrendLabel = mtf.d1_trend;
               analyzedSup = manualSup ? roundPrice(manualSup.price) : roundPrice(mtf.key_4h_support);
               analyzedRes = manualRes ? roundPrice(manualRes.price) : roundPrice(mtf.key_4h_resistance);
@@ -2174,7 +2293,7 @@ async function syncPositionsAndHistoryFromExchanges(
                   pos.is_short ? mtf.recommended_tp_short : mtf.recommended_tp_long
                 );
               }
-              const strongDca = findStrongestDcaLevel(c4h, c1d, entryRate, pos.is_short, 2.8, 95.0);
+              const strongDca = findStrongestDcaLevel(c4h, c1d, entryRate, pos.is_short, 2.8, 95.0, c1w);
               dcaPrice1 =
                 !pos.is_short && manualSup
                   ? roundPrice(manualSup.price)
@@ -2943,8 +3062,9 @@ async function runScalpBotCycle(waitForActive = false) {
 
             // Как только цена достигла или пробила целевой уровень DCA 1 (установленный вручную или рассчитанный ботом) и нет вертикального ножа — выполняем усреднение
             if (noKnifeOrPump) {
-              // Find next strongest 4H/1D DCA level first
-              const [{ candles: c4h }, { candles: c1d }] = await Promise.all([
+              // Find next strongest 1W->1D / 4H DCA level first
+              const [{ candles: c1w }, { candles: c4h }, { candles: c1d }] = await Promise.all([
+                fetchRealCandles(trade.pair, '1w', 300),
                 fetchRealCandles(trade.pair, '4h', 1000),
                 fetchRealCandles(trade.pair, '1d', 1000),
               ]);
@@ -3013,7 +3133,9 @@ async function runScalpBotCycle(waitForActive = false) {
                 c1d,
                 dcaAnchorPrice,
                 trade.is_short,
-                3.0
+                3.0,
+                95.0,
+                c1w
               );
 
               // 1. Before DB transaction: if this trade is part of a 2-way hedge campaign, close profitable sibling leg on exchange first
@@ -3424,12 +3546,14 @@ async function runScalpBotCycle(waitForActive = false) {
       scannedCount++;
       if (scannedCount > 24) break; // Analyze top 24 most volatile pairs per cycle for high capital turnover
 
-      // Top-Down Анализ: 1D (вся доступная история 365 дн.) -> 4H (500 свечей) -> 1H (200 свечей)
-      const [{ candles: c1h }, { candles: c4h }, { candles: c1d }] = await Promise.all([
-        fetchRealCandles(pair, botConfig.timeframe, 200),
-        fetchRealCandles(pair, '4h', 500),
-        fetchRealCandles(pair, '1d', 365),
-      ]);
+      // Top-Down Анализ: 1W (300 свечей) -> 1D (вся доступная история) -> 4H (500 свечей) -> 1H (200 свечей)
+      const [{ candles: c1w }, { candles: c1h }, { candles: c4h }, { candles: c1d }] =
+        await Promise.all([
+          fetchRealCandles(pair, '1w', 300),
+          fetchRealCandles(pair, botConfig.timeframe, 200),
+          fetchRealCandles(pair, '4h', 500),
+          fetchRealCandles(pair, '1d', 1000),
+        ]);
       if (c1h.length < 35 || c4h.length < 25) continue;
 
       const livePrice = c1h[c1h.length - 1].close;
@@ -3441,10 +3565,17 @@ async function runScalpBotCycle(waitForActive = false) {
         pairLevels.find((l) => l.role === 'resistance' && l.manual_override) ||
         pairLevels.find((l) => l.role === 'resistance');
 
-      const mtf = analyzeMultiTimeframe(pair, c1h, c4h, c1d, {
-        support: manualSupLvl?.manual_override ? manualSupLvl.price : undefined,
-        resistance: manualResLvl?.manual_override ? manualResLvl.price : undefined,
-      });
+      const mtf = analyzeMultiTimeframe(
+        pair,
+        c1h,
+        c4h,
+        c1d,
+        {
+          support: manualSupLvl?.manual_override ? manualSupLvl.price : undefined,
+          resistance: manualResLvl?.manual_override ? manualResLvl.price : undefined,
+        },
+        c1w
+      );
 
       const customSup = manualSupLvl?.price || mtf.key_4h_support;
       const customRes = manualResLvl?.price || mtf.key_4h_resistance;
@@ -3501,6 +3632,7 @@ async function runScalpBotCycle(waitForActive = false) {
               if (sig.enter_short && mtf.allow_short) {
                 await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, {
                   strategyName: 'ScalpingStrategy',
+                  candles1w: c1w,
                 });
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
@@ -3519,7 +3651,7 @@ async function runScalpBotCycle(waitForActive = false) {
                   c4h,
                   c1d,
                   'Scalp_Trend_Short',
-                  { strategyName: 'ScalpingStrategy' }
+                  { strategyName: 'ScalpingStrategy', candles1w: c1w }
                 );
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
@@ -3529,6 +3661,7 @@ async function runScalpBotCycle(waitForActive = false) {
                   horizon: hedgeEval.horizon,
                   longTpPrice: hedgeEval.long_tp_price,
                   shortTpPrice: hedgeEval.short_tp_price,
+                  candles1w: c1w,
                 });
                 openedInThisCycle += 2;
                 if (openedInThisCycle >= 3) break;
@@ -3536,6 +3669,7 @@ async function runScalpBotCycle(waitForActive = false) {
               } else if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
                 await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, {
                   strategyName: 'ScalpingStrategy',
+                  candles1w: c1w,
                 });
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
@@ -3546,6 +3680,7 @@ async function runScalpBotCycle(waitForActive = false) {
               if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
                 await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, {
                   strategyName: 'ScalpingStrategy',
+                  candles1w: c1w,
                 });
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
@@ -3565,7 +3700,7 @@ async function runScalpBotCycle(waitForActive = false) {
                   c4h,
                   c1d,
                   'Scalp_Trend_Long',
-                  { strategyName: 'ScalpingStrategy' }
+                  { strategyName: 'ScalpingStrategy', candles1w: c1w }
                 );
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
@@ -3575,6 +3710,7 @@ async function runScalpBotCycle(waitForActive = false) {
                   horizon: hedgeEval.horizon,
                   longTpPrice: hedgeEval.long_tp_price,
                   shortTpPrice: hedgeEval.short_tp_price,
+                  candles1w: c1w,
                 });
                 openedInThisCycle += 2;
                 if (openedInThisCycle >= 3) break;
@@ -3582,6 +3718,7 @@ async function runScalpBotCycle(waitForActive = false) {
               } else if (sig.enter_short && mtf.allow_short) {
                 await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, {
                   strategyName: 'ScalpingStrategy',
+                  candles1w: c1w,
                 });
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
@@ -3594,6 +3731,7 @@ async function runScalpBotCycle(waitForActive = false) {
                   horizon: hedgeEval.horizon,
                   longTpPrice: hedgeEval.long_tp_price,
                   shortTpPrice: hedgeEval.short_tp_price,
+                  candles1w: c1w,
                 });
                 openedInThisCycle += 2;
                 if (openedInThisCycle >= 3) break;
@@ -3601,6 +3739,7 @@ async function runScalpBotCycle(waitForActive = false) {
               } else if (sig.enter_short && mtf.allow_short) {
                 await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, {
                   strategyName: 'ScalpingStrategy',
+                  candles1w: c1w,
                 });
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
@@ -3608,6 +3747,7 @@ async function runScalpBotCycle(waitForActive = false) {
               } else if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
                 await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, {
                   strategyName: 'ScalpingStrategy',
+                  candles1w: c1w,
                 });
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
@@ -3628,7 +3768,7 @@ async function runScalpBotCycle(waitForActive = false) {
                   c4h,
                   c1d,
                   'Scalp_Overbought_Short',
-                  { strategyName: 'ScalpingStrategy' }
+                  { strategyName: 'ScalpingStrategy', candles1w: c1w }
                 );
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
@@ -3650,7 +3790,7 @@ async function runScalpBotCycle(waitForActive = false) {
                   c4h,
                   c1d,
                   'Scalp_Oversold_Long',
-                  { strategyName: 'ScalpingStrategy' }
+                  { strategyName: 'ScalpingStrategy', candles1w: c1w }
                 );
                 openedInThisCycle++;
                 if (openedInThisCycle >= 3) break;
@@ -3768,6 +3908,7 @@ async function openHedgeCampaign(
     horizon?: 'MEDIUM_TERM_4H' | 'LONG_TERM_1D';
     longTpPrice?: number;
     shortTpPrice?: number;
+    candles1w?: RawCandle[];
   }
 ): Promise<{ longTrade: FreqtradeTrade; shortTrade: FreqtradeTrade | null }> {
   const cleanPair = pair.toUpperCase();
@@ -3894,6 +4035,7 @@ async function createScalpBotPosition(
     preloadedPairLevels?: Awaited<ReturnType<typeof getOrComputeMtfBotLevels>>;
     strategyName?: string;
     timeframeOverride?: string;
+    candles1w?: RawCandle[];
   }
 ): Promise<FreqtradeTrade> {
   const activeAccounts = exchangeAccountsStore.filter((a) => a.enabled);
@@ -4034,8 +4176,16 @@ async function createScalpBotPosition(
     ((Math.abs(targetTp - entryRate) / Math.max(1e-8, entryRate)) * 100).toFixed(2)
   );
 
-  // Усреднения: DCA 1 строго на глобальном уровне 1D/4H SUP/RES (или ручном SUP/RES), DCA 2 строго на абсолютном историческом пике (SHORT) или дне (LONG)
-  const strongestDca = findStrongestDcaLevel(candles4h, candles1d, entryRate, isShort, 2.8, 95.0);
+  // Усреднения: DCA 1 строго на уточнённом глобальном уровне 1W->1D SUP/RES (или ручном SUP/RES), DCA 2 строго на абсолютном историческом пике (SHORT) или дне (LONG)
+  const strongestDca = findStrongestDcaLevel(
+    candles4h,
+    candles1d,
+    entryRate,
+    isShort,
+    2.8,
+    95.0,
+    customOpts?.candles1w
+  );
   const nextDcaPrice = !isShort
     ? manualSupLvl
       ? roundPrice(manualSupLvl.price)
@@ -4675,12 +4825,14 @@ async function startServer() {
 
   app.get('/api/v1/mtf_analysis', async (req, res) => {
     const pair = String(req.query.pair || 'ETH/USDT:USDT').toUpperCase();
-    const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
-      fetchRealCandles(pair, '1d', 1000),
-      fetchRealCandles(pair, '4h', 1000),
-      fetchRealCandles(pair, '1h', 250),
-    ]);
-    const mtf = analyzeMultiTimeframe(pair, c1h, c4h, c1d);
+    const [{ candles: c1w }, { candles: c1d }, { candles: c4h }, { candles: c1h }] =
+      await Promise.all([
+        fetchRealCandles(pair, '1w', 300),
+        fetchRealCandles(pair, '1d', 1000),
+        fetchRealCandles(pair, '4h', 1000),
+        fetchRealCandles(pair, '1h', 250),
+      ]);
+    const mtf = analyzeMultiTimeframe(pair, c1h, c4h, c1d, undefined, c1w);
     const { candles: btcCandles } = await fetchRealCandles('BTC/USDT:USDT', '1h', 60);
     const btcGuard = checkBtcMarketHealth(btcCandles);
     const strategyEval =
@@ -4703,12 +4855,14 @@ async function startServer() {
     const analyzed = await Promise.all(
       topSlice.map(async (pair) => {
         const ticker = tickerCache.get(pair);
-        const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
-          fetchRealCandles(pair, '1d', 1000),
-          fetchRealCandles(pair, '4h', 1000),
-          fetchRealCandles(pair, '1h', 100),
-        ]);
-        const mtf = analyzeMultiTimeframe(pair, c1h, c4h, c1d);
+        const [{ candles: c1w }, { candles: c1d }, { candles: c4h }, { candles: c1h }] =
+          await Promise.all([
+            fetchRealCandles(pair, '1w', 300),
+            fetchRealCandles(pair, '1d', 1000),
+            fetchRealCandles(pair, '4h', 1000),
+            fetchRealCandles(pair, '1h', 100),
+          ]);
+        const mtf = analyzeMultiTimeframe(pair, c1h, c4h, c1d, undefined, c1w);
         const sig =
           c1h.length >= 30
             ? evaluateScalpingStrategy(c1h, mtf.key_4h_support, mtf.key_4h_resistance)
@@ -5416,16 +5570,18 @@ async function startServer() {
       skip_client_sync: skipClientSync,
     } = req.body || {};
     const cleanPair = String(pair).toUpperCase();
-    const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
-      fetchRealCandles(cleanPair, '1d', 1000),
-      fetchRealCandles(cleanPair, '4h', 1000),
-      fetchRealCandles(cleanPair, '1h', 250),
-    ]);
+    const [{ candles: c1w }, { candles: c1d }, { candles: c4h }, { candles: c1h }] =
+      await Promise.all([
+        fetchRealCandles(cleanPair, '1w', 300),
+        fetchRealCandles(cleanPair, '1d', 1000),
+        fetchRealCandles(cleanPair, '4h', 1000),
+        fetchRealCandles(cleanPair, '1h', 250),
+      ]);
     const latestPrice = c1h.length > 0 ? c1h[c1h.length - 1].close : 100;
     const entryRate = roundPrice(
       customPrice && Number(customPrice) > 0 ? Number(customPrice) : latestPrice
     );
-    const mtf = analyzeMultiTimeframe(cleanPair, c1h, c4h, c1d);
+    const mtf = analyzeMultiTimeframe(cleanPair, c1h, c4h, c1d, undefined, c1w);
     const normalizedSide = String(side || 'long').toLowerCase();
     if (normalizedSide === 'hedge' || normalizedSide === 'both') {
       try {
@@ -5440,6 +5596,7 @@ async function startServer() {
             leverage:
               customLeverage && Number(customLeverage) >= 1 ? Number(customLeverage) : undefined,
             skipClientSync: Boolean(skipClientSync),
+            candles1w: c1w,
           }
         );
         res.json({
@@ -5477,6 +5634,7 @@ async function startServer() {
           customSl: customSl && Number(customSl) > 0 ? Number(customSl) : undefined,
           skipClientSync: Boolean(skipClientSync),
           preloadedPairLevels,
+          candles1w: c1w,
         }
       );
     } catch (err: any) {
@@ -5506,11 +5664,13 @@ async function startServer() {
       return;
     }
 
-    const [{ candles: c1d }, { candles: c4h }, { candles: c1h }] = await Promise.all([
-      fetchRealCandles(trade.pair, '1d', 1000),
-      fetchRealCandles(trade.pair, '4h', 1000),
-      fetchRealCandles(trade.pair, '1h', 100),
-    ]);
+    const [{ candles: c1w }, { candles: c1d }, { candles: c4h }, { candles: c1h }] =
+      await Promise.all([
+        fetchRealCandles(trade.pair, '1w', 300),
+        fetchRealCandles(trade.pair, '1d', 1000),
+        fetchRealCandles(trade.pair, '4h', 1000),
+        fetchRealCandles(trade.pair, '1h', 100),
+      ]);
     const livePrice =
       c1h.length > 0 ? c1h[c1h.length - 1].close : trade.current_rate;
     trade.current_rate = livePrice;
@@ -5580,7 +5740,15 @@ async function startServer() {
     const dcaAnchorPrice = trade.is_short
       ? Math.max(newAvgOpenRate, fillPrice)
       : Math.min(newAvgOpenRate, fillPrice);
-    const nextStrongDca = findStrongestDcaLevel(c4h, c1d, dcaAnchorPrice, trade.is_short, 3.0);
+    const nextStrongDca = findStrongestDcaLevel(
+      c4h,
+      c1d,
+      dcaAnchorPrice,
+      trade.is_short,
+      3.0,
+      95.0,
+      c1w
+    );
 
     // Pre-dispatch client DCA orders if master trade is averaged
     const clientDcaDispatches = new Map<number, PlacedOrderResult | null>();
@@ -6060,8 +6228,13 @@ async function startServer() {
     target.manual_override = true;
     target.updated_at = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
-    // Keep global SUP/RES explicit role, while allowing user-added LVL lines to adapt role when dragged across live price
+    // Keep global SUP/RES explicit role, while allowing user-added LVL/local lines to adapt role when dragged across live price
     const isCustomManualLvl = target.id.startsWith('lvl-');
+    const isGlobalSupRes =
+      target.id.startsWith('tf-sup-') ||
+      target.id.startsWith('mtf-sup-') ||
+      target.id.startsWith('tf-res-') ||
+      target.id.startsWith('mtf-res-');
     const livePairPrice = tickerCache.get(cleanPair)?.price || 0;
     if (role === 'support' || role === 'resistance') {
       target.role = role;
@@ -6091,8 +6264,8 @@ async function startServer() {
         updated_at: target.updated_at,
       });
 
-      // Only clean up sibling auto-levels when user drags a global SUP/RES line itself (never when dragging a separate MANUAL LVL)
-      if (!isCustomManualLvl) {
+      // Only clean up sibling auto-levels and bind global trade S/R when user drags a global SUP/RES line itself
+      if (isGlobalSupRes) {
         sqliteDb.replaceAutoBotLevelsWithManual(cleanPair, target.role, target.id);
 
         // Привязываем DCA 1 (если его ещё не трогали вручную) к перетащенному глобальному SUP/RES; TP оставляем независимым
