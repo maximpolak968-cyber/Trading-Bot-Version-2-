@@ -96,6 +96,30 @@ export interface MultiTimeframeAnalysis {
   institutional_levels: ClusteredLevelWithHistory[];
   local_1d_levels?: ClusteredLevelWithHistory[];
   structural_4h_levels?: ClusteredLevelWithHistory[];
+  trend_strength_score?: number;
+  trend_regime?: 'STRONG_TREND' | 'MODERATE_TREND' | 'RANGE_CHOP';
+  tp_horizon_long?: '1H' | '4H' | '1D' | '1W';
+  tp_horizon_short?: '1H' | '4H' | '1D' | '1W';
+  tp_reason_long?: string;
+  tp_reason_short?: string;
+  chart_targets_long?: Array<{
+    price: number;
+    level_price: number;
+    horizon: '1H' | '4H' | '1D' | '1W';
+    label: string;
+    strength: number;
+    zone_low?: number;
+    zone_high?: number;
+  }>;
+  chart_targets_short?: Array<{
+    price: number;
+    level_price: number;
+    horizon: '1H' | '4H' | '1D' | '1W';
+    label: string;
+    strength: number;
+    zone_low?: number;
+    zone_high?: number;
+  }>;
   mover_category?: string;
   change_24h_pct?: number;
   funding_rate_pct?: number;
@@ -1177,6 +1201,360 @@ function classifyTimeframeTrend(
   return 'MILD_BEARISH';
 }
 
+interface ChartTpCandidate {
+  price: number;
+  level_price: number;
+  horizon: '1H' | '4H' | '1D' | '1W';
+  label: string;
+  strength: number;
+  bounces: number;
+  breaks: number;
+  zone_low?: number;
+  zone_high?: number;
+}
+
+function computeDirectionalTrendStrength(params: {
+  direction: 'long' | 'short';
+  w1Trend: string;
+  d1Trend: string;
+  h4Trend: string;
+  h1Trend: string;
+  candles1h: OhlcvCandle[];
+  candles4h: OhlcvCandle[];
+  rsi1h: number;
+  rsi4h: number;
+  rsi1d: number;
+}): { score: number; regime: 'STRONG_TREND' | 'MODERATE_TREND' | 'RANGE_CHOP' } {
+  const { direction, w1Trend, d1Trend, h4Trend, h1Trend, candles1h, candles4h, rsi1h, rsi4h, rsi1d } =
+    params;
+  const isLong = direction === 'long';
+  const isStrongMatch = (t: string) => (isLong ? t === 'BULLISH' : t === 'BEARISH');
+  const isMildMatch = (t: string) => (isLong ? t === 'MILD_BULLISH' : t === 'MILD_BEARISH');
+  const isCounter = (t: string) =>
+    isLong
+      ? t === 'BEARISH' || t === 'MILD_BEARISH'
+      : t === 'BULLISH' || t === 'MILD_BULLISH';
+
+  let score = 30;
+  if (isStrongMatch(w1Trend)) score += 12;
+  else if (isMildMatch(w1Trend)) score += 6;
+  else if (isCounter(w1Trend)) score -= 8;
+
+  if (isStrongMatch(d1Trend)) score += 20;
+  else if (isMildMatch(d1Trend)) score += 10;
+  else if (isCounter(d1Trend)) score -= 18;
+
+  if (isStrongMatch(h4Trend)) score += 20;
+  else if (isMildMatch(h4Trend)) score += 10;
+  else if (isCounter(h4Trend)) score -= 15;
+
+  if (isStrongMatch(h1Trend)) score += 14;
+  else if (isMildMatch(h1Trend)) score += 7;
+  else if (isCounter(h1Trend)) score -= 10;
+
+  // 4H EMA separation & slope confirmation
+  if (candles4h.length >= 25) {
+    const c4 = candles4h.map((c) => c.close);
+    const ema20 = calcEmaSeries(c4, 20);
+    const ema50 = calcEmaSeries(c4, Math.min(50, c4.length));
+    const cur20 = ema20[ema20.length - 1];
+    const prev20 = ema20[Math.max(0, ema20.length - 4)];
+    const cur50 = ema50[ema50.length - 1];
+    const spreadPct = cur50 > 0 ? ((cur20 - cur50) / cur50) * 100 : 0;
+    const slopePct = prev20 > 0 ? ((cur20 - prev20) / prev20) * 100 : 0;
+    const directionalSpread = isLong ? spreadPct : -spreadPct;
+    const directionalSlope = isLong ? slopePct : -slopePct;
+    if (directionalSpread > 0.8 && directionalSlope > 0.25) score += 10;
+    else if (directionalSpread > 0.2 && directionalSlope > 0) score += 5;
+    else if (directionalSpread < -0.5) score -= 8;
+  }
+
+  // RSI momentum runway
+  if (isLong) {
+    if (rsi4h >= 45 && rsi4h <= 66 && rsi1h <= 70 && rsi1d <= 72) score += 6;
+    else if (rsi4h > 72 || rsi1h > 75) score -= 12;
+  } else {
+    if (rsi4h <= 55 && rsi4h >= 34 && rsi1h >= 30 && rsi1d >= 28) score += 6;
+    else if (rsi4h < 28 || rsi1h < 25) score -= 12;
+  }
+
+  // 1H recent expansion / impulse
+  if (candles1h.length >= 10) {
+    const closes1h = candles1h.map((c) => c.close);
+    const ema20h = calcEmaSeries(closes1h, 20);
+    const curClose = closes1h[closes1h.length - 1];
+    const curEma = ema20h[ema20h.length - 1];
+    if ((isLong && curClose > curEma) || (!isLong && curClose < curEma)) {
+      score += 4;
+    }
+  }
+
+  const clamped = Math.max(0, Math.min(100, Math.round(score)));
+  const regime: 'STRONG_TREND' | 'MODERATE_TREND' | 'RANGE_CHOP' =
+    clamped >= 68 ? 'STRONG_TREND' : clamped >= 45 ? 'MODERATE_TREND' : 'RANGE_CHOP';
+  return { score: clamped, regime };
+}
+
+function selectChartDrivenTakeProfit(params: {
+  direction: 'long' | 'short';
+  currentPrice: number;
+  regime: 'STRONG_TREND' | 'MODERATE_TREND' | 'RANGE_CHOP';
+  trendScore: number;
+  candles4h: OhlcvCandle[];
+  candles1h: OhlcvCandle[];
+  local1hTarget: number;
+  keyGlobalTarget: number;
+  customLevelTarget?: number;
+  structure1hLevels: ClusteredLevelWithHistory[];
+  swing1hExtremes: number[];
+  structural4hLevels: ClusteredLevelWithHistory[];
+  swing4hExtremes: number[];
+  local1d: ClusteredLevelWithHistory[];
+  refinedGlobal: ClusteredLevelWithHistory[];
+}): {
+  tp: number;
+  horizon: '1H' | '4H' | '1D' | '1W';
+  reason: string;
+  targets: ChartTpCandidate[];
+} {
+  const {
+    direction,
+    currentPrice,
+    regime,
+    candles4h,
+    candles1h,
+    local1hTarget,
+    keyGlobalTarget,
+    customLevelTarget,
+    structure1hLevels,
+    swing1hExtremes,
+    structural4hLevels,
+    swing4hExtremes,
+    local1d,
+    refinedGlobal,
+  } = params;
+
+  const isLong = direction === 'long';
+  // Minimum safe profit distance (~0.60%) above entry so initial TP clears fees (0.12%) + slippage
+  const minSafePrice = isLong ? currentPrice * 1.006 : currentPrice * 0.994;
+
+  const horizonRank: Record<'1H' | '4H' | '1D' | '1W', number> = {
+    '1W': 4,
+    '1D': 3,
+    '4H': 2,
+    '1H': 1,
+  };
+
+  const toExecPrice = (
+    rawLevel: number,
+    zoneLow?: number,
+    zoneHigh?: number
+  ): number => {
+    if (isLong) {
+      if (zoneLow && zoneLow > currentPrice * 1.003) {
+        return zoneLow * 0.9985;
+      }
+      return rawLevel * 0.998;
+    } else {
+      if (zoneHigh && zoneHigh < currentPrice * 0.997) {
+        return zoneHigh * 1.0015;
+      }
+      return rawLevel * 1.002;
+    }
+  };
+
+  const rawCandidates: ChartTpCandidate[] = [];
+
+  const pushLevel = (
+    levelPrice: number,
+    horizon: '1H' | '4H' | '1D' | '1W',
+    label: string,
+    strength: number,
+    bounces = 1,
+    breaks = 0,
+    zoneLow?: number,
+    zoneHigh?: number
+  ) => {
+    if (!Number.isFinite(levelPrice) || levelPrice <= 0) return;
+    const execPrice = toExecPrice(levelPrice, zoneLow, zoneHigh);
+    if (isLong ? execPrice < minSafePrice : execPrice > minSafePrice) return;
+    rawCandidates.push({
+      price: Number(execPrice.toPrecision(7)),
+      level_price: Number(levelPrice.toPrecision(7)),
+      horizon,
+      label,
+      strength,
+      bounces,
+      breaks,
+      zone_low: zoneLow,
+      zone_high: zoneHigh,
+    });
+  };
+
+  if (customLevelTarget && customLevelTarget > 0) {
+    pushLevel(customLevelTarget, '1D', 'Ручной уровень графика', 25, 3, 0);
+  }
+  if (local1hTarget > 0) {
+    pushLevel(local1hTarget, '1H', '1H локальный уровень', 6, 1, 0);
+  }
+  if (keyGlobalTarget > 0) {
+    pushLevel(keyGlobalTarget, '1D', '1W->1D глобальная зона', 16, 2, 0);
+  }
+
+  for (const l of structure1hLevels) {
+    pushLevel(
+      l.price,
+      '1H',
+      l.consolidation_bars && l.consolidation_bars >= 3 ? '1H граница боковика' : '1H свинг-уровень',
+      l.strength_score || 5,
+      l.bounces || 1,
+      l.breaks || 0,
+      l.zone_low,
+      l.zone_high
+    );
+  }
+  for (const sw of swing1hExtremes) {
+    pushLevel(sw, '1H', '1H экстремум', 4, 1, 0);
+  }
+  for (const l of structural4hLevels) {
+    pushLevel(
+      l.price,
+      '4H',
+      l.consolidation_bars && l.consolidation_bars >= 3 ? '4H зона консолидации' : '4H структурный уровень',
+      (l.strength_score || 6) * 1.25,
+      l.bounces || 1,
+      l.breaks || 0,
+      l.zone_low,
+      l.zone_high
+    );
+  }
+  for (const sw of swing4hExtremes) {
+    pushLevel(sw, '4H', '4H свинг-пик/дно', 6.5, 1, 0);
+  }
+  for (const l of local1d) {
+    pushLevel(
+      l.price,
+      '1D',
+      l.consolidation_bars && l.consolidation_bars >= 3 ? '1D зона консолидации' : '1D локальный уровень',
+      (l.strength_score || 8) * 1.4,
+      l.bounces || 2,
+      l.breaks || 0,
+      l.zone_low,
+      l.zone_high
+    );
+  }
+  for (const l of refinedGlobal) {
+    const h: '1D' | '1W' = l.refined_from_1w ? '1W' : '1D';
+    pushLevel(
+      l.price,
+      h,
+      l.refined_from_1w ? '1W->1D глобальный уровень' : '1D глобальный уровень',
+      (l.strength_score || 10) * 1.6,
+      l.bounces || 2,
+      l.breaks || 0,
+      l.zone_low,
+      l.zone_high
+    );
+  }
+
+  // Deduplicate candidates clustered within 0.45% (keep highest authority/strength)
+  const deduped: ChartTpCandidate[] = [];
+  const sortedByAuth = [...rawCandidates].sort((a, b) => {
+    if (horizonRank[b.horizon] !== horizonRank[a.horizon]) {
+      return horizonRank[b.horizon] - horizonRank[a.horizon];
+    }
+    return b.strength - a.strength;
+  });
+  for (const cand of sortedByAuth) {
+    const tooClose = deduped.some(
+      (ex) => (Math.abs(ex.price - cand.price) / Math.max(1e-9, cand.price)) * 100 < 0.45
+    );
+    if (!tooClose) deduped.push(cand);
+  }
+
+  // Order by trajectory from currentPrice outward
+  const ordered = deduped.sort((a, b) => (isLong ? a.price - b.price : b.price - a.price));
+
+  // ATR fallback measured move (used ONLY when chart is in uncharted breakout with zero overhead levels)
+  const atr4hPct = candles4h.length >= 14 ? getMedianAtrPct(candles4h, 14) : 0;
+  const atr1hPct = candles1h.length >= 14 ? getMedianAtrPct(candles1h, 14) : 0;
+  const effectiveAtrPct = Math.max(0.8, atr4hPct || atr1hPct * 1.8 || 1.4);
+
+  if (ordered.length === 0) {
+    const mult = regime === 'STRONG_TREND' ? 2.6 : regime === 'MODERATE_TREND' ? 1.8 : 1.1;
+    const movePct = Math.max(0.8, effectiveAtrPct * mult) / 100;
+    const projPrice = Number(
+      (isLong ? currentPrice * (1 + movePct) : currentPrice * (1 - movePct)).toPrecision(7)
+    );
+    return {
+      tp: projPrice,
+      horizon: regime === 'STRONG_TREND' ? '4H' : '1H',
+      reason: `Проекция волатильности (ATR×${mult}) — свободный ход без близких стен`,
+      targets: [],
+    };
+  }
+
+  // First strong HTF wall (1D/1W) blocking the path — never set TP blindly behind an intact major wall
+  const firstMajorHtfWall = ordered.find(
+    (c) => (c.horizon === '1D' || c.horizon === '1W') && c.bounces >= c.breaks
+  );
+
+  let chosen: ChartTpCandidate | undefined;
+
+  if (regime === 'RANGE_CHOP') {
+    // Weak trend / sideways: take profit at nearest confirmed 1H/4H structure (above safe floor)
+    chosen =
+      ordered.find((c) => (c.horizon === '1H' || c.horizon === '4H') && c.bounces >= 1) ||
+      ordered[0];
+  } else if (regime === 'MODERATE_TREND') {
+    // Moderate trend: prefer 4H or confirmed 1D structure unless a solid 1H wall has high bounces or major HTF wall is closer
+    const c4hOr1d = ordered.find(
+      (c) =>
+        (c.horizon === '4H' || c.horizon === '1D' || c.horizon === '1W') &&
+        ((Math.abs(c.price - currentPrice) / currentPrice) * 100 >= 0.9 || c.strength >= 8)
+    );
+    if (firstMajorHtfWall && c4hOr1d && (isLong ? firstMajorHtfWall.price < c4hOr1d.price : firstMajorHtfWall.price > c4hOr1d.price)) {
+      chosen = firstMajorHtfWall;
+    } else {
+      chosen = c4hOr1d || ordered[0];
+    }
+  } else {
+    // STRONG_TREND: skip weak 1H bumps, aim for major 1D/1W target (or strongest 4H before major 1D/1W)
+    const majorHtf = ordered.find(
+      (c) =>
+        (c.horizon === '1D' || c.horizon === '1W') &&
+        (Math.abs(c.price - currentPrice) / currentPrice) * 100 >= 1.2
+    );
+    const strong4h = ordered.find(
+      (c) =>
+        c.horizon === '4H' &&
+        (Math.abs(c.price - currentPrice) / currentPrice) * 100 >= 1.4
+    );
+    if (firstMajorHtfWall) {
+      chosen = firstMajorHtfWall;
+    } else {
+      chosen = majorHtf || strong4h || ordered[ordered.length - 1];
+    }
+  }
+
+  if (!chosen) chosen = ordered[0];
+
+  const distPct = ((Math.abs(chosen.price - currentPrice) / Math.max(1e-9, currentPrice)) * 100).toFixed(2);
+  const regimeLabel =
+    regime === 'STRONG_TREND'
+      ? 'сильный тренд'
+      : regime === 'MODERATE_TREND'
+      ? 'умеренный тренд'
+      : 'боковик/слабый тренд';
+
+  return {
+    tp: chosen.price,
+    horizon: chosen.horizon,
+    reason: `${chosen.label} [${chosen.horizon}] @ ${chosen.level_price} (${isLong ? '+' : '-'}${distPct}%, режим: ${regimeLabel})`,
+    targets: ordered.slice(0, 12),
+  };
+}
+
 export function analyzeMultiTimeframe(
   pair: string,
   candles1h: OhlcvCandle[],
@@ -1429,20 +1807,50 @@ export function analyzeMultiTimeframe(
     rejectionReasonShort = `Бычий тренд рынка (1D=${d1Trend}, 4H=${h4Trend}, 1H=${h1Trend}) — вход в SHORT против тренда заблокирован`;
   }
 
-  // Long TP: aim for nearest confirmed S/R or consolidation zone edge within +0.8%..+3.5%, fallback +1.2%
-  const minTpDistLong = currentPrice * 1.008;
-  const maxTpDistLong = currentPrice * 1.035;
-  const defaultScalpTpLong = currentPrice * 1.012;
-  const longTargetCandidates = [
-    local1hResistance * 0.998,
-    key4hResistance * 0.998,
-    ...local1d.map((l) => (l.zone_low && l.zone_low > currentPrice ? l.zone_low * 0.999 : l.price * 0.998)),
-    ...structural4hLevels.map((l) => (l.zone_low && l.zone_low > currentPrice ? l.zone_low * 0.999 : l.price * 0.998)),
-    ...refinedGlobal.map((l) => (l.zone_low && l.zone_low > currentPrice ? l.zone_low * 0.999 : l.price * 0.998)),
-  ]
-    .filter((p) => Number.isFinite(p) && p >= minTpDistLong && p <= maxTpDistLong)
-    .sort((a, b) => a - b);
-  const recTpLong = longTargetCandidates.length > 0 ? longTargetCandidates[0] : defaultScalpTpLong;
+  // Chart-Driven TP selection based on trend strength (1H/4H locally in chop/moderate trend, 1D/1W globally in strong trend)
+  const longStrength = computeDirectionalTrendStrength({
+    direction: 'long',
+    w1Trend,
+    d1Trend,
+    h4Trend,
+    h1Trend,
+    candles1h,
+    candles4h,
+    rsi1h,
+    rsi4h,
+    rsi1d,
+  });
+  const shortStrength = computeDirectionalTrendStrength({
+    direction: 'short',
+    w1Trend,
+    d1Trend,
+    h4Trend,
+    h1Trend,
+    candles1h,
+    candles4h,
+    rsi1h,
+    rsi4h,
+    rsi1d,
+  });
+
+  const longTpPlan = selectChartDrivenTakeProfit({
+    direction: 'long',
+    currentPrice,
+    regime: longStrength.regime,
+    trendScore: longStrength.score,
+    candles4h,
+    candles1h,
+    local1hTarget: local1hResistance,
+    keyGlobalTarget: key4hResistance,
+    customLevelTarget: hasCustomRes ? Number(customLevels!.resistance) : undefined,
+    structure1hLevels: structure1h.all_levels || [],
+    swing1hExtremes: structure1h.swing_highs || [],
+    structural4hLevels,
+    swing4hExtremes: structure4h.swing_highs || [],
+    local1d,
+    refinedGlobal,
+  });
+  const recTpLong = longTpPlan.tp;
 
   const safeSupport = Math.min(key4hSupport, local1hSupport);
   let recSlLong = safeSupport * 0.996;
@@ -1450,20 +1858,33 @@ export function analyzeMultiTimeframe(
   if (slDistPctLong < 0.8) recSlLong = currentPrice * 0.985;
   else if (slDistPctLong > 4.5) recSlLong = currentPrice * 0.96;
 
-  // Short TP: aim for nearest confirmed S/R or consolidation zone edge within -0.8%..-3.5%, fallback -1.2%
-  const minTpDistShort = currentPrice * 0.992;
-  const maxTpDistShort = currentPrice * 0.965;
-  const defaultScalpTpShort = currentPrice * 0.988;
-  const shortTargetCandidates = [
-    local1hSupport * 1.002,
-    key4hSupport * 1.002,
-    ...local1d.map((l) => (l.zone_high && l.zone_high < currentPrice ? l.zone_high * 1.001 : l.price * 1.002)),
-    ...structural4hLevels.map((l) => (l.zone_high && l.zone_high < currentPrice ? l.zone_high * 1.001 : l.price * 1.002)),
-    ...refinedGlobal.map((l) => (l.zone_high && l.zone_high < currentPrice ? l.zone_high * 1.001 : l.price * 1.002)),
-  ]
-    .filter((p) => Number.isFinite(p) && p <= minTpDistShort && p >= maxTpDistShort)
-    .sort((a, b) => b - a);
-  const recTpShort = shortTargetCandidates.length > 0 ? shortTargetCandidates[0] : defaultScalpTpShort;
+  const shortTpPlan = selectChartDrivenTakeProfit({
+    direction: 'short',
+    currentPrice,
+    regime: shortStrength.regime,
+    trendScore: shortStrength.score,
+    candles4h,
+    candles1h,
+    local1hTarget: local1hSupport,
+    keyGlobalTarget: key4hSupport,
+    customLevelTarget: hasCustomSup ? Number(customLevels!.support) : undefined,
+    structure1hLevels: structure1h.all_levels || [],
+    swing1hExtremes: structure1h.swing_lows || [],
+    structural4hLevels,
+    swing4hExtremes: structure4h.swing_lows || [],
+    local1d,
+    refinedGlobal,
+  });
+  const recTpShort = shortTpPlan.tp;
+
+  const dominantTrendStrength =
+    marketTrend === 'BEARISH'
+      ? shortStrength
+      : marketTrend === 'BULLISH'
+      ? longStrength
+      : longStrength.score >= shortStrength.score
+      ? longStrength
+      : shortStrength;
 
   const safeResistance = Math.max(key4hResistance, local1hResistance);
   let recSlShort = safeResistance * 1.004;
@@ -1549,6 +1970,14 @@ export function analyzeMultiTimeframe(
     institutional_levels: mergedInstitutional.slice(0, 10),
     local_1d_levels: local1d.slice(0, 6),
     structural_4h_levels: structural4hLevels.slice(0, 4),
+    trend_strength_score: dominantTrendStrength.score,
+    trend_regime: dominantTrendStrength.regime,
+    tp_horizon_long: longTpPlan.horizon,
+    tp_horizon_short: shortTpPlan.horizon,
+    tp_reason_long: longTpPlan.reason,
+    tp_reason_short: shortTpPlan.reason,
+    chart_targets_long: longTpPlan.targets,
+    chart_targets_short: shortTpPlan.targets,
   };
 }
 
@@ -1983,15 +2412,21 @@ export function evaluateGlobalHedgeStrategy(
   const shouldEnter =
     channelWidthPct >= 3.2 && inEquilibriumZone && safeRsiZone && noExtremeImpulse;
 
-  // Среднесрочные / долгосрочные цели TP для каждой ноги внутри глобального канала 4H / 1D (от 1.8% до 4.5% движения цены)
-  const rawLongTarget = globalRes * 0.995;
-  const rawShortTarget = globalSup * 1.005;
-  const longTpPrice = Number(
-    Math.max(currentPrice * 1.018, Math.min(currentPrice * 1.045, rawLongTarget)).toPrecision(7)
-  );
-  const shortTpPrice = Number(
-    Math.min(currentPrice * 0.982, Math.max(currentPrice * 0.955, rawShortTarget)).toPrecision(7)
-  );
+  // Цели TP для хеджа по реальным уровням канала 4H/1D (без жёсткого потолка 4.5%, с защитой от микро-цели ниже 0.75%)
+  const minSafeLongHedgeTp = currentPrice * 1.0075;
+  const minSafeShortHedgeTp = currentPrice * 0.9925;
+  const htfLongTarget = mtf.chart_targets_long?.find(
+    (c) => (c.horizon === '4H' || c.horizon === '1D' || c.horizon === '1W') && c.price >= minSafeLongHedgeTp
+  )?.price;
+  const htfShortTarget = mtf.chart_targets_short?.find(
+    (c) => (c.horizon === '4H' || c.horizon === '1D' || c.horizon === '1W') && c.price <= minSafeShortHedgeTp
+  )?.price;
+  const rawLongTarget = globalRes > currentPrice ? globalRes * 0.996 : mtf.recommended_tp_long;
+  const rawShortTarget = globalSup > 0 && globalSup < currentPrice ? globalSup * 1.004 : mtf.recommended_tp_short;
+  const chosenLongHedgeTp = htfLongTarget && htfLongTarget < rawLongTarget ? htfLongTarget : rawLongTarget;
+  const chosenShortHedgeTp = htfShortTarget && htfShortTarget > rawShortTarget ? htfShortTarget : rawShortTarget;
+  const longTpPrice = Number(Math.max(minSafeLongHedgeTp, chosenLongHedgeTp).toPrecision(7));
+  const shortTpPrice = Number(Math.min(minSafeShortHedgeTp, chosenShortHedgeTp).toPrecision(7));
 
   const longDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, false, 3.0, 95.0, candles1w);
   const shortDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, true, 3.0, 95.0, candles1w);

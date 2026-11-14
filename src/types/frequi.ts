@@ -165,6 +165,8 @@ export interface FreqtradeTrade {
   take_profit_abs?: number;
   take_profit_pct?: number;
   tp_manual_override?: boolean;
+  tp_horizon?: string;
+  tp_reason?: string;
   stop_loss_abs: number;
   stop_loss_pct: number;
   sl_manual_override?: boolean;
