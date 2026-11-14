@@ -67,6 +67,7 @@ export interface LiveCandleFrame {
   close: number;
   volume: number;
   confirmed: boolean;
+  exchange?: 'bybit' | 'binance';
 }
 
 const uiClients = new Set<ConnectedUiClient>();

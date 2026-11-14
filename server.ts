@@ -4,6 +4,7 @@ import http from 'http';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import {
   DEFAULT_SCALPBOT_CONFIG,
@@ -426,18 +427,35 @@ function evaluateFastWsTpExit(wsTick: LiveWsTicker): void {
 onWsTickerUpdate((wsTick) => {
   const tickExchange: 'bybit' | 'binance' = wsTick.source === 'binance_ws' ? 'binance' : 'bybit';
   exchangeTickerCache.set(`${tickExchange}:${wsTick.pair}`, wsTick);
-  tickerCache.set(wsTick.pair, {
-    price: wsTick.markPrice > 0 ? wsTick.markPrice : wsTick.price,
-    change24h: wsTick.change24h,
-    volume24h: wsTick.volume24h,
-    high24h: wsTick.high24h,
-    low24h: wsTick.low24h,
-    updatedAt: wsTick.updatedAt,
-  });
 
-  // Обновляем закрытие последней свечи в кэше для этой пары в реальном времени
+  const preferredEx =
+    exchangeAccountsStore.find((a) => a.enabled)?.exchange === 'binance' ? 'binance' : 'bybit';
+  const prevCachedTick = tickerCache.get(wsTick.pair);
+  if (
+    tickExchange === preferredEx ||
+    !prevCachedTick ||
+    Date.now() - prevCachedTick.updatedAt > 10_000
+  ) {
+    tickerCache.set(wsTick.pair, {
+      price: wsTick.markPrice > 0 ? wsTick.markPrice : wsTick.price,
+      change24h: wsTick.change24h,
+      volume24h: wsTick.volume24h,
+      high24h: wsTick.high24h,
+      low24h: wsTick.low24h,
+      updatedAt: wsTick.updatedAt,
+    });
+  }
+
+  // Обновляем закрытие последней свечи в кэше ТОЛЬКО от той же биржи, что и источник свечей (без прыжков цен между Bybit и Binance)
   for (const [key, entry] of candleCache.entries()) {
     if (key.startsWith(`${wsTick.pair}_`) && key.endsWith('_latest') && entry.candles.length > 0) {
+      const srcLower = (entry.source || '').toLowerCase();
+      const entryEx = srcLower.includes('binance')
+        ? 'binance'
+        : srcLower.includes('bybit')
+        ? 'bybit'
+        : preferredEx;
+      if (entryEx !== tickExchange) continue;
       const last = entry.candles[entry.candles.length - 1];
       last.close = wsTick.price;
       if (wsTick.price > last.high) last.high = wsTick.price;
@@ -480,18 +498,30 @@ onWsTickerUpdate((wsTick) => {
 });
 
 onWsKlineUpdate((wsKline) => {
+  const klineExchange: 'bybit' | 'binance' = wsKline.source === 'binance_ws' ? 'binance' : 'bybit';
+  const preferredEx =
+    exchangeAccountsStore.find((a) => a.enabled)?.exchange === 'binance' ? 'binance' : 'bybit';
   const barTsMs = wsKline.time * 1000;
+
   for (const [key, entry] of candleCache.entries()) {
     if (
       key.startsWith(`${wsKline.pair}_${wsKline.interval}_`) &&
       key.endsWith('_latest') &&
       entry.candles.length > 0
     ) {
+      const srcLower = (entry.source || '').toLowerCase();
+      const entryEx = srcLower.includes('binance')
+        ? 'binance'
+        : srcLower.includes('bybit')
+        ? 'bybit'
+        : preferredEx;
+      if (entryEx !== klineExchange) continue;
+
       const last = entry.candles[entry.candles.length - 1];
       if (last.timestamp === barTsMs) {
         last.open = wsKline.open;
-        last.high = Math.max(last.high, wsKline.high);
-        last.low = Math.min(last.low, wsKline.low);
+        last.high = wsKline.high;
+        last.low = wsKline.low;
         last.close = wsKline.close;
         last.volume = wsKline.volume;
       } else if (barTsMs > last.timestamp) {
@@ -514,17 +544,20 @@ onWsKlineUpdate((wsKline) => {
     }
   }
 
-  broadcastLiveCandleTick({
-    pair: wsKline.pair,
-    interval: wsKline.interval,
-    timestamp: barTsMs,
-    open: wsKline.open,
-    high: wsKline.high,
-    low: wsKline.low,
-    close: wsKline.close,
-    volume: wsKline.volume,
-    confirmed: wsKline.confirmed,
-  });
+  if (klineExchange === preferredEx) {
+    broadcastLiveCandleTick({
+      pair: wsKline.pair,
+      interval: wsKline.interval,
+      timestamp: barTsMs,
+      open: wsKline.open,
+      high: wsKline.high,
+      low: wsKline.low,
+      close: wsKline.close,
+      volume: wsKline.volume,
+      confirmed: wsKline.confirmed,
+      exchange: klineExchange,
+    });
+  }
 });
 
 async function fetchWithTimeout(url: string, timeoutMs = 6000): Promise<Response> {
@@ -951,66 +984,9 @@ async function fetchRealCandles(
     parse: (raw: any) => RawCandle[];
   }
 
-  // Публичные свечи запрашиваем в первую очередь через Binance Vision CDN (AWS CloudFront — 0 нагрузки на лимит IP fapi.binance.com!)
-  // и Bybit V5 Linear, чтобы никогда не расходовать лимит запросов боевого API fapi.binance.com (-1003).
+  // Публичные свечи запрашиваем в первую очередь с фьючерсных рынков (Bybit V5 Linear и Binance USD-M Futures),
+  // чтобы исторические свечи 1:1 совпадали с живым фьючерсным WebSocket-потоком без расхождения Spot vs Futures.
   const allProviders: KlineProvider[] = [
-    {
-      id: 'binance',
-      name: `Binance (${interval})`,
-      url: `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
-      parse: (raw: any) =>
-        Array.isArray(raw)
-          ? raw.map((k: any[]) => ({
-              timestamp: Number(k[0]),
-              open: parseFloat(k[1]),
-              high: parseFloat(k[2]),
-              low: parseFloat(k[3]),
-              close: parseFloat(k[4]),
-              volume: parseFloat(k[5]),
-            }))
-          : [],
-    },
-    ...(exchangeAccountsStore.some((a) => a.enabled && a.exchange === 'binance' && a.is_testnet) &&
-    !isBinanceHostRateLimited('https://testnet.binancefuture.com').limited
-      ? [
-          {
-            id: 'binance' as SupportedExchange,
-            name: `Binance Testnet (${interval})`,
-            url: `https://testnet.binancefuture.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
-            parse: (raw: any) =>
-              Array.isArray(raw)
-                ? raw.map((k: any[]) => ({
-                    timestamp: Number(k[0]),
-                    open: parseFloat(k[1]),
-                    high: parseFloat(k[2]),
-                    low: parseFloat(k[3]),
-                    close: parseFloat(k[4]),
-                    volume: parseFloat(k[5]),
-                  }))
-                : [],
-          },
-        ]
-      : []),
-    ...(!isBinanceHostRateLimited('https://fapi.binance.com').limited
-      ? [
-          {
-            id: 'binance' as SupportedExchange,
-            name: `Binance Futures (${interval})`,
-            url: `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
-            parse: (raw: any) =>
-              Array.isArray(raw)
-                ? raw.map((k: any[]) => ({
-                    timestamp: Number(k[0]),
-                    open: parseFloat(k[1]),
-                    high: parseFloat(k[2]),
-                    low: parseFloat(k[3]),
-                    close: parseFloat(k[4]),
-                    volume: parseFloat(k[5]),
-                  }))
-                : [],
-          },
-        ]
-      : []),
     ...(bybitIntervals[interval]
       ? [
           ...(exchangeAccountsStore.some((a) => a.enabled && a.exchange === 'bybit' && a.is_testnet)
@@ -1061,6 +1037,63 @@ async function fetchRealCandles(
           },
         ]
       : []),
+    ...(exchangeAccountsStore.some((a) => a.enabled && a.exchange === 'binance' && a.is_testnet) &&
+    !isBinanceHostRateLimited('https://testnet.binancefuture.com').limited
+      ? [
+          {
+            id: 'binance' as SupportedExchange,
+            name: `Binance Testnet (${interval})`,
+            url: `https://testnet.binancefuture.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
+            parse: (raw: any) =>
+              Array.isArray(raw)
+                ? raw.map((k: any[]) => ({
+                    timestamp: Number(k[0]),
+                    open: parseFloat(k[1]),
+                    high: parseFloat(k[2]),
+                    low: parseFloat(k[3]),
+                    close: parseFloat(k[4]),
+                    volume: parseFloat(k[5]),
+                  }))
+                : [],
+          },
+        ]
+      : []),
+    ...(!isBinanceHostRateLimited('https://fapi.binance.com').limited
+      ? [
+          {
+            id: 'binance' as SupportedExchange,
+            name: `Binance Futures (${interval})`,
+            url: `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
+            parse: (raw: any) =>
+              Array.isArray(raw)
+                ? raw.map((k: any[]) => ({
+                    timestamp: Number(k[0]),
+                    open: parseFloat(k[1]),
+                    high: parseFloat(k[2]),
+                    low: parseFloat(k[3]),
+                    close: parseFloat(k[4]),
+                    volume: parseFloat(k[5]),
+                  }))
+                : [],
+          },
+        ]
+      : []),
+    {
+      id: 'binance',
+      name: `Binance (${interval})`,
+      url: `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
+      parse: (raw: any) =>
+        Array.isArray(raw)
+          ? raw.map((k: any[]) => ({
+              timestamp: Number(k[0]),
+              open: parseFloat(k[1]),
+              high: parseFloat(k[2]),
+              low: parseFloat(k[3]),
+              close: parseFloat(k[4]),
+              volume: parseFloat(k[5]),
+            }))
+          : [],
+    },
     ...(okxBars[interval]
       ? [
           {
@@ -1622,7 +1655,7 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     );
     trade.profit_ratio = Number((trade.net_profit_percent / 100).toFixed(4));
     trade.profit_pct = trade.net_profit_percent;
-    trade.profit_abs = exactUnrealized;
+    trade.profit_abs = Number(netAfterFees.toFixed(3));
   } else {
     const grossProfit = (trade.is_short ? openRate - refRate : refRate - openRate) * totalAmount;
     const netProfit = grossProfit - trade.fee_total;
@@ -1905,6 +1938,48 @@ const botLogs: Array<{
 }> = [];
 const cooldownPairs = new Map<string, number>();
 let ownerManuallyStoppedBot = false;
+const stoppedUsers = new Set<string>();
+const pausedNewEntriesUsers = new Set<string>();
+
+function isUserBotStopped(userId = 'owner'): boolean {
+  const clean = String(userId || 'owner').trim() || 'owner';
+  if (clean === 'owner') return ownerManuallyStoppedBot || stoppedUsers.has('owner');
+  return stoppedUsers.has(clean);
+}
+
+function setUserBotStopped(userId = 'owner', stopped: boolean): void {
+  const clean = String(userId || 'owner').trim() || 'owner';
+  if (stopped) {
+    stoppedUsers.add(clean);
+  } else {
+    stoppedUsers.delete(clean);
+  }
+  if (clean === 'owner') {
+    ownerManuallyStoppedBot = stopped;
+  }
+}
+
+function isUserNewEntriesPaused(userId = 'owner'): boolean {
+  const clean = String(userId || 'owner').trim() || 'owner';
+  if (clean === 'owner') return Boolean(botConfig.pause_new_entries) || pausedNewEntriesUsers.has('owner');
+  return pausedNewEntriesUsers.has(clean);
+}
+
+function setUserNewEntriesPaused(userId = 'owner', paused: boolean): void {
+  const clean = String(userId || 'owner').trim() || 'owner';
+  if (paused) {
+    pausedNewEntriesUsers.add(clean);
+  } else {
+    pausedNewEntriesUsers.delete(clean);
+  }
+  if (clean === 'owner') {
+    botConfig.pause_new_entries = paused;
+  }
+}
+
+function generateSecureClientAccessCode(exchange: string): string {
+  return `${String(exchange || 'BYBIT').toUpperCase()}-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+}
 
 function appendLog(
   logger: string,
@@ -2141,18 +2216,21 @@ let initializedTrades = false;
 async function getOrComputeMtfBotLevels(
   pair: string,
   timeframe = '1h',
-  forceRefresh = false
+  forceRefresh = false,
+  userId = 'owner'
 ): Promise<BotChartLevel[]> {
   const cleanPair = pair.toUpperCase();
   const normTf = String(timeframe || '1h').trim().toLowerCase();
-  const storeKey = `${cleanPair}_${normTf}`;
+  const cleanUser = String(userId || 'owner').trim() || 'owner';
+  const storeKey = cleanUser === 'owner' ? `${cleanPair}_${normTf}` : `${cleanUser}::${cleanPair}_${normTf}`;
+  const pairStoreKey = cleanUser === 'owner' ? cleanPair : `${cleanUser}::${cleanPair}`;
 
   if (!forceRefresh && botLevelsStore.has(storeKey)) {
     return botLevelsStore.get(storeKey)!;
   }
 
-  // Load all persisted levels for this pair (including deleted flag so deleted auto-levels are never recreated)
-  const allForPair = sqliteDb.getAllBotLevelsForPairIncludeDeleted(cleanPair);
+  // Load all persisted levels for this pair & user (including deleted flag so deleted auto-levels are never recreated)
+  const allForPair = sqliteDb.getAllBotLevelsForPairIncludeDeleted(cleanPair, cleanUser);
 
   // All manual levels configured or dragged by the user on this pair apply across all timeframes and bot cycles
   const manualLevels = allForPair.filter((l) => l.manual_override && !l.deleted);
@@ -2240,7 +2318,7 @@ async function getOrComputeMtfBotLevels(
       const metaChanged =
         !savedRow || savedRow.label !== lvl.label || savedRow.source !== lvl.source;
       if (priceChanged || metaChanged) {
-        sqliteDb.upsertBotLevel({ ...lvl, deleted: false });
+        sqliteDb.upsertBotLevel({ ...lvl, deleted: false }, cleanUser);
       }
     };
 
@@ -2393,7 +2471,7 @@ async function getOrComputeMtfBotLevels(
 
     generated.sort((a, b) => b.price - a.price);
     botLevelsStore.set(storeKey, generated);
-    botLevelsStore.set(cleanPair, generated);
+    botLevelsStore.set(pairStoreKey, generated);
     return generated;
   } catch {
     return manualLevels;
@@ -2408,11 +2486,21 @@ async function initializeBotTrades() {
   const rawTrades = sqliteDb.loadAllTrades();
   exchangeAccountsStore = sqliteDb.loadExchangeAccounts();
 
-  // Deduplicate any duplicate test accounts by client_access_code or (name + exchange)
+  // Deduplicate any duplicate test accounts strictly within the same user_id, and upgrade legacy short client_access_code
   const uniqueAccounts: ExchangeAccountRecord[] = [];
   const seenAccKeys = new Set<string>();
   for (const acc of exchangeAccountsStore) {
-    const key = `${acc.client_access_code || ''}::${acc.name.toLowerCase()}::${acc.exchange}`;
+    const accUser = acc.user_id || 'owner';
+    if (
+      !acc.client_access_code ||
+      (acc.client_access_code.length < 12 &&
+        acc.client_access_code !== 'BYBIT-ENV1' &&
+        acc.client_access_code !== 'BINANCE-ENV1')
+    ) {
+      acc.client_access_code = generateSecureClientAccessCode(acc.exchange);
+      sqliteDb.upsertExchangeAccount(acc);
+    }
+    const key = `${accUser}::${acc.api_key_raw || acc.client_access_code || ''}::${acc.name.toLowerCase()}::${acc.exchange}`;
     if (seenAccKeys.has(key)) {
       sqliteDb.deleteExchangeAccount(acc.id);
     } else {
@@ -2790,7 +2878,8 @@ async function enrichImportedPositionMtfLevelsAsync(
     const refreshedLvls = await getOrComputeMtfBotLevels(
       pos.pair,
       botConfig.timeframe,
-      true
+      true,
+      acc.user_id || 'owner'
     ).catch(() => [] as BotChartLevel[]);
 
     const liveTrade = tradesStore.find((t) => t.trade_id === tradeId && t.is_open);
@@ -2954,12 +3043,51 @@ async function syncPositionsAndHistoryFromExchanges(
             Math.abs(existingOpen.open_rate - pos.entry_price) / Math.max(1e-8, pos.entry_price) > 0.0005 ||
             (pos.margin_usdt > 0 && Math.abs((existingOpen.stake_amount || 0) - pos.margin_usdt) > 0.05)
           ) {
+            const sizeIncreased = pos.size > existingOpen.amount * 1.02;
+            const entryShifted =
+              Math.abs(existingOpen.open_rate - pos.entry_price) / Math.max(1e-8, pos.entry_price) >
+              0.0003;
+            const addedQty = Math.max(0, Number((pos.size - existingOpen.amount).toFixed(4)));
+            const addedStake = Math.max(
+              0,
+              Number((pos.margin_usdt - (existingOpen.stake_amount || 0)).toFixed(2))
+            );
             existingOpen.open_rate = roundPrice(pos.entry_price);
             existingOpen.amount = Number(pos.size.toFixed(4));
             if (pos.margin_usdt > 0) {
               existingOpen.stake_amount = Number(pos.margin_usdt.toFixed(2));
             }
             existingOpen.leverage = pos.leverage || existingOpen.leverage;
+            if (sizeIncreased && entryShifted) {
+              const nextStep = (existingOpen.dca_count || 0) + 1;
+              existingOpen.dca_count = nextStep;
+              const nowTs = Date.now();
+              const nowDateStr = new Date(nowTs).toISOString().replace('T', ' ').slice(0, 19);
+              existingOpen.last_dca_date = nowDateStr;
+              if (!Array.isArray(existingOpen.orders)) existingOpen.orders = [];
+              existingOpen.orders.push({
+                id: `ord-ex-dca-${existingOpen.trade_id}-${nextStep}-${nowTs}`,
+                step: nextStep,
+                label: `DCA #${nextStep} (Синхр. с биржи ${acc.exchange.toUpperCase()})`,
+                side: existingOpen.is_short ? 'short' : 'long',
+                price: existingOpen.open_rate,
+                amount: addedQty > 0 ? addedQty : existingOpen.amount,
+                stake_amount: addedStake > 0 ? addedStake : existingOpen.stake_amount,
+                timestamp: nowTs,
+                date: nowDateStr,
+              });
+              if (!existingOpen.tp_manual_override) {
+                const newTp =
+                  pos.take_profit && pos.take_profit > 0
+                    ? roundPrice(pos.take_profit)
+                    : roundPrice(
+                        existingOpen.is_short
+                          ? existingOpen.open_rate * (1 - 0.009)
+                          : existingOpen.open_rate * (1 + 0.009)
+                      );
+                existingOpen.take_profit_abs = newTp;
+              }
+            }
           }
 
           // При отсутствии плановых DCA ИЛИ при подключении / восстановлении связи доанализируем асинхронно, не тормозя синхронизацию других позиций
@@ -3161,10 +3289,13 @@ async function syncPositionsAndHistoryFromExchanges(
         acc.equity_usdt = Number((walletRef + acc.unrealized_pnl).toFixed(4));
         if (acc.used_margin_usdt === 0) {
           acc.available_balance_usdt = Number(walletRef.toFixed(2));
-        } else if (acc.available_balance_usdt === undefined) {
-          acc.available_balance_usdt = Number(Math.max(0, acc.equity_usdt - acc.used_margin_usdt).toFixed(2));
+        } else {
+          acc.available_balance_usdt = Number(
+            Math.max(0, walletRef - acc.used_margin_usdt).toFixed(2)
+          );
         }
       }
+      sqliteDb.upsertExchangeAccount(acc);
 
       // 2. Удаляем старые симулированные (sim-*) или чужие межбиржевые фантомы, которых нет ни на одной подключённой бирже
       const enabledExchangesSet = new Set<string>(
@@ -3193,14 +3324,14 @@ async function syncPositionsAndHistoryFromExchanges(
 
       reconcileExchangeAccountOpenDuplicates(targetAccountId);
 
-      // 3. ТОЛЬКО для уже отслеженных ботом открытых сделок на ЭТОМ аккаунте/бирже, которые исчезли из списка открытых на бирже:
+      // 3. Для открытых сделок на ЭТОМ аккаунте/бирже, которые исчезли из списка открытых на бирже (закрылись по TP или вручную):
       const localOpenForAcc = tradesStore.filter(
         (t) =>
           t.is_open &&
           t.exchange === acc.exchange &&
           tradeMatchesAccount(t, acc, targetAccountId) &&
           !activePositionKeys.has(getPosLockKey(targetAccountId, t.pair, t.is_short)) &&
-          Date.now() - (t.open_timestamp || 0) > 20_000
+          Date.now() - (t.open_timestamp || 0) > 15_000
       );
 
       const disappearedTrades = localOpenForAcc.filter(
@@ -3217,36 +3348,62 @@ async function syncPositionsAndHistoryFromExchanges(
           closed: [],
         }));
         const minValidTs = acc.connected_at || 0;
-        const phantomIdsToDelete = new Set<number>();
         const consumedClosedKeys = new Set<string>();
 
         for (const localTrade of disappearedTrades) {
-          if (!closedPnlRes.success) {
-            continue;
-          }
-          const matchedClosed = closedPnlRes.closed.find((c) => {
-            const cKey = `${c.order_id}:${c.updated_time}:${c.pair}:${c.is_short ? 'S' : 'L'}`;
-            return (
-              !consumedClosedKeys.has(cKey) &&
-              c.pair === localTrade.pair &&
-              (c.is_short === localTrade.is_short || c.order_id.startsWith('inc-')) &&
-              c.updated_time >= Math.max(minValidTs, (localTrade.open_timestamp || 0) - 120_000)
-            );
-          });
+          const matchedClosed = closedPnlRes.success
+            ? closedPnlRes.closed.find((c) => {
+                const cKey = `${c.order_id}:${c.updated_time}:${c.pair}:${c.is_short ? 'S' : 'L'}`;
+                return (
+                  !consumedClosedKeys.has(cKey) &&
+                  c.pair === localTrade.pair &&
+                  (c.is_short === localTrade.is_short || c.order_id.startsWith('inc-')) &&
+                  c.updated_time >= Math.max(minValidTs, (localTrade.open_timestamp || 0) - 180_000)
+                );
+              })
+            : undefined;
 
           if (!matchedClosed) {
-            phantomIdsToDelete.add(localTrade.trade_id);
-            sqliteDb.deleteTrade(localTrade.trade_id);
+            // Если позиция реально исчезла из открытых на бирже, но эндпоинт closed-pnl ещё не проиндексировал запись (или позиция закрыта без записи в последнем батче),
+            // НИКОГДА не удаляем сделку! Переводим её в закрытые по лучшей известной рыночной цене/TP.
+            const fallbackClosePrice = roundPrice(
+              localTrade.current_rate > 0 ? localTrade.current_rate : localTrade.open_rate
+            );
+            const closeTs = Date.now();
+            const closeDateStr = new Date(closeTs).toISOString().replace('T', ' ').slice(0, 19);
+            localTrade.is_open = false;
+            localTrade.close_rate = fallbackClosePrice;
+            localTrade.current_rate = fallbackClosePrice;
+            localTrade.close_timestamp = closeTs;
+            localTrade.close_date = closeDateStr;
+            localTrade.exit_reason = 'exchange_tp_closed_sync';
+            localTrade.trade_state = 'CLOSED';
+            localTrade.planned_dca_levels = [];
+            recalculateTradeMetrics(localTrade, false);
+            sqliteDb.upsertTrade(localTrade);
+            broadcastTradeLifecycleEvent('trade:closed', localTrade);
+            anyLifecycleChange = true;
             appendLog(
               `freqtrade.exchange.${acc.exchange}`,
-              'WARNING',
-              `🧹 Удалена фантомная локальная сделка #${localTrade.trade_id} [${localTrade.pair}], отсутствующая и среди открытых, и среди закрытых на бирже ${acc.exchange.toUpperCase()}.`,
+              'INFO',
+              `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] закрыта на бирже ${acc.exchange.toUpperCase()} @ ${fallbackClosePrice}$ | PnL: ${localTrade.profit_abs}$`,
               { userId: acc.user_id || 'owner' }
             );
             continue;
           }
           const matchedKey = `${matchedClosed.order_id}:${matchedClosed.updated_time}:${matchedClosed.pair}:${matchedClosed.is_short ? 'S' : 'L'}`;
           consumedClosedKeys.add(matchedKey);
+
+          if (matchedClosed.entry_price > 0 && !matchedClosed.order_id.startsWith('inc-')) {
+            localTrade.open_rate = roundPrice(matchedClosed.entry_price);
+          }
+          if (matchedClosed.qty > 0 && !matchedClosed.order_id.startsWith('inc-')) {
+            localTrade.amount = Number(matchedClosed.qty.toFixed(4));
+            const lev = Math.max(1, localTrade.leverage || 25);
+            localTrade.stake_amount = Number(
+              ((localTrade.open_rate * localTrade.amount) / lev).toFixed(2)
+            );
+          }
 
           const closePrice = roundPrice(
             matchedClosed.exit_price > 0 ? matchedClosed.exit_price : localTrade.current_rate
@@ -3278,14 +3435,9 @@ async function syncPositionsAndHistoryFromExchanges(
           appendLog(
             `freqtrade.exchange.${acc.exchange}`,
             'INFO',
-            `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] закрыта на бирже ${acc.exchange.toUpperCase()} @ ${closePrice}$ | Реальный PnL биржи: ${localTrade.profit_abs}$ (Комиссия: ${localTrade.fee_total}$)`,
+            `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] закрыта на бирже ${acc.exchange.toUpperCase()} (Вход: ${localTrade.open_rate}$ ➔ Выход: ${closePrice}$) | Реальный PnL биржи: ${localTrade.profit_abs}$ (Комиссия: ${localTrade.fee_total}$)`,
             { userId: acc.user_id || 'owner' }
           );
-        }
-
-        if (phantomIdsToDelete.size > 0) {
-          tradesStore = tradesStore.filter((t) => !phantomIdsToDelete.has(t.trade_id));
-          anyLifecycleChange = true;
         }
       }
 
@@ -3399,7 +3551,7 @@ async function runScalpBotCycle(waitForActive = false) {
       await new Promise((r) => setTimeout(r, 100));
     }
   }
-  if (isBotCycleRunning || botConfig.state === 'stopped') return;
+  if (isBotCycleRunning) return;
   if (!hasConnectedExchangeAccount()) {
     botConfig.state = 'stopped';
     return;
@@ -3417,7 +3569,9 @@ async function runScalpBotCycle(waitForActive = false) {
     }
     await syncRealExchangeBalancesIfNeeded(false);
 
-    const activeAccounts = exchangeAccountsStore.filter((a) => a.enabled);
+    const activeAccounts = exchangeAccountsStore.filter(
+      (a) => a.enabled && !isUserBotStopped(a.user_id || 'owner')
+    );
     if (activeAccounts.length === 0) return;
 
     // Fetch live exchange positions for ALL real enabled accounts (keyed strictly per account ID)
@@ -3441,13 +3595,18 @@ async function runScalpBotCycle(waitForActive = false) {
     const openTrades = tradesStore.filter((t) => {
       if (!t.is_open) return false;
       const matchedAcc = resolveExchangeAccountRecord(t.account_id || 'master');
-      return Boolean(matchedAcc && matchedAcc.enabled && tradeMatchesAccount(t, matchedAcc, getTargetAccountIdForRecord(matchedAcc)));
+      return Boolean(
+        matchedAcc &&
+          matchedAcc.enabled &&
+          !isUserBotStopped(matchedAcc.user_id || 'owner') &&
+          tradeMatchesAccount(t, matchedAcc, getTargetAccountIdForRecord(matchedAcc))
+      );
     });
 
     // 1. Evaluate all currently open trades across all enabled accounts (TP, SL, 4H Hedge Leg, Smart Level DCA)
     for (const trade of openTrades) {
       const tradeAcc = resolveExchangeAccountRecord(trade.account_id || 'master');
-      if (!tradeAcc || !tradeAcc.enabled) continue;
+      if (!tradeAcc || !tradeAcc.enabled || isUserBotStopped(tradeAcc.user_id || 'owner')) continue;
       const tradeAccScopeId = getTargetAccountIdForRecord(tradeAcc);
       const tradeUserId = resolveTradeUserId(trade);
       const { candles: candles1h } = await fetchRealCandles(trade.pair, trade.timeframe || botConfig.timeframe, 60);
@@ -3768,6 +3927,8 @@ async function runScalpBotCycle(waitForActive = false) {
             const dcaEvalCandles = candles1hForDca.length >= 3 ? candles1hForDca : candles1h;
 
             const pairLvlsForDca =
+              botLevelsStore.get(`${tradeUserId}::${trade.pair}`) ||
+              botLevelsStore.get(`${tradeUserId}::${trade.pair}_${botConfig.timeframe}`) ||
               botLevelsStore.get(trade.pair) ||
               botLevelsStore.get(`${trade.pair}_${botConfig.timeframe}`) ||
               [];
@@ -3780,6 +3941,9 @@ async function runScalpBotCycle(waitForActive = false) {
               ? { zoneLow: nearestDcaZoneLvl.zone_low, zoneHigh: nearestDcaZoneLvl.zone_high }
               : undefined;
 
+            const isManualDcaTarget = Boolean(
+              trade.dca_manual_override || trade.planned_dca_levels?.[0]?.manual_override
+            );
             const noKnifeOrPump = !trade.is_short
               ? !isKnifeDrop(dcaEvalCandles)
               : !isPumpExhaustion(dcaEvalCandles);
@@ -3787,13 +3951,21 @@ async function runScalpBotCycle(waitForActive = false) {
               dcaEvalCandles,
               nextDcaTarget,
               trade.is_short,
-              0.9,
+              1.5,
               zoneBounds
             );
             const rsiCheck = checkRsiCondition(dcaEvalCandles, trade.is_short);
+            const deepLevelTouch = !trade.is_short
+              ? currentPrice <= nextDcaTarget * 0.997
+              : currentPrice >= nextDcaTarget * 1.003;
 
-            // Усредняем только когда цена достигла DCA, нет вертикального ножа/пампа И есть отбой от уровня/зоны или разворот RSI
-            if (noKnifeOrPump && (rejectionCheck.confirmed || rsiCheck.confirmed)) {
+            // Усредняем когда цена достигла уровня DCA:
+            // - мгновенно, если уровень DCA выставлен/перетащен пользователем вручную;
+            // - либо по структурному уровню при отсутствии вертикального ножа/пампа (отбой свечи, RSI или прокол уровня >= 0.3%)
+            if (
+              isManualDcaTarget ||
+              (noKnifeOrPump && (rejectionCheck.confirmed || rsiCheck.confirmed || deepLevelTouch))
+            ) {
               // Find next strongest 1W->1D / 4H DCA level first
               const [{ candles: c1w }, { candles: c4h }, { candles: c1d }] = await Promise.all([
                 fetchRealCandles(trade.pair, '1w', 300),
@@ -4076,8 +4248,11 @@ async function runScalpBotCycle(waitForActive = false) {
       sqliteDb.upsertTrade(trade);
     }
 
-    // 2. Scan for new entries ONLY if bot state === 'running', owner has NOT paused new entries, AND at least 1 API account is enabled
-    if (botConfig.state !== 'running' || botConfig.pause_new_entries || activeAccounts.length === 0) {
+    // 2. Scan for new entries for any enabled account whose user has NOT stopped or paused new entries
+    const entryEnabledAccounts = activeAccounts.filter(
+      (acc) => !isUserNewEntriesPaused(acc.user_id || 'owner')
+    );
+    if (entryEnabledAccounts.length === 0) {
       return;
     }
 
@@ -4094,7 +4269,7 @@ async function runScalpBotCycle(waitForActive = false) {
       if (blacklist.includes(pair)) continue;
 
       // Determine which enabled accounts are eligible to evaluate this pair
-      const eligiblePreTradability = activeAccounts.filter((acc) => {
+      const eligiblePreTradability = entryEnabledAccounts.filter((acc) => {
         if ((openedPerAccount.get(acc.id) || 0) >= 3) return false;
         const lastCd = cooldownPairs.get(`${acc.id}:${pair}`) || 0;
         if (Date.now() - lastCd < 3 * 60_000) return false;
@@ -4109,7 +4284,7 @@ async function runScalpBotCycle(waitForActive = false) {
 
       if (eligiblePreTradability.length === 0) {
         // Stop early if every active account has hit max_open_trades or per-cycle cap
-        const anyAccountCanStillOpenMore = activeAccounts.some((acc) => {
+        const anyAccountCanStillOpenMore = entryEnabledAccounts.some((acc) => {
           if ((openedPerAccount.get(acc.id) || 0) >= 3) return false;
           const accScopeId = getTargetAccountIdForRecord(acc);
           const accOpenCount = tradesStore.filter(
@@ -4223,12 +4398,17 @@ async function runScalpBotCycle(waitForActive = false) {
 
         const canOpenHedgeStrategy =
           hedgeEval.should_open_hedge && accOpen.length + 2 <= botConfig.max_open_trades;
+        const accUserId = acc.user_id || 'owner';
+        const accPairLevels =
+          accUserId === 'owner'
+            ? pairLevels
+            : await getOrComputeMtfBotLevels(pair, botConfig.timeframe, false, accUserId);
         const accOpts = {
           accountId: acc.id,
           accountName: acc.name,
           strategyName: 'ScalpingStrategy',
           candles1w: c1w,
-          preloadedPairLevels: pairLevels,
+          preloadedPairLevels: accPairLevels,
         };
 
         try {
@@ -4406,7 +4586,7 @@ async function openHedgeCampaign(
   const targetCreds = getAccountCredentialsFromStore(targetAcc);
   const [targetHedgeStatus, preloadedPairLevels] = await Promise.all([
     targetCreds ? ensureExchangeHedgeMode(targetCreds, cleanPair) : Promise.resolve({ enabled: true, message: 'No creds' }),
-    getOrComputeMtfBotLevels(cleanPair, hedgeTimeframe),
+    getOrComputeMtfBotLevels(cleanPair, hedgeTimeframe, false, targetUserId),
   ]);
 
   const canOpenBothSides =
@@ -4606,7 +4786,7 @@ async function createScalpBotPosition(
     // Загружаем актуальные уровни бота (или используем уже предзагруженные уровни при параллельном открытии 2-стороннего хеджа)
     const activePairLevels =
       customOpts?.preloadedPairLevels ??
-      (await getOrComputeMtfBotLevels(cleanPair, botConfig.timeframe));
+      (await getOrComputeMtfBotLevels(cleanPair, botConfig.timeframe, false, targetUserId));
     const manualSupLvl = activePairLevels.find(
       (l) => l.role === 'support' && l.manual_override && !l.id.startsWith('lvl-') && l.price < entryRate
     );
@@ -4943,16 +5123,19 @@ async function startServer() {
     accountId?: string;
   }): ResolvedAuth {
     const code = String(params.clientCode || '').trim().toUpperCase();
-    if (code) {
+    if (code && code.length >= 6) {
       const byCode = exchangeAccountsStore.find(
-        (a) => a.client_access_code.toUpperCase() === code
+        (a) =>
+          a.client_access_code.toUpperCase() === code &&
+          (a.user_id || 'owner') !== 'owner' &&
+          !a.is_owner
       );
       if (byCode) {
         const uId = byCode.user_id || `account:${byCode.id}`;
         return {
           authenticated: true,
           userId: uId,
-          role: uId === 'owner' ? 'owner' : 'client',
+          role: 'client',
           login: byCode.name,
           accountId: byCode.id,
         };
@@ -4972,6 +5155,16 @@ async function startServer() {
             inviteId: verified.inviteId,
           };
         }
+        if (verified.userId && verified.userId !== 'owner') {
+          return {
+            authenticated: true,
+            userId: verified.userId,
+            role: 'client',
+            login: verified.login,
+            inviteId: verified.inviteId,
+            accountId: verified.accountId,
+          };
+        }
         if (verified.inviteId) {
           return {
             authenticated: true,
@@ -4983,13 +5176,15 @@ async function startServer() {
         }
         if (verified.accountId) {
           const acc = exchangeAccountsStore.find((a) => a.id === verified.accountId);
-          return {
-            authenticated: true,
-            userId: acc?.user_id || `account:${verified.accountId}`,
-            role: 'client',
-            login: verified.login || acc?.name,
-            accountId: verified.accountId,
-          };
+          if (acc && (acc.user_id || 'owner') !== 'owner' && !acc.is_owner) {
+            return {
+              authenticated: true,
+              userId: acc.user_id || `account:${verified.accountId}`,
+              role: 'client',
+              login: verified.login || acc.name,
+              accountId: verified.accountId,
+            };
+          }
         }
       }
     }
@@ -5023,6 +5218,26 @@ async function startServer() {
       userId: '',
       role: 'client',
     };
+  }
+
+  function resolveInviteSessionUserId(
+    consumed: { id: string; role: 'owner' | 'client'; label: string },
+    existingBearerToken?: string
+  ): string {
+    if (consumed.role === 'owner') return 'owner';
+    if (existingBearerToken) {
+      const verified = sqliteDb.verifyAuthToken(existingBearerToken);
+      if (
+        verified.valid &&
+        verified.role === 'client' &&
+        verified.inviteId === consumed.id &&
+        verified.userId &&
+        verified.userId.startsWith(`invite:${consumed.id}`)
+      ) {
+        return verified.userId;
+      }
+    }
+    return `invite:${consumed.id}:${crypto.randomBytes(6).toString('hex')}`;
   }
 
   function resolveRequestAuth(req: express.Request): ResolvedAuth {
@@ -5168,19 +5383,26 @@ async function startServer() {
       const aLocalUsed = aOpen.reduce((s, t) => s + t.stake_amount, 0);
       const aLocalPnl = aOpen.reduce((s, t) => s + t.profit_abs, 0);
       const aUsed =
-        aIsReal && typeof a.used_margin_usdt === 'number' && Number.isFinite(a.used_margin_usdt)
-          ? a.used_margin_usdt
+        aIsReal && typeof a.used_margin_usdt === 'number' && a.used_margin_usdt > 0
+          ? aOpen.length > 0
+            ? Math.max(a.used_margin_usdt, aLocalUsed)
+            : a.used_margin_usdt
           : aLocalUsed;
+      const computedFree = Math.max(0, wBal - aUsed);
       const aFree =
         aIsReal &&
         typeof a.available_balance_usdt === 'number' &&
-        Number.isFinite(a.available_balance_usdt)
+        Number.isFinite(a.available_balance_usdt) &&
+        a.available_balance_usdt >= 0 &&
+        (aUsed === 0 || a.available_balance_usdt <= wBal - aUsed + 0.5)
           ? a.available_balance_usdt
-          : Math.max(0, wBal - aUsed);
+          : computedFree;
       const aPnl =
-        aIsReal && typeof a.unrealized_pnl === 'number' && aOpen.length > 0
+        aOpen.length > 0
+          ? aLocalPnl
+          : aIsReal && typeof a.unrealized_pnl === 'number'
           ? a.unrealized_pnl
-          : aLocalPnl;
+          : 0;
       sumWallet += wBal;
       sumOpenPnl += aPnl;
       sumUsedStake += aUsed;
@@ -5218,12 +5440,13 @@ async function startServer() {
     if (inviteParam) {
       const consumed = sqliteDb.consumeInviteToken(inviteParam);
       if (consumed) {
+        const uId = resolveInviteSessionUserId(consumed, token);
         const sessionToken = sqliteDb.createAuthToken({
           role: consumed.role,
           login: consumed.label,
           inviteId: consumed.id,
+          userId: uId,
         });
-        const uId = consumed.role === 'owner' ? 'owner' : `invite:${consumed.id}`;
         appendLog(
           'freqtrade.auth',
           'INFO',
@@ -5249,12 +5472,13 @@ async function startServer() {
     if (clientParam) {
       const acc = sqliteDb.verifyClientAccessCode(clientParam);
       if (acc) {
+        const uId = acc.user_id || `account:${acc.id}`;
         const sessionToken = sqliteDb.createAuthToken({
           role: 'client',
           login: acc.name,
           accountId: acc.id,
+          userId: uId,
         });
-        const uId = acc.user_id || `account:${acc.id}`;
         appendLog(
           'freqtrade.auth',
           'INFO',
@@ -5295,14 +5519,24 @@ async function startServer() {
 
     if (verified.valid) {
       let clientCode: string | undefined;
-      let userId = verified.role === 'owner' ? 'owner' : 'client:unknown';
+      let accountId = verified.accountId;
+      let userId = verified.role === 'owner' ? 'owner' : verified.userId || 'client:unknown';
       if (verified.role === 'client') {
-        if (verified.inviteId) {
+        if (!verified.userId && verified.inviteId) {
           userId = `invite:${verified.inviteId}`;
         } else if (verified.accountId) {
           const acc = exchangeAccountsStore.find((a) => a.id === verified.accountId);
-          if (acc) clientCode = acc.client_access_code;
-          userId = acc?.user_id || `account:${verified.accountId}`;
+          if (acc) {
+            clientCode = acc.client_access_code;
+            if (!verified.userId) userId = acc.user_id || `account:${verified.accountId}`;
+          }
+        }
+        if (!clientCode) {
+          const userAcc = exchangeAccountsStore.find((a) => (a.user_id || 'owner') === userId);
+          if (userAcc) {
+            clientCode = userAcc.client_access_code;
+            if (!accountId) accountId = userAcc.id;
+          }
         }
       }
       res.json({
@@ -5314,7 +5548,7 @@ async function startServer() {
         role: verified.role || 'owner',
         user_id: userId,
         login: verified.login || cfg.owner_login,
-        account_id: verified.accountId,
+        account_id: accountId,
         client_code: clientCode,
       });
       return;
@@ -5331,6 +5565,8 @@ async function startServer() {
 
   app.post('/api/v1/auth/login', (req, res) => {
     const { mode = 'owner', login, password, access_code, invite_token } = req.body || {};
+    const authHeader = String(req.headers.authorization || '');
+    const existingBearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
 
     if (mode === 'invite') {
       const consumed = sqliteDb.consumeInviteToken(String(invite_token || ''));
@@ -5338,12 +5574,13 @@ async function startServer() {
         res.status(401).json({ error: 'Ссылка доступа недействительна или отозвана владельцем' });
         return;
       }
+      const uId = resolveInviteSessionUserId(consumed, existingBearer);
       const token = sqliteDb.createAuthToken({
         role: consumed.role,
         login: consumed.label,
         inviteId: consumed.id,
+        userId: uId,
       });
-      const uId = consumed.role === 'owner' ? 'owner' : `invite:${consumed.id}`;
       appendLog(
         'freqtrade.auth',
         'INFO',
@@ -5366,12 +5603,13 @@ async function startServer() {
         res.status(401).json({ error: 'Неверный код доступа' });
         return;
       }
+      const uId = acc.user_id || `account:${acc.id}`;
       const token = sqliteDb.createAuthToken({
         role: 'client',
         login: String(acc.name || 'Пользователь'),
         accountId: String(acc.id),
+        userId: uId,
       });
-      const uId = acc.user_id || `account:${acc.id}`;
       appendLog(
         'freqtrade.auth',
         'INFO',
@@ -5484,6 +5722,10 @@ async function startServer() {
     const activeUserAccs = userAccs.filter((a) => a.enabled);
     const userConnected = activeUserAccs.length > 0;
     const anyConnected = hasConnectedExchangeAccount();
+    const userStopped = auth.authenticated ? isUserBotStopped(auth.userId) : ownerManuallyStoppedBot;
+    const userPausedEntries = auth.authenticated
+      ? isUserNewEntriesPaused(auth.userId)
+      : Boolean(botConfig.pause_new_entries);
     const userBalance = Number(
       activeUserAccs.reduce((s, a) => s + Number(a.wallet_balance_usdt ?? a.balance_usdt ?? 0), 0).toFixed(2)
     );
@@ -5493,7 +5735,8 @@ async function startServer() {
     }
     res.json({
       ...botConfig,
-      state: anyConnected && !ownerManuallyStoppedBot ? botConfig.state : 'stopped',
+      state: userConnected && !userStopped ? 'running' : 'stopped',
+      pause_new_entries: userPausedEntries,
       starting_balance: userConnected ? userBalance : 0,
       exchange_connected: userConnected,
       active_accounts_count: activeUserAccs.length,
@@ -5591,10 +5834,9 @@ async function startServer() {
   });
 
   app.post('/api/v1/scan_cycle', async (req, res) => {
-    const auth = requireOwner(req, res);
+    const auth = requireAuth(req, res);
     if (!auth) return;
-    if (!hasConnectedExchangeAccount()) {
-      botConfig.state = 'stopped';
+    if (!hasConnectedExchangeAccount(auth.userId)) {
       res.status(400).json({
         error: 'Бот не может запускать цикл анализа без подключенной биржи.',
         state: 'stopped',
@@ -5602,10 +5844,11 @@ async function startServer() {
       return;
     }
     await runScalpBotCycle(true);
+    const userOpen = filterTradesForUserScope(auth).filter((t) => t.is_open).length;
     res.json({
       status: 'completed',
-      state: botConfig.state,
-      open_trades_count: tradesStore.filter((t) => t.is_open).length,
+      state: !isUserBotStopped(auth.userId) ? 'running' : 'stopped',
+      open_trades_count: userOpen,
     });
   });
 
@@ -5718,6 +5961,12 @@ async function startServer() {
     }
     const userAccs = getAccountsForUser(auth);
     const scopedTrades = filterTradesForUserScope(auth);
+    for (const t of scopedTrades) {
+      if (t.is_open) {
+        refreshTradeLivePriceFromWs(t);
+        recalculateTradeMetrics(t, false);
+      }
+    }
     const open = scopedTrades.filter((t) => t.is_open);
     const closed = scopedTrades.filter((t) => !t.is_open);
     const closedProfitAbs = Number(
@@ -5870,6 +6119,12 @@ async function startServer() {
     }
     const userAccs = getAccountsForUser(auth);
     const scopedTrades = filterTradesForUserScope(auth);
+    for (const t of scopedTrades) {
+      if (t.is_open) {
+        refreshTradeLivePriceFromWs(t);
+        recalculateTradeMetrics(t, false);
+      }
+    }
     const openTrades = scopedTrades.filter((t) => t.is_open);
     const closedTrades = scopedTrades.filter((t) => !t.is_open);
     const metrics = getAggregatedMetricsForUser(userAccs, openTrades, closedTrades);
@@ -6032,10 +6287,9 @@ async function startServer() {
   });
 
   app.post('/api/v1/start', (req, res) => {
-    const auth = requireOwner(req, res);
+    const auth = requireAuth(req, res);
     if (!auth) return;
-    if (!hasConnectedExchangeAccount()) {
-      botConfig.state = 'stopped';
+    if (!hasConnectedExchangeAccount(auth.userId)) {
       appendLog(
         'freqtrade.rpc.rpc',
         'ERROR',
@@ -6050,100 +6304,104 @@ async function startServer() {
       });
       return;
     }
-    ownerManuallyStoppedBot = false;
-    botConfig.state = 'running';
-    botConfig.pause_new_entries = false;
+    setUserBotStopped(auth.userId, false);
+    setUserNewEntriesPaused(auth.userId, false);
+    if (hasConnectedExchangeAccount()) {
+      botConfig.state = 'running';
+    }
     appendLog('freqtrade.rpc.rpc', 'INFO', 'Changing state to: RUNNING (Новые входы разрешены)', {
-      publicMarket: true,
+      userId: auth.userId,
     });
-    scheduleScopeStateSync();
+    scheduleScopeStateSync(auth.userId);
     res.json({
       status: 'starting trader ...',
-      state: botConfig.state,
-      pause_new_entries: botConfig.pause_new_entries,
+      state: 'running',
+      pause_new_entries: false,
     });
   });
 
   app.post('/api/v1/stop', (req, res) => {
-    const auth = requireOwner(req, res);
+    const auth = requireAuth(req, res);
     if (!auth) return;
-    ownerManuallyStoppedBot = true;
-    botConfig.state = 'stopped';
+    setUserBotStopped(auth.userId, true);
     appendLog('freqtrade.rpc.rpc', 'WARNING', 'Changing state to: STOPPED', {
-      publicMarket: true,
+      userId: auth.userId,
     });
-    scheduleScopeStateSync();
+    scheduleScopeStateSync(auth.userId);
     res.json({
       status: 'stopping trader ...',
-      state: botConfig.state,
-      pause_new_entries: botConfig.pause_new_entries,
+      state: 'stopped',
+      pause_new_entries: isUserNewEntriesPaused(auth.userId),
     });
   });
 
   app.post('/api/v1/stopbuy', (req, res) => {
-    const auth = requireOwner(req, res);
+    const auth = requireAuth(req, res);
     if (!auth) return;
-    botConfig.pause_new_entries = !botConfig.pause_new_entries;
-    if (hasConnectedExchangeAccount() && !ownerManuallyStoppedBot && botConfig.state === 'paused') {
-      botConfig.state = 'running';
-    }
+    const nextPaused = !isUserNewEntriesPaused(auth.userId);
+    setUserNewEntriesPaused(auth.userId, nextPaused);
     appendLog(
       'freqtrade.rpc.rpc',
       'INFO',
-      botConfig.pause_new_entries
-        ? '⏸️ Владелец включил «Остановить открытие новых сделок»: бот прекратил новые входы, но продолжает усреднять (DCA) и закрывать в плюс текущие позиции.'
-        : '▶️ Владелец отключил паузу новых входов: бот снова ищет точки входа по стратегиям ScalpingStrategy и GlobalHedgeStrategy.',
-      { publicMarket: true }
+      nextPaused
+        ? '⏸️ Включен режим «Остановить открытие новых сделок»: бот прекратил новые входы, но продолжает усреднять (DCA) и закрывать в плюс текущие позиции.'
+        : '▶️ Отключена пауза новых входов: бот снова ищет точки входа по стратегиям ScalpingStrategy и GlobalHedgeStrategy.',
+      { userId: auth.userId }
     );
-    scheduleScopeStateSync();
+    scheduleScopeStateSync(auth.userId);
     res.json({
-      status: botConfig.pause_new_entries ? 'paused new entries' : 'resumed new entries',
-      state: botConfig.state,
-      pause_new_entries: botConfig.pause_new_entries,
+      status: nextPaused ? 'paused new entries' : 'resumed new entries',
+      state: hasConnectedExchangeAccount(auth.userId) && !isUserBotStopped(auth.userId) ? 'running' : 'stopped',
+      pause_new_entries: nextPaused,
     });
   });
 
   app.post('/api/v1/bot/pause_entries', (req, res) => {
-    const auth = requireOwner(req, res);
+    const auth = requireAuth(req, res);
     if (!auth) return;
     const explicitVal = req.body?.pause_new_entries;
-    botConfig.pause_new_entries =
-      typeof explicitVal === 'boolean' ? explicitVal : !botConfig.pause_new_entries;
-    if (hasConnectedExchangeAccount() && !ownerManuallyStoppedBot && botConfig.state !== 'stopped') {
-      botConfig.state = 'running';
-    }
+    const nextPaused =
+      typeof explicitVal === 'boolean' ? explicitVal : !isUserNewEntriesPaused(auth.userId);
+    setUserNewEntriesPaused(auth.userId, nextPaused);
     appendLog(
       'freqtrade.rpc.rpc',
       'INFO',
-      botConfig.pause_new_entries
-        ? '⏸️ Владелец включил режим «Без новых сделок»: бот НЕ открывает новые позиции, продолжая вести, усреднять (DCA) и закрывать в плюс уже открытые сделки.'
-        : '▶️ Владелец разрешил открытие новых сделок: сканер рынка и входы по стратегиям активны.',
-      { publicMarket: true }
+      nextPaused
+        ? '⏸️ Включен режим «Без новых сделок»: бот НЕ открывает новые позиции, продолжая вести, усреднять (DCA) и закрывать в плюс уже открытые сделки.'
+        : '▶️ Разрешено открытие новых сделок: сканер рынка и входы по стратегиям активны.',
+      { userId: auth.userId }
     );
-    scheduleScopeStateSync();
+    scheduleScopeStateSync(auth.userId);
     res.json({
-      status: botConfig.pause_new_entries ? 'paused_new_entries' : 'active_entries',
-      state: botConfig.state,
-      pause_new_entries: botConfig.pause_new_entries,
+      status: nextPaused ? 'paused_new_entries' : 'active_entries',
+      state: hasConnectedExchangeAccount(auth.userId) && !isUserBotStopped(auth.userId) ? 'running' : 'stopped',
+      pause_new_entries: nextPaused,
     });
   });
 
   app.post('/api/v1/reload_config', (req, res) => {
-    const auth = requireOwner(req, res);
+    const auth = requireAuth(req, res);
     if (!auth) return;
     candleCache.clear();
-    appendLog('freqtrade.rpc.rpc', 'INFO', 'Reloading config ...', { publicMarket: true });
-    scheduleScopeStateSync();
-    res.json({ status: 'Reloading config ...', state: botConfig.state });
+    appendLog('freqtrade.rpc.rpc', 'INFO', 'Reloading config ...', { userId: auth.userId });
+    scheduleScopeStateSync(auth.userId);
+    res.json({
+      status: 'Reloading config ...',
+      state: hasConnectedExchangeAccount(auth.userId) && !isUserBotStopped(auth.userId) ? 'running' : 'stopped',
+    });
   });
 
   app.patch('/api/v1/config', (req, res) => {
-    const auth = requireOwner(req, res);
+    const auth = requireAuth(req, res);
     if (!auth) return;
     const { strategy, timeframe } = req.body || {};
-    if (strategy) botConfig.strategy = String(strategy);
-    if (timeframe) botConfig.timeframe = String(timeframe);
-    res.json(botConfig);
+    if (strategy && auth.role === 'owner') botConfig.strategy = String(strategy);
+    if (timeframe && auth.role === 'owner') botConfig.timeframe = String(timeframe);
+    res.json({
+      ...botConfig,
+      state: hasConnectedExchangeAccount(auth.userId) && !isUserBotStopped(auth.userId) ? 'running' : 'stopped',
+      pause_new_entries: isUserNewEntriesPaused(auth.userId),
+    });
   });
 
   app.post('/api/v1/forceenter', async (req, res) => {
@@ -6234,7 +6492,12 @@ async function startServer() {
     }
 
     const isShort = normalizedSide === 'short';
-    const preloadedPairLevels = await getOrComputeMtfBotLevels(cleanPair);
+    const preloadedPairLevels = await getOrComputeMtfBotLevels(
+      cleanPair,
+      botConfig.timeframe,
+      false,
+      auth.userId
+    );
 
     let newTrade: FreqtradeTrade;
     try {
@@ -6300,16 +6563,21 @@ async function startServer() {
         fetchRealCandles(trade.pair, '4h', 1000),
         fetchRealCandles(trade.pair, '1h', 100),
       ]);
+    refreshTradeLivePriceFromWs(trade);
+    const liveWsExec = getFuturesExecutionPrice(trade.pair, trade.is_short, false, trade.exchange);
     const livePrice =
-      c1h.length > 0 ? c1h[c1h.length - 1].close : trade.current_rate;
-    trade.current_rate = livePrice;
+      liveWsExec && liveWsExec.executionPrice > 0
+        ? liveWsExec.executionPrice
+        : trade.current_rate > 0
+        ? trade.current_rate
+        : c1h.length > 0
+        ? c1h[c1h.length - 1].close
+        : trade.open_rate;
+    trade.current_rate = roundPrice(livePrice);
 
-    const plannedLevel1 = trade.planned_dca_levels?.[0]?.price || trade.next_dca_price;
     let fillPrice = livePrice;
     if (customDcaPrice && Number(customDcaPrice) > 0) {
       fillPrice = Number(customDcaPrice);
-    } else if (plannedLevel1 && plannedLevel1 > 0) {
-      fillPrice = plannedLevel1;
     }
     fillPrice = roundPrice(fillPrice);
 
@@ -6361,7 +6629,7 @@ async function startServer() {
 
       addAmount =
         dcaOrderRes?.success && dcaOrderRes.qty > 0 ? dcaOrderRes.qty : rawAddAmount;
-      if (dcaOrderRes?.success && dcaOrderRes.price > 0 && !customDcaPrice && !plannedLevel1) {
+      if (dcaOrderRes?.success && dcaOrderRes.price > 0 && !customDcaPrice) {
         fillPrice = roundPrice(dcaOrderRes.price);
       }
 
@@ -6683,13 +6951,13 @@ async function startServer() {
     await initializeBotTrades();
     const pair = String(req.query.pair || 'ETH/USDT:USDT').toUpperCase();
     const timeframe = String(req.query.timeframe || botConfig.timeframe || '1h').toLowerCase();
-    const levels = await getOrComputeMtfBotLevels(pair, timeframe);
+    const levels = await getOrComputeMtfBotLevels(pair, timeframe, false, auth.userId);
     res.json({ pair, timeframe, levels });
   });
 
-  // Add a new Bot Level on a pair (persisted in trades.sqlite)
+  // Add a new Bot Level on a pair (persisted per user in trades.sqlite)
   app.post('/api/v1/pair_levels', async (req, res) => {
-    const auth = requireOwner(req, res);
+    const auth = requireAuth(req, res);
     if (!auth) return;
     await initializeBotTrades();
     const { pair = 'ETH/USDT:USDT', timeframe = botConfig.timeframe, price, role, label } = req.body || {};
@@ -6700,7 +6968,7 @@ async function startServer() {
       res.status(400).json({ error: 'Invalid level price' });
       return;
     }
-    const existing = await getOrComputeMtfBotLevels(cleanPair, normTf);
+    const existing = await getOrComputeMtfBotLevels(cleanPair, normTf, false, auth.userId);
     const nextIdx = existing.length + 1;
     const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
     const livePrice = tickerCache.get(cleanPair)?.price || 0;
@@ -6726,34 +6994,38 @@ async function startServer() {
       manual_override: true,
       updated_at: nowStr,
     };
+    const userPrefix = `${auth.userId}::${cleanPair}`;
     for (const k of Array.from(botLevelsStore.keys())) {
-      if (k === cleanPair || k.startsWith(`${cleanPair}_`)) {
+      if (k === userPrefix || k.startsWith(`${userPrefix}_`)) {
         botLevelsStore.delete(k);
       }
     }
-    sqliteDb.upsertBotLevel({
-      ...newLevel,
-      touches: 1,
-      bounces: 1,
-      breaks: 0,
-      strength_score: 10,
-      source: 'MANUAL',
-      manual_override: true,
-      deleted: false,
-    });
-    const refreshed = await getOrComputeMtfBotLevels(cleanPair, normTf);
+    sqliteDb.upsertBotLevel(
+      {
+        ...newLevel,
+        touches: 1,
+        bounces: 1,
+        breaks: 0,
+        strength_score: 10,
+        source: 'MANUAL',
+        manual_override: true,
+        deleted: false,
+      },
+      auth.userId
+    );
+    const refreshed = await getOrComputeMtfBotLevels(cleanPair, normTf, false, auth.userId);
     appendLog(
       'freqtrade.bot.levels',
       'INFO',
       `[${cleanPair}] Добавлен уровень бота ${newLevel.label} @ ${cleanPrice}$`,
-      { userId: 'owner' }
+      { userId: auth.userId }
     );
     res.json({ pair: cleanPair, level: newLevel, levels: refreshed });
   });
 
-  // Update a Bot Level price when dragged on the chart (persisted in trades.sqlite & synced to owner open trades)
+  // Update a Bot Level price when dragged on the chart (persisted per user in trades.sqlite & synced to user's open trades)
   app.patch('/api/v1/pair_levels', async (req, res) => {
-    const auth = requireOwner(req, res);
+    const auth = requireAuth(req, res);
     if (!auth) return;
     await initializeBotTrades();
     const { pair = 'ETH/USDT:USDT', timeframe = botConfig.timeframe, id, price, role } = req.body || {};
@@ -6764,8 +7036,8 @@ async function startServer() {
       res.status(400).json({ error: 'Invalid level price' });
       return;
     }
-    const existing = await getOrComputeMtfBotLevels(cleanPair, normTf);
-    const allDbLevels = sqliteDb.getAllBotLevelsForPairIncludeDeleted(cleanPair);
+    const existing = await getOrComputeMtfBotLevels(cleanPair, normTf, false, auth.userId);
+    const allDbLevels = sqliteDb.getAllBotLevelsForPairIncludeDeleted(cleanPair, auth.userId);
     const target = existing.find((l) => l.id === id) || allDbLevels.find((l) => l.id === id);
     if (!target) {
       res.status(404).json({ error: 'Bot level not found' });
@@ -6796,29 +7068,31 @@ async function startServer() {
     }
 
     sqliteDb.runInTransaction(() => {
-      sqliteDb.upsertBotLevel({
-        id: target.id,
-        pair: cleanPair,
-        label: target.label,
-        role: target.role,
-        price: target.price,
-        touches: target.touches || 1,
-        bounces: target.bounces || 1,
-        breaks: target.breaks || 0,
-        strength_score: target.strength_score || 10,
-        source: target.source || normTf.toUpperCase(),
-        manual_override: true,
-        deleted: false,
-        updated_at: target.updated_at,
-      });
+      sqliteDb.upsertBotLevel(
+        {
+          id: target.id,
+          pair: cleanPair,
+          label: target.label,
+          role: target.role,
+          price: target.price,
+          touches: target.touches || 1,
+          bounces: target.bounces || 1,
+          breaks: target.breaks || 0,
+          strength_score: target.strength_score || 10,
+          source: target.source || normTf.toUpperCase(),
+          manual_override: true,
+          deleted: false,
+          updated_at: target.updated_at,
+        },
+        auth.userId
+      );
 
-      // Only clean up sibling auto-levels and bind global trade S/R when owner drags a global SUP/RES line itself
+      // Only clean up sibling auto-levels and bind global trade S/R for this user's own open trades
       if (isGlobalSupRes) {
-        sqliteDb.replaceAutoBotLevelsWithManual(cleanPair, target.role, target.id);
+        sqliteDb.replaceAutoBotLevelsWithManual(cleanPair, target.role, target.id, auth.userId);
 
-        // Привязываем DCA 1 (только для сделок владельца, если его ещё не трогали вручную) к перетащенному глобальному SUP/RES
         for (const t of tradesStore) {
-          if (t.is_open && t.pair === cleanPair && isTradeInMasterScope(t)) {
+          if (t.is_open && t.pair === cleanPair && resolveTradeUserId(t) === auth.userId) {
             recalculateTradeMetrics(t, false);
             const dca1 = t.planned_dca_levels?.[0];
             if (target.role === 'support') {
@@ -6845,21 +7119,22 @@ async function startServer() {
       }
     });
 
+    const userPrefix = `${auth.userId}::${cleanPair}`;
     for (const k of Array.from(botLevelsStore.keys())) {
-      if (k === cleanPair || k.startsWith(`${cleanPair}_`)) {
+      if (k === userPrefix || k.startsWith(`${userPrefix}_`)) {
         botLevelsStore.delete(k);
       }
     }
-    const refreshedLevels = await getOrComputeMtfBotLevels(cleanPair, normTf);
+    const refreshedLevels = await getOrComputeMtfBotLevels(cleanPair, normTf, false, auth.userId);
     const updatedPairTrades = tradesStore.filter(
-      (t) => t.is_open && t.pair === cleanPair && isTradeInMasterScope(t)
+      (t) => t.is_open && t.pair === cleanPair && resolveTradeUserId(t) === auth.userId
     );
 
     appendLog(
       'freqtrade.bot.levels',
       'INFO',
       `[${cleanPair}] Уровень ${target.label} (${target.role.toUpperCase()}) перенесен на графике: ${prevPrice}$ ➔ ${newPrice}$.`,
-      { userId: 'owner' }
+      { userId: auth.userId }
     );
     res.json({
       pair: cleanPair,
@@ -6870,47 +7145,49 @@ async function startServer() {
     });
   });
 
-  // Delete a single Bot Level (marks deleted in trades.sqlite so auto-MTF won't recreate it)
+  // Delete a single Bot Level (marks deleted per user in trades.sqlite so auto-MTF won't recreate it)
   app.delete('/api/v1/pair_levels/:id', async (req, res) => {
-    const auth = requireOwner(req, res);
+    const auth = requireAuth(req, res);
     if (!auth) return;
     await initializeBotTrades();
     const id = String(req.params.id);
     const pair = String(req.query.pair || 'ETH/USDT:USDT').toUpperCase();
     const timeframe = String(req.query.timeframe || botConfig.timeframe || '1h').toLowerCase();
-    const existing = await getOrComputeMtfBotLevels(pair, timeframe);
+    const existing = await getOrComputeMtfBotLevels(pair, timeframe, false, auth.userId);
     const removed = existing.find((l) => l.id === id);
     const next = existing.filter((l) => l.id !== id);
+    const userPrefix = `${auth.userId}::${pair}`;
     for (const k of Array.from(botLevelsStore.keys())) {
-      if (k === pair || k.startsWith(`${pair}_`)) {
+      if (k === userPrefix || k.startsWith(`${userPrefix}_`)) {
         botLevelsStore.delete(k);
       }
     }
-    botLevelsStore.set(`${pair}_${timeframe}`, next);
-    sqliteDb.markBotLevelDeleted(id);
+    botLevelsStore.set(`${auth.userId}::${pair}_${timeframe}`, next);
+    sqliteDb.markBotLevelDeleted(id, auth.userId);
     appendLog(
       'freqtrade.bot.levels',
       'INFO',
       `[${pair}] Удален уровень бота ${removed ? `${removed.label} @ ${removed.price}$` : id}. Триггер уровня отменен.`,
-      { userId: 'owner' }
+      { userId: auth.userId }
     );
     res.json({ pair, removed_id: id, levels: next });
   });
 
-  // Clear all Bot Levels for a pair
+  // Clear all Bot Levels for a pair for the current user
   app.delete('/api/v1/pair_levels', async (req, res) => {
-    const auth = requireOwner(req, res);
+    const auth = requireAuth(req, res);
     if (!auth) return;
     await initializeBotTrades();
     const pair = String(req.query.pair || 'ETH/USDT:USDT').toUpperCase();
+    const userPrefix = `${auth.userId}::${pair}`;
     for (const k of Array.from(botLevelsStore.keys())) {
-      if (k === pair || k.startsWith(`${pair}_`)) {
+      if (k === userPrefix || k.startsWith(`${userPrefix}_`)) {
         botLevelsStore.delete(k);
       }
     }
-    sqliteDb.clearBotLevelsForPair(pair);
+    sqliteDb.clearBotLevelsForPair(pair, auth.userId);
     appendLog('freqtrade.bot.levels', 'INFO', `[${pair}] Очищены все уровни бота на графике`, {
-      userId: 'owner',
+      userId: auth.userId,
     });
     res.json({ pair, levels: [] });
   });
@@ -7049,14 +7326,20 @@ async function startServer() {
         ? acc.unrealized_pnl
         : accOpenPnl;
     const usedMargin =
-      typeof acc.used_margin_usdt === 'number' && Number.isFinite(acc.used_margin_usdt)
-        ? Number(acc.used_margin_usdt.toFixed(2))
+      typeof acc.used_margin_usdt === 'number' && acc.used_margin_usdt > 0
+        ? accOpen.length > 0
+          ? Number(Math.max(acc.used_margin_usdt, accLocalUsed).toFixed(2))
+          : Number(acc.used_margin_usdt.toFixed(2))
         : accLocalUsed;
     const walletBal = Number((acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2));
+    const computedAvail = Number(Math.max(0, walletBal - usedMargin).toFixed(2));
     const availBal =
-      typeof acc.available_balance_usdt === 'number' && Number.isFinite(acc.available_balance_usdt)
+      typeof acc.available_balance_usdt === 'number' &&
+      Number.isFinite(acc.available_balance_usdt) &&
+      acc.available_balance_usdt >= 0 &&
+      (usedMargin === 0 || acc.available_balance_usdt <= walletBal - usedMargin + 0.5)
         ? Number(acc.available_balance_usdt.toFixed(2))
-        : Number(Math.max(0, walletBal - usedMargin).toFixed(2));
+        : computedAvail;
     return serializeAccountForClient({
       ...acc,
       open_trades_count: accOpen.length,
@@ -7176,17 +7459,44 @@ async function startServer() {
 
     const cleanName = String(name).trim();
     const generatedCode =
-      client_access_code && String(client_access_code).trim().length >= 4
+      client_access_code && String(client_access_code).trim().length >= 8
         ? String(client_access_code).trim().toUpperCase()
-        : `${cleanExchange.toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+        : generateSecureClientAccessCode(cleanExchange);
+
+    // Проверка: не подключен ли этот же реальный API-ключ в другом профиле
+    const existingByRawKey = !isSimulatedTestApiKey(cleanKeyInput)
+      ? exchangeAccountsStore.find(
+          (a) => sanitizeCredentialString(a.api_key_raw) === cleanKeyInput
+        )
+      : undefined;
+
+    if (existingByRawKey && (existingByRawKey.user_id || 'owner') !== auth.userId) {
+      const existingIsOwner = (existingByRawKey.user_id || 'owner') === 'owner' || existingByRawKey.is_owner;
+      const sameSecret =
+        sanitizeCredentialString(existingByRawKey.api_secret_raw) === cleanSecretInput;
+      if (existingIsOwner || !sameSecret) {
+        res.status(403).json({
+          error:
+            'Этот API-ключ уже используется другим пользователем. Подключите собственный API-ключ биржи.',
+        });
+        return;
+      }
+      // Тот же клиент повторно ввёл свои API Key + Secret Key с нового устройства/браузера — перепривязываем его аккаунт и сделки к текущей сессии
+      existingByRawKey.user_id = auth.userId;
+      sqliteDb.upsertExchangeAccount(existingByRawKey);
+    }
 
     // Защита от дублирования строго в рамках аккаунтов текущего пользователя
     const userOwnedAccs = getAccountsForUser(auth);
-    const existingAcc = userOwnedAccs.find(
-      (a) =>
-        (client_access_code && a.client_access_code.toUpperCase() === generatedCode) ||
-        (a.name.toLowerCase() === cleanName.toLowerCase() && a.exchange === cleanExchange)
-    );
+    const existingAcc =
+      (existingByRawKey && (existingByRawKey.user_id || 'owner') === auth.userId
+        ? existingByRawKey
+        : undefined) ||
+      userOwnedAccs.find(
+        (a) =>
+          (client_access_code && a.client_access_code.toUpperCase() === generatedCode) ||
+          (a.name.toLowerCase() === cleanName.toLowerCase() && a.exchange === cleanExchange)
+      );
 
     const effectiveIsOwner = auth.role === 'owner';
 
@@ -7203,7 +7513,10 @@ async function startServer() {
       existingAcc.has_passphrase = Boolean(cleanPassInput.length > 0);
       existingAcc.is_owner = effectiveIsOwner;
       existingAcc.user_id = auth.userId;
-      existingAcc.client_access_code = generatedCode;
+      existingAcc.client_access_code =
+        existingAcc.client_access_code && existingAcc.client_access_code.length >= 12
+          ? existingAcc.client_access_code
+          : generatedCode;
       existingAcc.enabled = true;
       existingAcc.copy_trading = false;
       existingAcc.copy_multiplier = 1.0;
@@ -7237,6 +7550,7 @@ async function startServer() {
       existingAcc.last_sync = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
       sqliteDb.upsertExchangeAccount(existingAcc);
+      setUserBotStopped(auth.userId, false);
 
       if (!isSimulatedTestApiKey(cleanKeyInput)) {
         await syncPositionsAndHistoryFromExchanges(existingAcc, true);
@@ -7245,8 +7559,8 @@ async function startServer() {
           prewarmExchangeAccountCaches(existingCreds).catch(() => {});
         }
       }
-      botConfig.state = hasConnectedExchangeAccount() && !ownerManuallyStoppedBot ? 'running' : 'stopped';
-      if (!isSimulatedTestApiKey(cleanKeyInput) && !ownerManuallyStoppedBot) {
+      botConfig.state = hasConnectedExchangeAccount() ? 'running' : 'stopped';
+      if (!isSimulatedTestApiKey(cleanKeyInput) && !isUserBotStopped(auth.userId)) {
         runScalpBotCycle(false).catch(() => {});
       }
       scheduleScopeStateSync(auth.userId);
@@ -7309,6 +7623,7 @@ async function startServer() {
 
     exchangeAccountsStore.push(newAcc);
     sqliteDb.upsertExchangeAccount(newAcc);
+    setUserBotStopped(auth.userId, false);
 
     appendLog(
       'freqtrade.exchange.accounts',
@@ -7324,8 +7639,8 @@ async function startServer() {
         prewarmExchangeAccountCaches(newCreds).catch(() => {});
       }
     }
-    botConfig.state = hasConnectedExchangeAccount() && !ownerManuallyStoppedBot ? 'running' : 'stopped';
-    if (!isSimulatedTestApiKey(cleanKeyInput) && !ownerManuallyStoppedBot) {
+    botConfig.state = hasConnectedExchangeAccount() ? 'running' : 'stopped';
+    if (!isSimulatedTestApiKey(cleanKeyInput) && !isUserBotStopped(auth.userId)) {
       runScalpBotCycle(false).catch(() => {});
     }
     scheduleScopeStateSync(auth.userId);
@@ -7619,6 +7934,8 @@ async function startServer() {
     if (!acc && verified.valid) {
       if (verified.accountId) {
         acc = exchangeAccountsStore.find((a) => a.id === verified.accountId) || null;
+      } else if (verified.userId) {
+        acc = exchangeAccountsStore.find((a) => (a.user_id || 'owner') === verified.userId) || null;
       } else if (verified.inviteId) {
         const uId = `invite:${verified.inviteId}`;
         acc = exchangeAccountsStore.find((a) => (a.user_id || 'owner') === uId) || null;
@@ -8164,14 +8481,63 @@ async function startServer() {
     const updatedUserIds = new Set<string>();
     for (const acc of exchangeAccountsStore) {
       if (acc.enabled && sanitizeCredentialString(acc.api_key_raw) === wsState.apiKey) {
+        const targetAccountId = getTargetAccountIdForRecord(acc);
+        const accOpenTrades = tradesStore.filter(
+          (t) => t.is_open && tradeMatchesAccount(t, acc, targetAccountId)
+        );
+        const localOpenMargin = Number(
+          accOpenTrades.reduce((s, t) => s + (t.stake_amount || 0), 0).toFixed(2)
+        );
+
         acc.balance_usdt = Number(wsState.walletBalanceUsdt.toFixed(4));
         acc.wallet_balance_usdt = Number(wsState.walletBalanceUsdt.toFixed(4));
         acc.unrealized_pnl = Number(wsState.unrealizedPnlUsdt.toFixed(4));
         acc.equity_usdt = Number(wsState.equityUsdt.toFixed(4));
-        acc.available_balance_usdt = Number(wsState.availableBalanceUsdt.toFixed(2));
-        acc.used_margin_usdt = Number(wsState.usedMarginUsdt.toFixed(2));
-        acc.open_trades_count = wsState.positions.length;
+
+        if (wsState.usedMarginUsdt > 0) {
+          acc.used_margin_usdt = Number(Math.max(wsState.usedMarginUsdt, localOpenMargin).toFixed(2));
+        } else if (wsState.positionsSynced && wsState.positions.length === 0) {
+          acc.used_margin_usdt = 0;
+        } else if (localOpenMargin > 0) {
+          acc.used_margin_usdt = localOpenMargin;
+        }
+
+        acc.available_balance_usdt = Number(
+          Math.max(0, acc.wallet_balance_usdt - (acc.used_margin_usdt || 0)).toFixed(2)
+        );
+        if (wsState.positionsSynced) {
+          acc.open_trades_count = wsState.positions.length;
+        }
         acc.status = 'connected';
+
+        // Мгновенно синхронизируем цену входа, объём и маржу открытых позиций по приватным WS-событиям биржи
+        let needsFullPositionSync = false;
+        for (const pos of wsState.positions) {
+          const existing = accOpenTrades.find(
+            (t) => t.pair === pos.pair && t.is_short === pos.is_short
+          );
+          if (existing) {
+            if (pos.entry_price > 0) existing.open_rate = roundPrice(pos.entry_price);
+            if (pos.size > 0) existing.amount = Number(pos.size.toFixed(4));
+            if (pos.margin_usdt > 0) existing.stake_amount = Number(pos.margin_usdt.toFixed(2));
+            if (pos.mark_price > 0) {
+              existing.current_rate = roundPrice(pos.mark_price);
+              existing.exchange_mark_price = pos.mark_price;
+            }
+            existing.exchange_unrealized_pnl = Number(pos.unrealized_pnl || 0);
+            existing.exchange_synced_at = Date.now();
+            if (pos.take_profit && pos.take_profit > 0 && !existing.tp_manual_override) {
+              existing.take_profit_abs = roundPrice(pos.take_profit);
+            }
+            recalculateTradeMetrics(existing, false);
+          } else {
+            needsFullPositionSync = true;
+          }
+        }
+        if (needsFullPositionSync) {
+          void syncPositionsAndHistoryFromExchanges(acc, false, false);
+        }
+
         updatedUserIds.add(acc.user_id || 'owner');
       }
     }
@@ -8230,10 +8596,14 @@ async function startServer() {
         .slice(-80)
         .reverse();
 
+      const userStopped = isUserBotStopped(scope.userId);
+      const userPausedEntries = isUserNewEntriesPaused(scope.userId);
+
       return {
         botConfig: {
           ...botConfig,
-          state: anyConnected && !ownerManuallyStoppedBot ? botConfig.state : 'stopped',
+          state: userConnected && !userStopped ? 'running' : 'stopped',
+          pause_new_entries: userPausedEntries,
           starting_balance: userConnected ? userBalance : 0,
           exchange_connected: userConnected,
           active_accounts_count: activeUserAccs.length,

@@ -326,6 +326,15 @@ export class SqliteBotDatabase {
         // column already exists
       }
     }
+
+    const extraBotLevelCols = [['user_id', "TEXT DEFAULT 'owner'"]];
+    for (const [col, def] of extraBotLevelCols) {
+      try {
+        this.db.exec(`ALTER TABLE bot_levels ADD COLUMN ${col} ${def}`);
+      } catch {
+        // column already exists
+      }
+    }
   }
 
   private parseStoredUtcTimestamp(dateStr?: string | null, explicitTs?: number | null): number | null {
@@ -1173,13 +1182,30 @@ export class SqliteBotDatabase {
     }
   }
 
-  public getBotLevelsForPair(pair: string): SqliteBotLevelRow[] {
+  private toScopedBotLevelDbId(id: string, userId = 'owner'): string {
+    const cleanUser = String(userId || 'owner').trim() || 'owner';
+    if (cleanUser === 'owner') return id;
+    const prefix = `${cleanUser}::`;
+    return id.startsWith(prefix) ? id : `${prefix}${id}`;
+  }
+
+  private fromScopedBotLevelDbId(dbId: string, userId = 'owner'): string {
+    const cleanUser = String(userId || 'owner').trim() || 'owner';
+    if (cleanUser === 'owner') return dbId;
+    const prefix = `${cleanUser}::`;
+    return dbId.startsWith(prefix) ? dbId.slice(prefix.length) : dbId;
+  }
+
+  public getBotLevelsForPair(pair: string, userId = 'owner'): SqliteBotLevelRow[] {
     try {
+      const cleanUser = String(userId || 'owner').trim() || 'owner';
       const rows = this.db
-        .prepare(`SELECT * FROM bot_levels WHERE pair = ? AND deleted = 0 ORDER BY price DESC`)
-        .all(pair.toUpperCase());
+        .prepare(
+          `SELECT * FROM bot_levels WHERE pair = ? AND COALESCE(user_id, 'owner') = ? AND deleted = 0 ORDER BY price DESC`
+        )
+        .all(pair.toUpperCase(), cleanUser);
       return rows.map((r: any) => ({
-        id: String(r.id),
+        id: this.fromScopedBotLevelDbId(String(r.id), cleanUser),
         pair: String(r.pair),
         label: String(r.label),
         role: (r.role === 'resistance' ? 'resistance' : r.role === 'entry_trigger' ? 'entry_trigger' : 'support') as SqliteBotLevelRow['role'],
@@ -1198,22 +1224,27 @@ export class SqliteBotDatabase {
     }
   }
 
-  public hasAnyBotLevelsRecordForPair(pair: string): boolean {
+  public hasAnyBotLevelsRecordForPair(pair: string, userId = 'owner'): boolean {
     try {
+      const cleanUser = String(userId || 'owner').trim() || 'owner';
       const row = this.db
-        .prepare(`SELECT COUNT(*) as cnt FROM bot_levels WHERE pair = ?`)
-        .get(pair.toUpperCase());
+        .prepare(
+          `SELECT COUNT(*) as cnt FROM bot_levels WHERE pair = ? AND COALESCE(user_id, 'owner') = ?`
+        )
+        .get(pair.toUpperCase(), cleanUser);
       return Number(row?.cnt || 0) > 0;
     } catch {
       return false;
     }
   }
 
-  public upsertBotLevel(level: SqliteBotLevelRow) {
+  public upsertBotLevel(level: SqliteBotLevelRow, userId = 'owner') {
     try {
+      const cleanUser = String(userId || 'owner').trim() || 'owner';
+      const dbId = this.toScopedBotLevelDbId(level.id, cleanUser);
       const stmt = this.db.prepare(`
-        INSERT INTO bot_levels (id, pair, label, role, price, touches, bounces, breaks, strength_score, source, manual_override, deleted, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO bot_levels (id, pair, label, role, price, touches, bounces, breaks, strength_score, source, manual_override, deleted, updated_at, user_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           label = excluded.label,
           role = excluded.role,
@@ -1225,10 +1256,11 @@ export class SqliteBotDatabase {
           source = excluded.source,
           manual_override = excluded.manual_override,
           deleted = excluded.deleted,
-          updated_at = excluded.updated_at
+          updated_at = excluded.updated_at,
+          user_id = excluded.user_id
       `);
       stmt.run(
-        level.id,
+        dbId,
         level.pair.toUpperCase(),
         level.label,
         level.role,
@@ -1240,28 +1272,36 @@ export class SqliteBotDatabase {
         level.source || '4H',
         level.manual_override ? 1 : 0,
         level.deleted ? 1 : 0,
-        level.updated_at
+        level.updated_at,
+        cleanUser
       );
     } catch (e) {
       console.error('upsertBotLevel error:', e);
     }
   }
 
-  public markBotLevelDeleted(id: string) {
+  public markBotLevelDeleted(id: string, userId = 'owner') {
     try {
-      this.db.prepare(`UPDATE bot_levels SET deleted = 1 WHERE id = ?`).run(id);
+      const cleanUser = String(userId || 'owner').trim() || 'owner';
+      const dbId = this.toScopedBotLevelDbId(id, cleanUser);
+      this.db
+        .prepare(`UPDATE bot_levels SET deleted = 1 WHERE id = ? AND COALESCE(user_id, 'owner') = ?`)
+        .run(dbId, cleanUser);
     } catch {
       // ignore
     }
   }
 
-  public getAllBotLevelsForPairIncludeDeleted(pair: string): SqliteBotLevelRow[] {
+  public getAllBotLevelsForPairIncludeDeleted(pair: string, userId = 'owner'): SqliteBotLevelRow[] {
     try {
+      const cleanUser = String(userId || 'owner').trim() || 'owner';
       const rows = this.db
-        .prepare(`SELECT * FROM bot_levels WHERE pair = ? ORDER BY price DESC`)
-        .all(pair.toUpperCase());
+        .prepare(
+          `SELECT * FROM bot_levels WHERE pair = ? AND COALESCE(user_id, 'owner') = ? ORDER BY price DESC`
+        )
+        .all(pair.toUpperCase(), cleanUser);
       return rows.map((r: any) => ({
-        id: String(r.id),
+        id: this.fromScopedBotLevelDbId(String(r.id), cleanUser),
         pair: String(r.pair),
         label: String(r.label),
         role: (r.role === 'resistance' ? 'resistance' : r.role === 'entry_trigger' ? 'entry_trigger' : 'support') as SqliteBotLevelRow['role'],
@@ -1280,21 +1320,26 @@ export class SqliteBotDatabase {
     }
   }
 
-  public replaceAutoBotLevelsWithManual(pair: string, role: string, keepId: string) {
+  public replaceAutoBotLevelsWithManual(pair: string, role: string, keepId: string, userId = 'owner') {
     try {
+      const cleanUser = String(userId || 'owner').trim() || 'owner';
+      const dbKeepId = this.toScopedBotLevelDbId(keepId, cleanUser);
       this.db
         .prepare(
-          `DELETE FROM bot_levels WHERE pair = ? AND role = ? AND manual_override = 0 AND id != ?`
+          `DELETE FROM bot_levels WHERE pair = ? AND role = ? AND COALESCE(user_id, 'owner') = ? AND manual_override = 0 AND id != ?`
         )
-        .run(pair.toUpperCase(), role, keepId);
+        .run(pair.toUpperCase(), role, cleanUser, dbKeepId);
     } catch {
       // ignore
     }
   }
 
-  public clearBotLevelsForPair(pair: string) {
+  public clearBotLevelsForPair(pair: string, userId = 'owner') {
     try {
-      this.db.prepare(`DELETE FROM bot_levels WHERE pair = ?`).run(pair.toUpperCase());
+      const cleanUser = String(userId || 'owner').trim() || 'owner';
+      this.db
+        .prepare(`DELETE FROM bot_levels WHERE pair = ? AND COALESCE(user_id, 'owner') = ?`)
+        .run(pair.toUpperCase(), cleanUser);
     } catch {
       // ignore
     }
@@ -1607,9 +1652,14 @@ export class SqliteBotDatabase {
   public verifyClientAccessCode(code: string): any | null {
     try {
       const cleanCode = String(code || '').trim().toUpperCase();
-      if (!cleanCode) return null;
+      if (!cleanCode || cleanCode.length < 6) return null;
       const row = this.db
-        .prepare(`SELECT * FROM exchange_accounts WHERE UPPER(client_access_code) = ?`)
+        .prepare(
+          `SELECT * FROM exchange_accounts
+           WHERE UPPER(client_access_code) = ?
+             AND COALESCE(user_id, 'owner') != 'owner'
+             AND COALESCE(is_owner, 0) = 0`
+        )
         .get(cleanCode) as any;
       return row || null;
     } catch {
@@ -1758,6 +1808,7 @@ export class SqliteBotDatabase {
     login: string;
     accountId?: string;
     inviteId?: string;
+    userId?: string;
   }): string {
     try {
       const row = this.db.prepare(`SELECT session_secret FROM site_auth WHERE id = 1`).get() as any;
@@ -1767,6 +1818,7 @@ export class SqliteBotDatabase {
         login: payload.login,
         accountId: payload.accountId || '',
         inviteId: payload.inviteId || '',
+        userId: payload.userId || '',
         exp: Date.now() + 1000 * 60 * 60 * 24 * 30, // 30 days
       });
       const b64 = Buffer.from(data, 'utf8').toString('base64url');
@@ -1783,6 +1835,7 @@ export class SqliteBotDatabase {
     login?: string;
     accountId?: string;
     inviteId?: string;
+    userId?: string;
   } {
     try {
       if (!token || !token.includes('.')) return { valid: false };
@@ -1810,6 +1863,7 @@ export class SqliteBotDatabase {
         login: String(parsed.login || 'admin'),
         accountId: parsed.accountId ? String(parsed.accountId) : undefined,
         inviteId: parsed.inviteId ? String(parsed.inviteId) : undefined,
+        userId: parsed.userId ? String(parsed.userId) : undefined,
       };
     } catch {
       return { valid: false };

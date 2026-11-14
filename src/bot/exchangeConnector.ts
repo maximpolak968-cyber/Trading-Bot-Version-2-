@@ -4102,10 +4102,14 @@ export async function fetchExchangeClosedPnl(
             }
           }
         }
-        for (const rawSym of knownSymbols.slice(0, 5)) {
+        const priorityCleanSymbols = new Set<string>();
+        for (const rawSym of knownSymbols.slice(0, 10)) {
           const cleanSym = pairToCleanSymbol(rawSym);
-          if (cleanSym.endsWith('USDT') && !latestIncomeBySym.has(cleanSym)) {
-            latestIncomeBySym.set(cleanSym, 1);
+          if (cleanSym.endsWith('USDT') || cleanSym.endsWith('USDC')) {
+            priorityCleanSymbols.add(cleanSym);
+            if (!latestIncomeBySym.has(cleanSym)) {
+              latestIncomeBySym.set(cleanSym, Date.now());
+            }
           }
         }
 
@@ -4116,7 +4120,7 @@ export async function fetchExchangeClosedPnl(
         for (const [sym, latestTs] of latestIncomeBySym.entries()) {
           const symCacheKey = `${cleanKey}:${baseUrl}:${sym}`;
           const cachedSym = binanceSymbolTradesCache.get(symCacheKey);
-          if (cachedSym && cachedSym.latestIncomeTs >= latestTs) {
+          if (cachedSym && cachedSym.latestIncomeTs >= latestTs && !priorityCleanSymbols.has(sym)) {
             if (cachedSym.items.length > 0) {
               coveredSymbolsWithUserTrades.add(sym);
               closed.push(...cachedSym.items);
@@ -4126,8 +4130,15 @@ export async function fetchExchangeClosedPnl(
           }
         }
 
-        // Ограничиваем запрос /fapi/v1/userTrades максимум 3 новыми символами за цикл, чтобы никогда не превышать лимит весов Binance (-1003)!
-        const symbolArr = uncachedSymbols.slice(0, 3);
+        // Ставим запрошенные известные символы (disappearedTrades) в абсолютный приоритет
+        uncachedSymbols.sort((a, b) => {
+          const aPrio = priorityCleanSymbols.has(a) ? 1 : 0;
+          const bPrio = priorityCleanSymbols.has(b) ? 1 : 0;
+          if (aPrio !== bPrio) return bPrio - aPrio;
+          return (latestIncomeBySym.get(b) || 0) - (latestIncomeBySym.get(a) || 0);
+        });
+
+        const symbolArr = uncachedSymbols.slice(0, 6);
         const batchSize = 3;
         for (let i = 0; i < symbolArr.length; i += batchSize) {
           const batch = symbolArr.slice(i, i + batchSize);
@@ -4274,7 +4285,8 @@ export async function fetchExchangeClosedPnl(
           );
         }
 
-        // Резервное восстановление из /fapi/v1/income (REALIZED_PNL), если по каким-то символам userTrades не вернул детали
+        // Резервное восстановление из /fapi/v1/income (REALIZED_PNL), если по каким-то символам userTrades не вернул детали:
+        // НИКОГДА не подставляем вымышленные entry_price: 100 / exit_price: 100+pnl — передаём 0, чтобы использовались реальные цены сделки!
         if (Array.isArray(incomeList)) {
           const commByKey = new Map<string, number>();
           if (Array.isArray(commList)) {
@@ -4294,7 +4306,7 @@ export async function fetchExchangeClosedPnl(
             const sym = String(inc.symbol || '').trim().toUpperCase();
             const gross = Number(inc.income || 0);
             const time = Number(inc.time || 0);
-            if (!sym || !sym.endsWith('USDT') || Math.abs(gross) < 1e-8) continue;
+            if (!sym || (!sym.endsWith('USDT') && !sym.endsWith('USDC')) || Math.abs(gross) < 1e-8) continue;
             if (coveredSymbolsWithUserTrades.has(sym)) continue;
             const bucket = Math.floor(time / 5000);
             const gKey = `${sym}:${bucket}`;
@@ -4321,9 +4333,9 @@ export async function fetchExchangeClosedPnl(
               pair: symbolToFreqtradePair(grp.sym),
               symbol: grp.sym,
               is_short: false,
-              qty: 1,
-              entry_price: 100,
-              exit_price: Number((100 + grp.grossPnl).toFixed(4)),
+              qty: 0,
+              entry_price: 0,
+              exit_price: 0,
               leverage: 25,
               closed_pnl: Number(netClosedPnl.toFixed(4)),
               open_fee: openFee,

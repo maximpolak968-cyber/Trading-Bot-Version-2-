@@ -248,6 +248,40 @@ export const TradeView: React.FC<TradeViewProps> = ({
     [openTrades, closedTrades]
   );
 
+  const financialSummary = useMemo(() => {
+    const openMarginSum = openTrades.reduce((s, t) => s + Number(t.stake_amount || 0), 0);
+    const openPnlSum = openTrades.reduce(
+      (s, t) => s + Number(t.net_profit ?? t.profit_abs ?? 0),
+      0
+    );
+    const closedPnlSum = closedTrades.reduce(
+      (s, t) => s + Number(t.net_profit ?? t.profit_abs ?? 0),
+      0
+    );
+    const walletBal = Number(balance?.wallet_balance ?? balance?.total ?? 0);
+    const usedMargin =
+      typeof balance?.used_margin === 'number' && balance.used_margin > 0
+        ? openTrades.length > 0
+          ? Math.max(balance.used_margin, openMarginSum)
+          : balance.used_margin
+        : openMarginSum;
+    const freeMargin =
+      typeof balance?.available_balance === 'number' &&
+      balance.available_balance >= 0 &&
+      (usedMargin === 0 || balance.available_balance <= walletBal - usedMargin + 0.5)
+        ? balance.available_balance
+        : Math.max(0, walletBal - usedMargin);
+    const equityBal = walletBal + openPnlSum;
+    return {
+      walletBal,
+      usedMargin,
+      freeMargin,
+      openPnlSum,
+      closedPnlSum,
+      equityBal,
+    };
+  }, [openTrades, closedTrades, balance]);
+
   const handleTriggerDca = async (trade: FreqtradeTrade, e: React.MouseEvent) => {
     e.stopPropagation();
     await onAverageTrade(trade.trade_id);
@@ -315,7 +349,6 @@ export const TradeView: React.FC<TradeViewProps> = ({
               <span className="text-[12px] font-semibold text-white">Сделки и уровни (↕ перетаскивание на графике)</span>
 
               <div className="flex items-center gap-1">
-                {isOwner && (
                   <>
                     <button
                       type="button"
@@ -361,7 +394,6 @@ export const TradeView: React.FC<TradeViewProps> = ({
                       <RotateCw className="w-3 h-3" />
                     </button>
                   </>
-                )}
                 <button
                   type="button"
                   onClick={() => onForceExit('all')}
@@ -471,6 +503,50 @@ export const TradeView: React.FC<TradeViewProps> = ({
               </button>
             </div>
 
+            {/* Компактная сводка финансов: Баланс | Маржа в сделках | Свободно | Плавающий PnL | Закрытый PnL */}
+            <div className="shrink-0 grid grid-cols-4 bg-[#11151c] border-b border-[#2a2e39] px-2 py-1.5 gap-1.5 text-[10px] font-mono">
+              <div className="flex flex-col">
+                <span className="text-[#8b949e] text-[9px]">Баланс</span>
+                <span className="text-white font-semibold tabular-nums">
+                  {fmtComma(financialSummary.walletBal, 2)}$
+                </span>
+              </div>
+              <div className="flex flex-col" title="Задействованная маржа во всех открытых позициях">
+                <span className="text-[#8b949e] text-[9px]">Маржа в сделках</span>
+                <span className="text-[#fbbf24] font-semibold tabular-nums">
+                  {fmtComma(financialSummary.usedMargin, 2)}$
+                </span>
+              </div>
+              <div className="flex flex-col" title="Доступная свободная маржа">
+                <span className="text-[#8b949e] text-[9px]">Свободно</span>
+                <span className="text-[#38bdf8] font-semibold tabular-nums">
+                  {fmtComma(financialSummary.freeMargin, 2)}$
+                </span>
+              </div>
+              <div className="flex flex-col" title="Плавающий PnL открытых / Реализованный PnL закрытых">
+                <span className="text-[#8b949e] text-[9px]">PnL Откр / Закр</span>
+                <span className="font-semibold tabular-nums truncate">
+                  <span
+                    className={
+                      financialSummary.openPnlSum >= 0 ? 'text-[#10b981]' : 'text-[#ef4444]'
+                    }
+                  >
+                    {financialSummary.openPnlSum >= 0 ? '+' : ''}
+                    {fmtComma(financialSummary.openPnlSum, 2)}$
+                  </span>
+                  <span className="text-[#6b7280]"> / </span>
+                  <span
+                    className={
+                      financialSummary.closedPnlSum >= 0 ? 'text-[#10b981]' : 'text-[#ef4444]'
+                    }
+                  >
+                    {financialSummary.closedPnlSum >= 0 ? '+' : ''}
+                    {fmtComma(financialSummary.closedPnlSum, 2)}$
+                  </span>
+                </span>
+              </div>
+            </div>
+
             {/* Короткое уведомление о синхронизации с ботом */}
             {statusNotification && (
               <div className="px-2.5 py-1 bg-[#0c2d36] border-b border-[#00a8b5]/50 text-[#7dd3fc] text-[11px] flex items-center gap-1.5">
@@ -540,9 +616,19 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                 {shortPairName(trade.pair)}
                               </td>
 
-                              {/* 3. Size $ */}
+                              {/* 3. Size $ (Маржа) + Live PnL */}
                               <td className="py-1.5 px-1.5 whitespace-nowrap font-mono tabular-nums">
-                                {fmtComma(trade.stake_amount, 1)}$
+                                <div className="text-white">{fmtComma(trade.stake_amount, 2)}$</div>
+                                <div
+                                  className={`text-[9.5px] font-semibold ${
+                                    (trade.net_profit ?? trade.profit_abs ?? 0) >= 0
+                                      ? 'text-[#10b981]'
+                                      : 'text-[#ef4444]'
+                                  }`}
+                                >
+                                  {(trade.net_profit ?? trade.profit_abs ?? 0) >= 0 ? '+' : ''}
+                                  {fmtComma(trade.net_profit ?? trade.profit_abs ?? 0, 2)}$
+                                </div>
                               </td>
 
                               {/* 4. Qty */}
@@ -839,9 +925,19 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                 {shortPairName(trade.pair)}
                               </td>
 
-                              {/* 3. Size $ */}
+                              {/* 3. Size $ (Маржа) + Live PnL */}
                               <td className="py-1.5 px-1.5 whitespace-nowrap font-mono tabular-nums">
-                                {fmtComma(trade.stake_amount, 1)}$
+                                <div className="text-white">{fmtComma(trade.stake_amount, 2)}$</div>
+                                <div
+                                  className={`text-[9.5px] font-semibold ${
+                                    (trade.net_profit ?? trade.profit_abs ?? 0) >= 0
+                                      ? 'text-[#10b981]'
+                                      : 'text-[#ef4444]'
+                                  }`}
+                                >
+                                  {(trade.net_profit ?? trade.profit_abs ?? 0) >= 0 ? '+' : ''}
+                                  {fmtComma(trade.net_profit ?? trade.profit_abs ?? 0, 2)}$
+                                </div>
                               </td>
 
                               {/* 4. Qty */}
@@ -1229,21 +1325,57 @@ export const TradeView: React.FC<TradeViewProps> = ({
                   )}
 
                   {leftTab === 'balance' && balance && (
-                    <div className="text-xs space-y-2">
-                      <div className="font-semibold text-sm">
-                        Всего: {fmtComma(balance.total, 3)} USDT (тест)
-                      </div>
-                      {balance.currencies.map((c) => (
-                        <div
-                          key={c.currency}
-                          className="p-2 bg-[#1c2026] rounded border border-[#2b3036]"
-                        >
-                          <div className="flex justify-between font-mono">
-                            <span>{c.currency}</span>
-                            <span>{fmtComma(c.balance, 3)}</span>
-                          </div>
+                    <div className="text-xs space-y-2 font-mono">
+                      <div className="p-2.5 bg-[#1c2026] rounded border border-[#2b3036] space-y-1.5">
+                        <div className="flex justify-between">
+                          <span className="text-[#8b949e]">Баланс кошелька (USDT):</span>
+                          <span className="text-white font-semibold">
+                            {fmtComma(financialSummary.walletBal, 2)}$
+                          </span>
                         </div>
-                      ))}
+                        <div className="flex justify-between">
+                          <span className="text-[#8b949e]">Задействовано маржи:</span>
+                          <span className="text-[#fbbf24] font-semibold">
+                            {fmtComma(financialSummary.usedMargin, 2)}$
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-[#8b949e]">Свободная маржа:</span>
+                          <span className="text-[#38bdf8] font-semibold">
+                            {fmtComma(financialSummary.freeMargin, 2)}$
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-[#8b949e]">Текущий Эквити:</span>
+                          <span className="text-white font-semibold">
+                            {fmtComma(financialSummary.equityBal, 2)}$
+                          </span>
+                        </div>
+                        <div className="flex justify-between border-t border-[#2b3036] pt-1.5">
+                          <span className="text-[#8b949e]">Плавающий PnL:</span>
+                          <span
+                            className={`font-semibold ${
+                              financialSummary.openPnlSum >= 0 ? 'text-[#10b981]' : 'text-[#ef4444]'
+                            }`}
+                          >
+                            {financialSummary.openPnlSum >= 0 ? '+' : ''}
+                            {fmtComma(financialSummary.openPnlSum, 2)}$
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-[#8b949e]">Закрытый PnL:</span>
+                          <span
+                            className={`font-semibold ${
+                              financialSummary.closedPnlSum >= 0
+                                ? 'text-[#10b981]'
+                                : 'text-[#ef4444]'
+                            }`}
+                          >
+                            {financialSummary.closedPnlSum >= 0 ? '+' : ''}
+                            {fmtComma(financialSummary.closedPnlSum, 2)}$
+                          </span>
+                        </div>
+                      </div>
                     </div>
                   )}
 

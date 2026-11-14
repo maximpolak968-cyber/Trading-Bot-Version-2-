@@ -2256,52 +2256,64 @@ export function findStrongestDcaLevel(
     .map((lvl) => ({ ...lvl, type: targetRole }));
 
   if (validLevels.length > 0) {
-    // Для DCA 1 балансируем 1W->1D GLOBAL и сильные 1D LOCAL уровни (не перепрыгиваем рабочий 1D уровень ради -55% дальнего)
-    const primaryPool = validLevels.filter(
+    // Для DCA 1 в приоритете рабочие уровни в разумной зоне 2.8%..12.5% от точки входа (до зоны ликвидации 25x),
+    // чтобы бот реально усреднял сделку на структурной поддержке/сопротивлении 1D/4H, а не ставил DCA 1 за -45%
+    const reachableLevels = validLevels.filter((l) => {
+      const dist = (Math.abs(referencePrice - l.price) / referencePrice) * 100;
+      return dist >= effectiveMinDistPct && dist <= 12.5;
+    });
+    const candidateLevels = reachableLevels.length > 0 ? reachableLevels : validLevels;
+    const primaryPool = candidateLevels.filter(
       (l) =>
         l.source?.includes('GLOBAL') ||
-        (l.source === '1D_LOCAL' && (l.strength_score >= 8 || l.bounces >= 2 || (l.mirror_retests || 0) > 0))
+        (l.source === '1D_LOCAL' && (l.strength_score >= 6 || l.bounces >= 2 || (l.mirror_retests || 0) > 0)) ||
+        (l.source === '4H_STRUCT' && (l.strength_score >= 5 || l.bounces >= 2))
     );
-    const poolToRank = primaryPool.length > 0 ? primaryPool : validLevels;
+    const poolToRank = primaryPool.length > 0 ? primaryPool : candidateLevels;
     const bestFirst = poolToRank.reduce((best, cur) => {
       const distBest = (Math.abs(referencePrice - best.price) / referencePrice) * 100;
       const distCur = (Math.abs(referencePrice - cur.price) / referencePrice) * 100;
-      const rankBest = best.strength_score / (1 + distBest * 0.03);
-      const rankCur = cur.strength_score / (1 + distCur * 0.03);
+      const rankBest = best.strength_score / (1 + distBest * 0.12);
+      const rankCur = cur.strength_score / (1 + distCur * 0.12);
       return rankCur > rankBest ? cur : best;
     });
 
-    // Для DCA 2 берем АБСОЛЮТНЫЙ исторический пик (для SHORT) или АБСОЛЮТНОЕ дно (для LONG) за всю доступную историю 1D+4H
+    // Для DCA 2 ищем следующий сильный уровень 1D/4H дальше DCA 1 (в пределах 2.8%..22% от DCA 1), либо исторический экстремум
     const absExtreme = isShort ? absHighest : absLowest;
     let secondPrice = 0;
 
-    if (
+    const furtherCandidates = validLevels
+      .filter((l) => {
+        const distFromFirst = isShort
+          ? ((l.price - bestFirst.price) / bestFirst.price) * 100
+          : ((bestFirst.price - l.price) / bestFirst.price) * 100;
+        return distFromFirst >= effectiveMinDistPct && distFromFirst <= 22.0;
+      })
+      .sort((a, b) => {
+        const distA = (Math.abs(bestFirst.price - a.price) / bestFirst.price) * 100;
+        const distB = (Math.abs(bestFirst.price - b.price) / bestFirst.price) * 100;
+        const rankA = a.strength_score / (1 + distA * 0.08);
+        const rankB = b.strength_score / (1 + distB * 0.08);
+        return rankB - rankA;
+      });
+
+    if (furtherCandidates.length > 0) {
+      secondPrice = Number(furtherCandidates[0].price.toPrecision(7));
+    } else if (
       Number.isFinite(absExtreme) &&
       absExtreme > 0 &&
       (isShort
-        ? absExtreme > bestFirst.price * 1.005
-        : absExtreme < bestFirst.price * 0.995)
+        ? absExtreme > bestFirst.price * 1.015 && absExtreme <= bestFirst.price * 1.25
+        : absExtreme < bestFirst.price * 0.985 && absExtreme >= bestFirst.price * 0.75)
     ) {
       secondPrice = Number(absExtreme.toPrecision(7));
     } else {
-      const furtherCandidates = validLevels
-        .filter((l) => {
-          const distFromFirst = isShort
-            ? ((l.price - bestFirst.price) / bestFirst.price) * 100
-            : ((bestFirst.price - l.price) / bestFirst.price) * 100;
-          return distFromFirst >= effectiveMinDistPct;
-        })
-        .sort((a, b) => (isShort ? b.price - a.price : a.price - b.price));
-
-      secondPrice =
-        furtherCandidates.length > 0
-          ? Number(furtherCandidates[0].price.toPrecision(7))
-          : Number(
-              (
-                bestFirst.price *
-                (isShort ? 1 + effectiveMinDistPct / 100 : 1 - effectiveMinDistPct / 100)
-              ).toPrecision(7)
-            );
+      secondPrice = Number(
+        (
+          bestFirst.price *
+          (isShort ? 1 + Math.max(0.035, effectiveMinDistPct / 100) : 1 - Math.max(0.035, effectiveMinDistPct / 100))
+        ).toPrecision(7)
+      );
     }
 
     return {
@@ -2875,7 +2887,8 @@ export function canExecuteDca(
 
   // 4. Portfolio Margin Guard: max margin share on a single coin (<= 20%)
   const lev = Math.max(1, params.leverage || config.leverage);
-  const minDcaStake = Math.max(5, config.min_stake_amount || 5);
+  // Минимальный объём ордера на фьючерсах биржи = 5.5 USDT нотионала (при 25x плече это ~0.22 USDT маржи, минимум 0.50 USDT маржи)
+  const minExchangeMargin = Math.max(0.5, Number((5.5 / lev).toFixed(2)));
   const currentPairNotional = params.currentAmount * params.currentPrice;
   const currentPairMargin = currentPairNotional / lev;
   const maxPairMarginLimit = (maxPairMarginPct / 100.0) * totalBalance;
@@ -2885,9 +2898,12 @@ export function canExecuteDca(
     config.dca_scale_mode === 'linear' ? baseAmt : params.currentAmount;
   const nextAddNotional = nextAddAmount * params.currentPrice;
   const rawNextAddMargin = nextAddNotional / lev;
-  const effectiveNextMargin = Math.max(minDcaStake, Math.min(rawNextAddMargin, remainingPairMargin));
+  const effectiveNextMargin = Math.max(
+    minExchangeMargin,
+    Math.min(rawNextAddMargin, remainingPairMargin)
+  );
 
-  if (remainingPairMargin < minDcaStake) {
+  if (remainingPairMargin < minExchangeMargin) {
     const curSharePct = (currentPairMargin / totalBalance) * 100.0;
     return {
       allowed: false,
@@ -2899,10 +2915,10 @@ export function canExecuteDca(
 
   // 5. Free balance check
   const availableBalance = Math.max(0, totalBalance - params.usedMarginUsdt);
-  if (availableBalance < effectiveNextMargin) {
+  if (availableBalance < minExchangeMargin) {
     return {
       allowed: false,
-      reason: `Не хватает свободной маржи: нужно ~${effectiveNextMargin.toFixed(2)} USDT, доступно ${availableBalance.toFixed(2)} USDT`,
+      reason: `Не хватает свободной маржи: нужно минимум ${minExchangeMargin.toFixed(2)} USDT, доступно ${availableBalance.toFixed(2)} USDT`,
       multiplier: currentMultiplier,
       liquidationDistancePct: 100,
     };
@@ -2962,8 +2978,10 @@ export function calculateDynamicDcaAmount(params: {
   minStakeUsdt?: number;
 }): { addAmount: number; addStake: number; targetAvgPrice: number; pullDistancePct: number } {
   const lev = Math.max(1, params.leverage);
-  const minStake = Math.max(5, params.minStakeUsdt || 5);
-  const totalBalance = Math.max(minStake, params.totalBalanceUsdt);
+  // Минимальный ордер на бирже 5.5 USDT нотионала (~0.50 USDT маржи при 25x)
+  const minExchangeMargin = Math.max(0.5, Number((5.5 / lev).toFixed(2)));
+  const preferredMinStake = Math.max(minExchangeMargin, Math.min(params.minStakeUsdt || 5, (params.totalBalanceUsdt || 100) * 0.05));
+  const totalBalance = Math.max(minExchangeMargin, params.totalBalanceUsdt);
   const freeMargin = Math.max(0, totalBalance - params.usedMarginUsdt);
   const maxPairMarginLimit = ((params.maxPairMarginPct || 20.0) / 100) * totalBalance;
 
@@ -2971,12 +2989,12 @@ export function calculateDynamicDcaAmount(params: {
   const currentPairMargin = currentPairNotional / lev;
   const remainingPairMargin = Math.max(0, maxPairMarginLimit - currentPairMargin);
 
-  // Reserve margin for other coins: allocate at most 50% of free margin or fair share, never exceeding remainingPairMargin
+  // Reserve margin for other coins: allocate up to 60% of free margin or fair share, never exceeding remainingPairMargin
   const fairShareMargin = freeMargin / Math.max(1, params.otherActiveCoinsCount + 1);
-  const budgetPool = Math.min(freeMargin * 0.6, Math.max(minStake, fairShareMargin * 1.5));
+  const budgetPool = Math.min(freeMargin * 0.75, Math.max(preferredMinStake, fairShareMargin * 1.5));
   const maxSafeMarginForThisStep = Math.min(remainingPairMargin, budgetPool, freeMargin);
 
-  if (maxSafeMarginForThisStep < minStake || params.currentPrice <= 0) {
+  if (maxSafeMarginForThisStep < minExchangeMargin || params.currentPrice <= 0) {
     return {
       addAmount: 0,
       addStake: 0,
@@ -3001,7 +3019,7 @@ export function calculateDynamicDcaAmount(params: {
   const desiredMargin = (desiredAddAmount * params.currentPrice) / lev;
   const finalStake = Math.min(
     maxSafeMarginForThisStep,
-    Math.max(minStake, desiredMargin)
+    Math.max(minExchangeMargin, desiredMargin)
   );
   const finalAddAmount = Number(
     ((finalStake * lev) / Math.max(1e-8, params.currentPrice)).toFixed(4)

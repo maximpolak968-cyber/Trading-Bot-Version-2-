@@ -515,7 +515,7 @@ export default function App() {
       if (snap.profit) setProfit(snap.profit);
       if (Array.isArray(snap.daily)) setDaily(snap.daily);
       if (Array.isArray(snap.logs)) setLogs(snap.logs);
-      if (authRoleRef.current === 'owner' && Array.isArray(snap.accounts)) {
+      if (Array.isArray(snap.accounts)) {
         setAccounts(snap.accounts);
       }
     };
@@ -596,10 +596,17 @@ export default function App() {
           const byPairLatest = new Map<string, any>();
           for (const tk of msg.tickers) {
             if (!tk || !tk.pair) continue;
-            const exKey = `${String(tk.exchange || '').toLowerCase()}:${tk.pair}`;
+            const exName = String(tk.exchange || '').toLowerCase();
+            const exKey = `${exName}:${tk.pair}`;
             byExAndPair.set(exKey, tk);
             const prevTk = byPairLatest.get(tk.pair);
-            if (!prevTk || Number(tk.updatedAt || 0) >= Number(prevTk.updatedAt || 0)) {
+            // Prefer Bybit as canonical fallback in byPairLatest so pair prices don't oscillate between two exchanges
+            if (
+              !prevTk ||
+              exName === 'bybit' ||
+              (String(prevTk.exchange || '').toLowerCase() !== 'bybit' &&
+                Number(tk.updatedAt || 0) >= Number(prevTk.updatedAt || 0))
+            ) {
               byPairLatest.set(tk.pair, tk);
             }
           }
@@ -608,7 +615,7 @@ export default function App() {
             if (!prev || !Array.isArray(prev.pair_metrics)) return prev;
             let changed = false;
             const nextMetrics = prev.pair_metrics.map((cur) => {
-              const tk = byPairLatest.get(cur.pair);
+              const tk = byExAndPair.get(`bybit:${cur.pair}`) || byPairLatest.get(cur.pair);
               const livePx = Number(tk?.markPrice || tk?.price || 0);
               if (!tk || livePx <= 0) return cur;
               changed = true;
@@ -637,7 +644,12 @@ export default function App() {
             let anyChanged = false;
             const updated = prev.map((t) => {
               const trEx = String(t.exchange || '').toLowerCase();
-              const tk = (trEx ? byExAndPair.get(`${trEx}:${t.pair}`) : null) || byPairLatest.get(t.pair);
+              const tk =
+                (trEx === 'binance' || trEx === 'bybit'
+                  ? byExAndPair.get(`${trEx}:${t.pair}`)
+                  : null) ||
+                byExAndPair.get(`bybit:${t.pair}`) ||
+                byPairLatest.get(t.pair);
               if (!tk) return t;
               const liveMark = Number(tk.markPrice > 0 ? tk.markPrice : tk.price || 0);
               if (!Number.isFinite(liveMark) || liveMark <= 0 || liveMark === t.current_rate) {
@@ -652,6 +664,7 @@ export default function App() {
               return {
                 ...t,
                 current_rate: liveMark,
+                gross_profit: Number(gross.toFixed(4)),
                 profit_abs: Number(net.toFixed(3)),
                 net_profit: Number(net.toFixed(3)),
                 profit_pct: Number(pct.toFixed(2)),
@@ -663,25 +676,29 @@ export default function App() {
           });
 
           if (dynamicUpdateRef.current) {
-            const activeTick = byPairLatest.get(selectedPairRef.current);
-            const tickPx = Number(activeTick?.price || activeTick?.markPrice || 0);
-            if (tickPx > 0) {
-              setDataframe((prev) => {
-                if (!prev || prev.pair !== selectedPairRef.current || !prev.data.length) return prev;
-                const nextData = prev.data.slice();
-                const lastIdx = nextData.length - 1;
-                const row = nextData[lastIdx];
-                if (!Array.isArray(row)) return prev;
-                const updatedRow = row.slice();
-                const curHigh = Number(updatedRow[2] || tickPx);
-                const curLow = Number(updatedRow[3] || tickPx);
-                updatedRow[2] = Math.max(curHigh, tickPx);
-                updatedRow[3] = Math.min(curLow, tickPx);
-                updatedRow[4] = tickPx;
-                nextData[lastIdx] = updatedRow;
-                return { ...prev, data: nextData };
-              });
-            }
+            setDataframe((prev) => {
+              if (!prev || prev.pair !== selectedPairRef.current || !prev.data.length) return prev;
+              const dfEx = String(prev.exchange_source || '')
+                .toLowerCase()
+                .includes('binance')
+                ? 'binance'
+                : 'bybit';
+              const activeTick = byExAndPair.get(`${dfEx}:${selectedPairRef.current}`);
+              const tickPx = Number(activeTick?.price || activeTick?.markPrice || 0);
+              if (!(tickPx > 0)) return prev;
+              const nextData = prev.data.slice();
+              const lastIdx = nextData.length - 1;
+              const row = nextData[lastIdx];
+              if (!Array.isArray(row)) return prev;
+              const updatedRow = row.slice();
+              const curHigh = Number(updatedRow[2] || tickPx);
+              const curLow = Number(updatedRow[3] || tickPx);
+              updatedRow[2] = Math.max(curHigh, tickPx);
+              updatedRow[3] = Math.min(curLow, tickPx);
+              updatedRow[4] = tickPx;
+              nextData[lastIdx] = updatedRow;
+              return { ...prev, data: nextData };
+            });
           }
           return;
         }
@@ -692,6 +709,14 @@ export default function App() {
           if (c.pair !== selectedPairRef.current || c.interval !== timeframeRef.current) return;
           setDataframe((prev) => {
             if (!prev || prev.pair !== c.pair || prev.timeframe !== c.interval || !prev.data.length) {
+              return prev;
+            }
+            const dfEx = String(prev.exchange_source || '')
+              .toLowerCase()
+              .includes('binance')
+              ? 'binance'
+              : 'bybit';
+            if (c.exchange && c.exchange !== dfEx) {
               return prev;
             }
             const nextData = prev.data.slice();
@@ -1648,13 +1673,13 @@ export default function App() {
 
         {/* Справа: Тумблер владельца «Стоп новые сделки», статус бота и профиль */}
         <div className="flex items-center gap-2.5">
-          {authState.role === 'owner' && (
+          {authState.authenticated && (
             <button
               type="button"
               onClick={handleTogglePauseNewEntries}
               title={
                 botConfig?.pause_new_entries
-                  ? 'Новые сделки остановлены владельцем (бот продолжает усреднять DCA и закрывать в плюс открытые сделки). Нажмите, чтобы снова разрешить открытие новых сделок.'
+                  ? 'Новые сделки остановлены (бот продолжает усреднять DCA и закрывать в плюс открытые сделки). Нажмите, чтобы снова разрешить открытие новых сделок.'
                   : 'Нажмите, чтобы бот прекратил открывать новые сделки (текущие сделки продолжат усредняться и закрываться в плюс).'
               }
               className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-[4px] border text-[11px] font-semibold transition-colors ${

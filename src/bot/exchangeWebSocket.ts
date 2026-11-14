@@ -373,7 +373,12 @@ function emitTickerUpdate(ticker: LiveWsTicker): void {
     marketType: ticker.marketType || 'futures',
   };
   wsTickersByExchangeAndSymbol.set(exKey, merged);
-  wsTickersBySymbol.set(merged.symbol, merged);
+  // Prevent dual-exchange price twitching on default symbol lookup:
+  // prefer Bybit Futures if fresh (<10s), otherwise fall back to Binance Futures
+  const bybitTick = wsTickersByExchangeAndSymbol.get(`bybit:${merged.symbol}`);
+  if (ex === 'bybit' || !bybitTick || Date.now() - bybitTick.updatedAt > 10_000) {
+    wsTickersBySymbol.set(merged.symbol, merged);
+  }
   totalWsTickerEvents++;
   lastWsEventTimestamp = Date.now();
   updatePositionsMarkPriceFromTicker(merged.symbol, merged.markPrice || merged.price, ex);
@@ -1578,8 +1583,8 @@ export async function ensureBinancePrivateUserStream(
             }
           }
 
-          // 2. Update positions (USDT and USDC futures)
-          if (Array.isArray(msg.a.P)) {
+          // 2. Update positions (USDT and USDC futures delta from ACCOUNT_UPDATE)
+          if (Array.isArray(msg.a.P) && msg.a.P.length > 0) {
             const posMap = new Map<string, ExchangePositionItem>();
             for (const p of state.positions) {
               posMap.set(`${p.symbol}:${p.is_short ? 'SHORT' : 'LONG'}`, p);
@@ -1626,12 +1631,13 @@ export async function ensureBinancePrivateUserStream(
                 const lev = prevPos?.leverage || 25;
                 const prevSizeChanged = !prevPos || Math.abs(prevPos.size - size) > 1e-6;
                 const rawIw = Number(rawP.iw || 0);
+                const computedCrossMargin = Number(((size * (markPrice > 0 ? markPrice : entryPrice)) / lev).toFixed(2));
                 const marginUsdt =
                   rawIw > 0
                     ? Number(rawIw.toFixed(2))
                     : !prevSizeChanged && prevPos?.margin_usdt && prevPos.margin_usdt > 0
                     ? prevPos.margin_usdt
-                    : Number(((size * entryPrice) / lev).toFixed(2));
+                    : Math.max(0.01, computedCrossMargin);
                 const unrealizedPnl = Number(rawP.up ?? prevPos?.unrealized_pnl ?? 0);
                 const updatedPos: ExchangePositionItem = {
                   pair: cleanSymbolToPair(sym),
@@ -1652,12 +1658,17 @@ export async function ensureBinancePrivateUserStream(
             }
 
             state.positions = Array.from(posMap.values());
+            state.positionsSynced = true;
             state.unrealizedPnlUsdt = Number(
               state.positions.reduce((s, p) => s + Number(p.unrealized_pnl || 0), 0).toFixed(4)
             );
-            state.usedMarginUsdt = Number(
+            const sumPosMargin = Number(
               state.positions.reduce((s, p) => s + Number(p.margin_usdt || 0), 0).toFixed(2)
             );
+            state.usedMarginUsdt =
+              state.positions.length > 0
+                ? Math.max(sumPosMargin, state.usedMarginUsdt > 0 && msg.a.P.length < state.positions.length ? state.usedMarginUsdt : sumPosMargin)
+                : 0;
             state.availableBalanceUsdt = Number(
               Math.max(0, state.walletBalanceUsdt - state.usedMarginUsdt).toFixed(2)
             );
@@ -2071,6 +2082,7 @@ export function ensureBybitPrivateUserStream(
           }
 
           state.positions = Array.from(posMap.values());
+          state.positionsSynced = true;
           state.unrealizedPnlUsdt = Number(
             state.positions.reduce((s, p) => s + Number(p.unrealized_pnl || 0), 0).toFixed(4)
           );
