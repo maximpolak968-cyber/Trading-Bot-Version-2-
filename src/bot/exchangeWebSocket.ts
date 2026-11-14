@@ -48,6 +48,7 @@ export interface WsAccountLiveState {
   positions: ExchangePositionItem[];
   closedPnl: ExchangeClosedPnlItem[];
   wsConnected: boolean;
+  positionsSynced?: boolean;
   updatedAt: number;
   lastRestBootstrapAt: number;
 }
@@ -1386,10 +1387,24 @@ const activePrivateSockets = new Map<
   string,
   {
     ws: WebSocket;
+    authenticated: boolean;
     keepaliveTimer?: ReturnType<typeof setInterval>;
     reconnectTimer?: ReturnType<typeof setTimeout>;
   }
 >();
+
+const privateBybitTimeOffsetByBase = new Map<string, number>();
+
+export function setBybitWsTimeOffset(baseUrl: string, offsetMs: number): void {
+  const wsUrl = baseUrl.includes('testnet')
+    ? 'wss://stream-testnet.bybit.com/v5/private'
+    : baseUrl.includes('demo')
+    ? 'wss://stream-demo.bybit.com/v5/private'
+    : 'wss://stream.bybit.com/v5/private';
+  if (Number.isFinite(offsetMs)) {
+    privateBybitTimeOffsetByBase.set(wsUrl, offsetMs);
+  }
+}
 
 const registeredPrivateStreams = new Map<
   string,
@@ -1424,7 +1439,7 @@ export function isPrivateWsStreamOpen(
 ): boolean {
   const entry = activePrivateSockets.get(`${exchange}:${apiKey}`);
   if (!entry || !entry.ws) return false;
-  return entry.ws.readyState === 1;
+  return entry.ws.readyState === 1 && entry.authenticated === true;
 }
 
 export function getWsAccountLiveState(
@@ -1517,9 +1532,11 @@ export async function ensureBinancePrivateUserStream(
       rpc.request('userDataStream.ping', { apiKey }, undefined, 5000).catch(() => {});
     }, 25 * 60_000);
 
-    activePrivateSockets.set(sockKey, { ws, keepaliveTimer });
+    activePrivateSockets.set(sockKey, { ws, authenticated: false, keepaliveTimer });
 
     ws.onopen = () => {
+      const entry = activePrivateSockets.get(sockKey);
+      if (entry) entry.authenticated = true;
       const reg = registeredPrivateStreams.get(sockKey);
       if (reg) reg.retries = 0;
       const state = wsAccountStateByKey.get(apiKey);
@@ -1798,10 +1815,11 @@ export function ensureBybitPrivateUserStream(
       }
     }, 20_000);
 
-    activePrivateSockets.set(sockKey, { ws, keepaliveTimer });
+    activePrivateSockets.set(sockKey, { ws, authenticated: false, keepaliveTimer });
 
     ws.onopen = () => {
-      const expires = Date.now() + 10_000;
+      const offsetMs = privateBybitTimeOffsetByBase.get(wsUrl) || 0;
+      const expires = Date.now() + offsetMs + 15_000;
       const signature = crypto
         .createHmac('sha256', apiSecret)
         .update(`GET/realtime${expires}`)
@@ -1818,21 +1836,53 @@ export function ensureBybitPrivateUserStream(
         const msg = JSON.parse(String(event.data));
         if (!msg) return;
 
-        if (msg.op === 'auth' && msg.success === true) {
-          const reg = registeredPrivateStreams.get(sockKey);
-          if (reg) reg.retries = 0;
-          const state = wsAccountStateByKey.get(apiKey);
-          if (state) {
-            state.wsConnected = true;
-            state.updatedAt = Date.now();
-            emitAccountUpdate(state);
+        if (msg.op === 'auth') {
+          if (msg.success === true) {
+            const entry = activePrivateSockets.get(sockKey);
+            if (entry) entry.authenticated = true;
+            const reg = registeredPrivateStreams.get(sockKey);
+            if (reg) reg.retries = 0;
+            const state = wsAccountStateByKey.get(apiKey);
+            if (state) {
+              state.wsConnected = true;
+              state.updatedAt = Date.now();
+              emitAccountUpdate(state);
+            }
+            ws.send(
+              JSON.stringify({
+                op: 'subscribe',
+                args: ['position', 'wallet', 'execution', 'order'],
+              })
+            );
+          } else {
+            const entry = activePrivateSockets.get(sockKey);
+            if (entry) entry.authenticated = false;
+            const state = wsAccountStateByKey.get(apiKey);
+            if (state) state.wsConnected = false;
+            try {
+              const restBase = wsUrl.includes('testnet')
+                ? 'https://api-testnet.bybit.com'
+                : wsUrl.includes('demo')
+                ? 'https://api-demo.bybit.com'
+                : 'https://api.bybit.com';
+              void fetch(`${restBase}/v5/market/time`)
+                .then((r) => r.json())
+                .then((d: any) => {
+                  const srvMs = Number(d?.time || (d?.result?.timeSecond ? Number(d.result.timeSecond) * 1000 : 0));
+                  if (srvMs > 0) {
+                    privateBybitTimeOffsetByBase.set(wsUrl, srvMs - Date.now());
+                  }
+                })
+                .catch(() => {});
+            } catch {
+              // ignore
+            }
+            try {
+              ws.close();
+            } catch {
+              // ignore
+            }
           }
-          ws.send(
-            JSON.stringify({
-              op: 'subscribe',
-              args: ['position', 'wallet', 'execution', 'order'],
-            })
-          );
           return;
         }
 

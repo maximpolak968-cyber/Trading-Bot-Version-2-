@@ -17,6 +17,7 @@ import { ExchangeAccount, SupportedExchange } from '../types/frequi';
 
 interface ExchangeAccountsViewProps {
   accounts: ExchangeAccount[];
+  authToken?: string;
   onAddAccount: (payload: {
     name: string;
     owner_label: string;
@@ -84,6 +85,7 @@ const EXCHANGE_META: Record<
 
 export const ExchangeAccountsView: React.FC<ExchangeAccountsViewProps> = ({
   accounts,
+  authToken,
   onAddAccount,
   onToggleAccount,
   onDeleteAccount,
@@ -107,7 +109,10 @@ export const ExchangeAccountsView: React.FC<ExchangeAccountsViewProps> = ({
     try {
       const res = await fetch('/api/v1/accounts/test-connection', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
         body: JSON.stringify({ account_id: acc.id, is_testnet: acc.is_testnet }),
       });
       const data = await res.json();
@@ -447,16 +452,14 @@ export const ExchangeAccountsView: React.FC<ExchangeAccountsViewProps> = ({
                   return (
                     <tr key={acc.id} className="hover:bg-[#1e222d]/60 transition-colors">
                       <td className="py-2.5 px-4 font-semibold text-white">
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex items-center gap-1.5 flex-wrap">
                           <span>{acc.name}</span>
-                          {acc.is_owner && (
-                            <span className="px-1.5 py-0.2 rounded bg-[#00a8b5]/20 border border-[#00a8b5]/40 text-[#38bdf8] text-[9.5px] font-mono">
-                              MASTER
-                            </span>
-                          )}
+                          <span className="px-1.5 py-0.2 rounded bg-[#089981]/15 border border-[#089981]/40 text-[#10b981] text-[9.5px] font-mono">
+                            АВТОНОМНЫЙ
+                          </span>
                         </div>
                         <div className="text-[10.5px] font-mono text-[#9ca3af]">
-                          {acc.api_key_masked}
+                          {acc.api_key_masked} · Сделок: {acc.open_trades_count ?? 0}
                         </div>
                       </td>
                       <td className="py-2.5 px-4">

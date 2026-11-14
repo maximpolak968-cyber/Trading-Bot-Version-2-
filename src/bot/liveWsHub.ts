@@ -2,8 +2,10 @@ import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 
 export interface LiveHubScopeInfo {
-  accountId: string;
-  isClient: boolean;
+  authenticated: boolean;
+  userId: string;
+  role: 'owner' | 'client';
+  accountId?: string;
 }
 
 export interface LiveHubSnapshot {
@@ -24,14 +26,18 @@ export interface LiveHubProviders {
     clientCode?: string;
     accountId?: string;
   }) => LiveHubScopeInfo;
-  buildSnapshotForScope: (accountId: string, isClient: boolean) => Promise<LiveHubSnapshot>;
+  buildSnapshotForScope: (scope: LiveHubScopeInfo) => Promise<LiveHubSnapshot>;
   onClientPairSubscribe?: (pair: string, timeframe: string) => void;
+  resolveTradeUserId?: (trade: any) => string;
+  resolveScopeUserId?: (scopeOrAccountId: string) => string | null;
 }
 
 interface ConnectedUiClient {
   ws: WebSocket;
-  accountId: string;
-  isClient: boolean;
+  authenticated: boolean;
+  userId: string;
+  role: 'owner' | 'client';
+  accountId?: string;
   subscribedPair: string;
   subscribedTimeframe: string;
   isAlive: boolean;
@@ -71,14 +77,14 @@ let wssInstance: WebSocketServer | null = null;
 const pendingTickerUpdates = new Map<string, LiveTickerFrame>();
 let tickerFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
-// Coalesced state:sync scheduler per scope (every 40ms max)
-const pendingScopeSyncs = new Set<string>();
+// Coalesced state:sync scheduler per userId (every 50ms max)
+const pendingUserSyncs = new Set<string>();
 let stateSyncFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
 export function getConnectedUiClientsCount(): number {
   let count = 0;
   for (const c of uiClients) {
-    if (c.ws.readyState === WebSocket.OPEN) count++;
+    if (c.ws.readyState === WebSocket.OPEN && c.authenticated) count++;
   }
   return count;
 }
@@ -167,10 +173,22 @@ export function attachLiveWebSocketHub(
       accountId: reqAccountId,
     });
 
+    if (!scope.authenticated) {
+      safeSend(ws, { type: 'auth:error', error: 'Unauthorized' });
+      try {
+        ws.close(4001, 'Unauthorized');
+      } catch {
+        // ignore close error
+      }
+      return;
+    }
+
     const client: ConnectedUiClient = {
       ws,
+      authenticated: scope.authenticated,
+      userId: scope.userId,
+      role: scope.role,
       accountId: scope.accountId,
-      isClient: scope.isClient,
       subscribedPair: pair,
       subscribedTimeframe: timeframe,
       isAlive: true,
@@ -197,20 +215,43 @@ export function attachLiveWebSocketHub(
           if (typeof msg.timeframe === 'string' && msg.timeframe.trim()) {
             client.subscribedTimeframe = msg.timeframe.trim();
           }
-          if (typeof msg.token === 'string' || typeof msg.client === 'string') {
+          if (
+            typeof msg.token === 'string' ||
+            typeof msg.client === 'string' ||
+            typeof msg.account_id === 'string'
+          ) {
             const nextScope = providers.resolveScopeFromAuth({
               token: typeof msg.token === 'string' ? msg.token : token,
               clientCode: typeof msg.client === 'string' ? msg.client : clientCode,
               accountId: typeof msg.account_id === 'string' ? msg.account_id : reqAccountId,
             });
+            if (!nextScope.authenticated) {
+              client.authenticated = false;
+              safeSend(ws, { type: 'auth:error', error: 'Unauthorized' });
+              uiClients.delete(client);
+              try {
+                ws.close(4001, 'Unauthorized');
+              } catch {
+                // ignore
+              }
+              return;
+            }
+            client.authenticated = nextScope.authenticated;
+            client.userId = nextScope.userId;
+            client.role = nextScope.role;
             client.accountId = nextScope.accountId;
-            client.isClient = nextScope.isClient;
           }
           providers.onClientPairSubscribe?.(client.subscribedPair, client.subscribedTimeframe);
           return;
         }
         if (msg.op === 'resync') {
-          const snap = await providers.buildSnapshotForScope(client.accountId, client.isClient);
+          if (!client.authenticated) return;
+          const snap = await providers.buildSnapshotForScope({
+            authenticated: client.authenticated,
+            userId: client.userId,
+            role: client.role,
+            accountId: client.accountId,
+          });
           safeSend(ws, { type: 'snapshot', data: snap });
         }
       } catch {
@@ -228,7 +269,7 @@ export function attachLiveWebSocketHub(
 
     // Send initial authoritative snapshot immediately on connect
     try {
-      const snap = await providers.buildSnapshotForScope(client.accountId, client.isClient);
+      const snap = await providers.buildSnapshotForScope(scope);
       safeSend(ws, { type: 'snapshot', data: snap });
     } catch {
       // ignore initial build error
@@ -254,7 +295,9 @@ export function queueLiveTickerBroadcast(frame: LiveTickerFrame): void {
       tickers: items,
     };
     for (const c of uiClients) {
-      safeSend(c.ws, payload);
+      if (c.authenticated) {
+        safeSend(c.ws, payload);
+      }
     }
   }, 100);
 }
@@ -268,6 +311,7 @@ export function broadcastLiveCandleTick(frame: LiveCandleFrame): void {
   };
   for (const c of uiClients) {
     if (
+      c.authenticated &&
       c.subscribedPair === frame.pair &&
       c.subscribedTimeframe === frame.interval
     ) {
@@ -281,53 +325,77 @@ export function broadcastTradeLifecycleEvent(
   trade: any
 ): void {
   if (getConnectedUiClientsCount() === 0 || !trade) return;
-  const targetAccId = trade.account_id || 'master';
+  const targetUserId =
+    hubProviders?.resolveTradeUserId?.(trade) || String(trade.user_id || 'owner');
   const payload = {
     type: eventName,
     ts: Date.now(),
     trade,
   };
   for (const c of uiClients) {
-    if (c.accountId === targetAccId) {
-      safeSend(c.ws, payload);
-    }
+    if (!c.authenticated || c.userId !== targetUserId) continue;
+    if (c.accountId && trade.account_id && c.accountId !== trade.account_id) continue;
+    safeSend(c.ws, payload);
   }
-  scheduleScopeStateSync(targetAccId);
+  scheduleScopeStateSync(targetUserId);
 }
 
-export function scheduleScopeStateSync(accountId?: string): void {
+export function scheduleScopeStateSync(scopeOrAccountOrUserId?: string): void {
   if (getConnectedUiClientsCount() === 0 || !hubProviders) return;
-  if (accountId) {
-    pendingScopeSyncs.add(accountId);
+  if (scopeOrAccountOrUserId) {
+    const resolvedUserId =
+      hubProviders.resolveScopeUserId?.(scopeOrAccountOrUserId) || scopeOrAccountOrUserId;
+    if (resolvedUserId) {
+      pendingUserSyncs.add(resolvedUserId);
+    }
   } else {
     for (const c of uiClients) {
-      pendingScopeSyncs.add(c.accountId);
+      if (c.authenticated) {
+        pendingUserSyncs.add(c.userId);
+      }
     }
   }
   if (stateSyncFlushTimer) return;
   stateSyncFlushTimer = setTimeout(async () => {
     stateSyncFlushTimer = null;
-    if (!hubProviders || pendingScopeSyncs.size === 0) {
-      pendingScopeSyncs.clear();
+    if (!hubProviders || pendingUserSyncs.size === 0) {
+      pendingUserSyncs.clear();
       return;
     }
-    const scopes = Array.from(pendingScopeSyncs);
-    pendingScopeSyncs.clear();
+    const targetUsers = Array.from(pendingUserSyncs);
+    pendingUserSyncs.clear();
 
-    for (const accId of scopes) {
+    for (const userId of targetUsers) {
       const matchingClients = Array.from(uiClients).filter(
-        (c) => c.ws.readyState === WebSocket.OPEN && c.accountId === accId
+        (c) => c.ws.readyState === WebSocket.OPEN && c.authenticated && c.userId === userId
       );
       if (matchingClients.length === 0) continue;
-      const isClient = matchingClients[0].isClient;
-      try {
-        const snap = await hubProviders.buildSnapshotForScope(accId, isClient);
-        const msg = { type: 'state:sync', ts: Date.now(), data: snap };
-        for (const c of matchingClients) {
-          safeSend(c.ws, msg);
+
+      // Group by optional accountId restriction (legacy ?client= tokens)
+      const bySubScope = new Map<string, ConnectedUiClient[]>();
+      for (const c of matchingClients) {
+        const key = `${c.role}:${c.accountId || ''}`;
+        const list = bySubScope.get(key) || [];
+        list.push(c);
+        bySubScope.set(key, list);
+      }
+
+      for (const clients of bySubScope.values()) {
+        const rep = clients[0];
+        try {
+          const snap = await hubProviders.buildSnapshotForScope({
+            authenticated: true,
+            userId: rep.userId,
+            role: rep.role,
+            accountId: rep.accountId,
+          });
+          const msg = { type: 'state:sync', ts: Date.now(), data: snap };
+          for (const c of clients) {
+            safeSend(c.ws, msg);
+          }
+        } catch {
+          // ignore snapshot error
         }
-      } catch {
-        // ignore snapshot error
       }
     }
   }, 50);

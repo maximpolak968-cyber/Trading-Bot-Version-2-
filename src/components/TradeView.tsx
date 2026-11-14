@@ -82,6 +82,7 @@ interface TradeViewProps {
   rightPanelTab?: RightPanelSection;
   onChangeRightPanelTab?: (tab: RightPanelSection) => void;
   statusNotification?: string | null;
+  isOwner?: boolean;
 }
 
 function formatSmartNumber(val: number): string {
@@ -163,6 +164,7 @@ export const TradeView: React.FC<TradeViewProps> = ({
   rightPanelTab: externalTab,
   onChangeRightPanelTab,
   statusNotification,
+  isOwner = true,
 }) => {
   // Collapsible right drawer state (TradingView-style right panel)
   const [isRightPanelOpen, setIsRightPanelOpen] = useState<boolean>(true);
@@ -313,49 +315,53 @@ export const TradeView: React.FC<TradeViewProps> = ({
               <span className="text-[12px] font-semibold text-white">Сделки и уровни (↕ перетаскивание на графике)</span>
 
               <div className="flex items-center gap-1">
-                <button
-                  type="button"
-                  onClick={() => onBotCommand('start')}
-                  title="Запустить бота"
-                  className="w-6 h-6 flex items-center justify-center rounded-[3px] bg-[#21252b] hover:bg-[#2c323a] border border-[#383e48] text-[#cfd6df]"
-                >
-                  <Play className="w-3 h-3 fill-current" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onBotCommand('stop')}
-                  title="Остановить бота"
-                  className="w-6 h-6 flex items-center justify-center rounded-[3px] bg-[#21252b] hover:bg-[#2c323a] border border-[#383e48] text-[#cfd6df]"
-                >
-                  <Square className="w-3 h-3 fill-current" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onBotCommand('stopbuy')}
-                  title={
-                    botConfig?.pause_new_entries
-                      ? 'Новые сделки остановлены (DCA и TP текущих активны). Нажмите, чтобы снова разрешить открытие новых сделок'
-                      : 'Остановить открытие новых сделок (бот продолжит усреднять DCA и закрывать в плюс текущие позиции)'
-                  }
-                  className={`px-1.5 h-6 flex items-center gap-1 rounded-[3px] border text-[10px] font-semibold transition-colors ${
-                    botConfig?.pause_new_entries
-                      ? 'bg-amber-500/25 border-amber-500 text-amber-300'
-                      : 'bg-[#21252b] hover:bg-[#2c323a] border-[#383e48] text-[#cfd6df]'
-                  }`}
-                >
-                  <Pause className="w-3 h-3 fill-current" />
-                  <span className="hidden xl:inline">
-                    {botConfig?.pause_new_entries ? 'Без новых' : 'Стоп вход'}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onBotCommand('reload_config')}
-                  title="Перезагрузить конфигурацию"
-                  className="w-6 h-6 flex items-center justify-center rounded-[3px] bg-[#21252b] hover:bg-[#2c323a] border border-[#383e48] text-[#cfd6df]"
-                >
-                  <RotateCw className="w-3 h-3" />
-                </button>
+                {isOwner && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => onBotCommand('start')}
+                      title="Запустить бота"
+                      className="w-6 h-6 flex items-center justify-center rounded-[3px] bg-[#21252b] hover:bg-[#2c323a] border border-[#383e48] text-[#cfd6df]"
+                    >
+                      <Play className="w-3 h-3 fill-current" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onBotCommand('stop')}
+                      title="Остановить бота"
+                      className="w-6 h-6 flex items-center justify-center rounded-[3px] bg-[#21252b] hover:bg-[#2c323a] border border-[#383e48] text-[#cfd6df]"
+                    >
+                      <Square className="w-3 h-3 fill-current" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onBotCommand('stopbuy')}
+                      title={
+                        botConfig?.pause_new_entries
+                          ? 'Новые сделки остановлены (DCA и TP текущих активны). Нажмите, чтобы снова разрешить открытие новых сделок'
+                          : 'Остановить открытие новых сделок (бот продолжит усреднять DCA и закрывать в плюс текущие позиции)'
+                      }
+                      className={`px-1.5 h-6 flex items-center gap-1 rounded-[3px] border text-[10px] font-semibold transition-colors ${
+                        botConfig?.pause_new_entries
+                          ? 'bg-amber-500/25 border-amber-500 text-amber-300'
+                          : 'bg-[#21252b] hover:bg-[#2c323a] border-[#383e48] text-[#cfd6df]'
+                      }`}
+                    >
+                      <Pause className="w-3 h-3 fill-current" />
+                      <span className="hidden xl:inline">
+                        {botConfig?.pause_new_entries ? 'Без новых' : 'Стоп вход'}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onBotCommand('reload_config')}
+                      title="Перезагрузить конфигурацию"
+                      className="w-6 h-6 flex items-center justify-center rounded-[3px] bg-[#21252b] hover:bg-[#2c323a] border border-[#383e48] text-[#cfd6df]"
+                    >
+                      <RotateCw className="w-3 h-3" />
+                    </button>
+                  </>
+                )}
                 <button
                   type="button"
                   onClick={() => onForceExit('all')}

@@ -14,6 +14,7 @@ import {
   isPrivateWsStreamOpen,
   isSupportedFuturesSymbol,
   cleanSymbolToPair,
+  setBybitWsTimeOffset,
 } from './exchangeWebSocket.ts';
 
 export type SupportedExchange = 'binance' | 'bybit' | 'okx' | 'bitget' | 'bingx';
@@ -366,6 +367,7 @@ async function getBybitTimestamp(
           bybitTimeOffsetMs = offsetMs;
           lastBybitTimeSyncTs = Date.now();
           bybitTimeOffsetByHost.set(cleanHost, { offsetMs, syncTs: Date.now() });
+          setBybitWsTimeOffset(cleanHost, offsetMs);
           return String(Date.now() + offsetMs);
         }
       }
@@ -2365,16 +2367,19 @@ export async function testExchangeConnection(
               ? availableBalance
               : Math.max(0, walletBalance - usedMargin);
 
-          binancePositionsCache.set(cleanKey, {
-            timestamp: Date.now(),
-            positions: parsedPositions,
-            network_label: netLabel,
-            is_testnet: isTestnetHost,
-          });
+          const hasPositionsArray = Array.isArray(json.positions);
+          if (hasPositionsArray) {
+            binancePositionsCache.set(cleanKey, {
+              timestamp: Date.now(),
+              positions: parsedPositions,
+              network_label: netLabel,
+              is_testnet: isTestnetHost,
+            });
+          }
 
           const openPositions = parsedPositions.length;
           // Определяем Hedge Mode прямо из позиций в ответе v2/account (если есть LONG/SHORT positionSide), чтобы не делать лишний REST запрос!
-          const inferredDualSide = Array.isArray(json.positions)
+          const inferredDualSide = hasPositionsArray
             ? json.positions.some((p: any) => {
                 const ps = String(p.positionSide || '').toUpperCase();
                 return ps === 'LONG' || ps === 'SHORT';
@@ -2401,11 +2406,12 @@ export async function testExchangeConnection(
             usedMarginUsdt: Number(usedMargin.toFixed(2)),
             canTrade,
             dualSidePosition: dualSide,
-            positions: parsedPositions,
+            positions: hasPositionsArray ? parsedPositions : existingWsState?.positions || [],
             closedPnl: existingWsState?.closedPnl || [],
             wsConnected: isPrivateWsStreamOpen('binance', cleanKey),
+            positionsSynced: hasPositionsArray || Boolean(existingWsState?.positionsSynced),
             updatedAt: Date.now(),
-            lastRestBootstrapAt: Date.now(),
+            lastRestBootstrapAt: hasPositionsArray ? Date.now() : existingWsState?.lastRestBootstrapAt || 0,
           });
           ensureBinancePrivateUserStream(cleanKey, cleanSecret, baseUrl).catch(() => {});
 
@@ -2742,6 +2748,7 @@ export async function testExchangeConnection(
             const seenBybitPos = new Set<string>();
             let posUnrealizedSum = 0;
             let posMarginSum = 0;
+            let bybitPosFetchOk = false;
             try {
               for (const settleCoin of ['USDT', 'USDC']) {
                 let cursor = '';
@@ -2749,10 +2756,16 @@ export async function testExchangeConnection(
                   const qs = `category=linear&settleCoin=${settleCoin}&limit=200${
                     cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''
                   }`;
-                  const posRes = await queryBybitEndpoint(baseUrl, `/v5/position/list?${qs}`, false);
+                  let posRes = await queryBybitEndpoint(baseUrl, `/v5/position/list?${qs}`, false);
                   if (posRes.statusCode !== 200) break;
-                  const posJson = JSON.parse(posRes.data);
+                  let posJson = JSON.parse(posRes.data);
+                  if (posJson.retCode === 10002) {
+                    posRes = await queryBybitEndpoint(baseUrl, `/v5/position/list?${qs}`, true);
+                    if (posRes.statusCode !== 200) break;
+                    posJson = JSON.parse(posRes.data);
+                  }
                   if (posJson.retCode !== 0 || !Array.isArray(posJson.result?.list)) break;
+                  bybitPosFetchOk = true;
                   for (const p of posJson.result.list) {
                     const size = Math.abs(Number(p.size || 0));
                     if (!(size > 0)) continue;
@@ -2825,7 +2838,7 @@ export async function testExchangeConnection(
                 ? resolvedAvailable
                 : Math.max(0, finalWalletBal - resolvedUsedMargin);
 
-            // Сохраняем ПОЛНЫЙ снимок позиций и маржи Bybit в WebSocket-движок и запускаем приватный поток
+            // Сохраняем ПОЛНЫЙ снимок позиций и маржи Bybit в WebSocket-движок только если список позиций реально получен
             const prevBybitWs = getWsAccountLiveState(cleanKey, 86_400_000);
             setWsAccountLiveState({
               apiKey: cleanKey,
@@ -2838,11 +2851,12 @@ export async function testExchangeConnection(
               availableBalanceUsdt: Number(finalAvail.toFixed(2)),
               usedMarginUsdt: Number(resolvedUsedMargin.toFixed(2)),
               canTrade: true,
-              positions: parsedBybitPositions,
+              positions: bybitPosFetchOk ? parsedBybitPositions : prevBybitWs?.positions || [],
               closedPnl: prevBybitWs?.closedPnl || [],
               wsConnected: isPrivateWsStreamOpen('bybit', cleanKey),
+              positionsSynced: bybitPosFetchOk || Boolean(prevBybitWs?.positionsSynced),
               updatedAt: Date.now(),
-              lastRestBootstrapAt: Date.now(),
+              lastRestBootstrapAt: bybitPosFetchOk ? Date.now() : prevBybitWs?.lastRestBootstrapAt || 0,
             });
             ensureBybitPrivateUserStream(cleanKey, cleanSecret, baseUrl);
 
@@ -3325,7 +3339,10 @@ export interface ExchangeClosedPnlItem {
  * Позволяет боту видеть уже открытые сделки после обновления кода/перезапуска или ручного открытия на бирже,
  * не открывать дубликаты и вести существующие позиции по стратегии.
  */
-export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Promise<{
+export async function fetchExchangeOpenPositions(
+  creds: ExchangeCredentials,
+  forceFresh = false
+): Promise<{
   success: boolean;
   positions: ExchangePositionItem[];
   network_label?: string;
@@ -3339,13 +3356,14 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
 
   // 1. BYBIT V5 LINEAR FUTURES (WebSocket Private Stream + paginated /v5/position/list bootstrap USDT+USDC)
   if (creds.exchange === 'bybit') {
-    const liveBybitWs = getWsAccountLiveState(cleanKey, 75_000);
+    const liveBybitWs = !forceFresh ? getWsAccountLiveState(cleanKey, 60_000) : undefined;
     if (
       liveBybitWs &&
       liveBybitWs.exchange === 'bybit' &&
+      liveBybitWs.positionsSynced &&
       liveBybitWs.wsConnected &&
       isPrivateWsStreamOpen('bybit', cleanKey) &&
-      Date.now() - liveBybitWs.lastRestBootstrapAt < 120_000
+      Date.now() - liveBybitWs.lastRestBootstrapAt < 90_000
     ) {
       for (const pos of liveBybitWs.positions) {
         const tick = getLiveWsTicker(pos.symbol, 'bybit');
@@ -3371,33 +3389,45 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
         const positions: ExchangePositionItem[] = [];
         const seenPosKeys = new Set<string>();
         let hostAuthenticated = false;
+        let invalidKeyOnHost = false;
+
+        const queryBybitPos = async (queryString: string, forceTimeSync = false) => {
+          const timestamp = await getBybitTimestamp(baseUrl, forceTimeSync);
+          const recvWindow = '15000';
+          const signature = signBybitV5(timestamp, cleanKey, recvWindow, queryString, cleanSecret);
+          return makeHttpsRequest(`${baseUrl}/v5/position/list?${queryString}`, {
+            method: 'GET',
+            headers: {
+              'X-BAPI-API-KEY': cleanKey,
+              'X-BAPI-TIMESTAMP': timestamp,
+              'X-BAPI-SIGN': signature,
+              'X-BAPI-RECV-WINDOW': recvWindow,
+              'Content-Type': 'application/json',
+            },
+            timeoutMs: 6500,
+          });
+        };
 
         for (const settleCoin of ['USDT', 'USDC']) {
           let cursor = '';
           for (let page = 0; page < 5; page++) {
-            const timestamp = await getBybitTimestamp(baseUrl, false);
-            const recvWindow = '15000';
             const queryString = `category=linear&settleCoin=${settleCoin}&limit=200${
               cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''
             }`;
-            const signature = signBybitV5(timestamp, cleanKey, recvWindow, queryString, cleanSecret);
-            const res = await makeHttpsRequest(`${baseUrl}/v5/position/list?${queryString}`, {
-              method: 'GET',
-              headers: {
-                'X-BAPI-API-KEY': cleanKey,
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-SIGN': signature,
-                'X-BAPI-RECV-WINDOW': recvWindow,
-                'Content-Type': 'application/json',
-              },
-              timeoutMs: 6500,
-            });
+            let res = await queryBybitPos(queryString, false);
             if (res.statusCode === 401 || res.statusCode === 403) {
+              invalidKeyOnHost = true;
               break;
             }
             if (res.statusCode !== 200) break;
-            const json = JSON.parse(res.data);
+            let json = JSON.parse(res.data);
+            if (json.retCode === 10002) {
+              res = await queryBybitPos(queryString, true);
+              if (res.statusCode !== 200) break;
+              json = JSON.parse(res.data);
+            }
             if (json.retCode === 10003 || json.retCode === 10004 || json.retCode === 33004) {
+              invalidKeyOnHost = true;
               hostAuthenticated = false;
               break;
             }
@@ -3451,7 +3481,7 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
             if (!nextCursor) break;
             cursor = nextCursor;
           }
-          if (!hostAuthenticated && settleCoin === 'USDT') break;
+          if (invalidKeyOnHost) break;
         }
 
         if (hostAuthenticated) {
@@ -3465,6 +3495,7 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
           const existingBybitWs = getWsAccountLiveState(cleanKey, 86_400_000);
           if (existingBybitWs) {
             existingBybitWs.positions = positions;
+            existingBybitWs.positionsSynced = true;
             existingBybitWs.usedMarginUsdt = Number(
               positions.reduce((s, p) => s + Number(p.margin_usdt || 0), 0).toFixed(2)
             );
@@ -3492,6 +3523,7 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
               positions,
               closedPnl: [],
               wsConnected: isPrivateWsStreamOpen('bybit', cleanKey),
+              positionsSynced: true,
               updatedAt: Date.now(),
               lastRestBootstrapAt: Date.now(),
             });
@@ -3511,15 +3543,16 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
     return { success: false, positions: [] };
   }
 
-  // 2. BINANCE USDT-M + USDC-M FUTURES (WebSocket User Data Stream + ws-fapi v2/account.position + кэш)
+  // 2. BINANCE USDT-M + USDC-M FUTURES (WebSocket User Data Stream + ws-fapi v2/account.position + REST fallback + кэш)
   if (creds.exchange === 'binance') {
-    const liveWsState = getWsAccountLiveState(cleanKey, 90_000);
+    const liveWsState = !forceFresh ? getWsAccountLiveState(cleanKey, 90_000) : undefined;
     if (
       liveWsState &&
       liveWsState.exchange === 'binance' &&
+      liveWsState.positionsSynced &&
       liveWsState.wsConnected &&
       isPrivateWsStreamOpen('binance', cleanKey) &&
-      Date.now() - liveWsState.lastRestBootstrapAt < 120_000
+      Date.now() - liveWsState.lastRestBootstrapAt < 90_000
     ) {
       for (const pos of liveWsState.positions) {
         const tick = getLiveWsTicker(pos.symbol, 'binance');
@@ -3540,7 +3573,7 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
     }
 
     const cachedPos = binancePositionsCache.get(cleanKey);
-    if (cachedPos && Date.now() - cachedPos.timestamp < 75_000) {
+    if (!forceFresh && cachedPos && Date.now() - cachedPos.timestamp < 75_000) {
       for (const pos of cachedPos.positions) {
         const tick = getLiveWsTicker(pos.symbol, 'binance');
         if (tick && tick.markPrice > 0) {
@@ -3565,33 +3598,54 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
         // 2A. Сначала запрашиваем открытые позиции через WebSocket API (wss://ws-fapi.binance.com/ws-fapi/v1) без бана IP -1003!
         const wsRpc = getBinanceWsRpcClient(baseUrl);
         const wsTs = await getBinanceTimestamp(false, baseUrl);
-        const wsPosRes = await wsRpc.request(
+        let wsPosRes = await wsRpc.request(
           'v2/account.position',
           { apiKey: cleanKey, timestamp: wsTs, recvWindow: 10000 },
           cleanSecret,
           5500
         );
+        if (wsPosRes.status !== 200 && wsPosRes.error?.code === -1021) {
+          const retryWsTs = await getBinanceTimestamp(true, baseUrl);
+          wsPosRes = await wsRpc.request(
+            'v2/account.position',
+            { apiKey: cleanKey, timestamp: retryWsTs, recvWindow: 15000 },
+            cleanSecret,
+            5500
+          );
+        }
 
         let list: any[] | null = null;
         if (wsPosRes.status === 200 && Array.isArray(wsPosRes.result)) {
           list = wsPosRes.result;
-        } else if (!wsPosRes.error || wsPosRes.status === 503 || wsPosRes.status === 408) {
-          if (!isBinanceHostRateLimited(baseUrl).limited) {
-            const ts = await getBinanceTimestamp(false, baseUrl);
-            const query = `timestamp=${ts}&recvWindow=10000`;
-            const sig = signBinanceFuturesQuery(query, cleanSecret);
-            const res = await makeHttpsRequest(
-              `${baseUrl}/fapi/v2/positionRisk?${query}&signature=${sig}`,
+        } else if (!isBinanceHostRateLimited(baseUrl).limited) {
+          // Резервный REST /fapi/v2/positionRisk при ЛЮБОЙ ошибке ws-fapi (вкл. 400/-1021/таймаут)
+          const ts = await getBinanceTimestamp(false, baseUrl);
+          const query = `timestamp=${ts}&recvWindow=10000`;
+          const sig = signBinanceFuturesQuery(query, cleanSecret);
+          let res = await makeHttpsRequest(
+            `${baseUrl}/fapi/v2/positionRisk?${query}&signature=${sig}`,
+            {
+              method: 'GET',
+              headers: { 'X-MBX-APIKEY': cleanKey },
+              timeoutMs: 6500,
+            }
+          );
+          if (res.statusCode !== 200 && res.data.includes('-1021')) {
+            const retryTs = await getBinanceTimestamp(true, baseUrl);
+            const retryQuery = `timestamp=${retryTs}&recvWindow=15000`;
+            const retrySig = signBinanceFuturesQuery(retryQuery, cleanSecret);
+            res = await makeHttpsRequest(
+              `${baseUrl}/fapi/v2/positionRisk?${retryQuery}&signature=${retrySig}`,
               {
                 method: 'GET',
                 headers: { 'X-MBX-APIKEY': cleanKey },
                 timeoutMs: 6500,
               }
             );
-            if (res.statusCode === 200) {
-              const parsed = JSON.parse(res.data);
-              if (Array.isArray(parsed)) list = parsed;
-            }
+          }
+          if (res.statusCode === 200) {
+            const parsed = JSON.parse(res.data);
+            if (Array.isArray(parsed)) list = parsed;
           }
         }
 
@@ -3651,6 +3705,7 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
           const existingBinanceWs = getWsAccountLiveState(cleanKey, 86_400_000);
           if (existingBinanceWs) {
             existingBinanceWs.positions = positions;
+            existingBinanceWs.positionsSynced = true;
             existingBinanceWs.usedMarginUsdt = Number(
               positions.reduce((s, p) => s + Number(p.margin_usdt || 0), 0).toFixed(2)
             );
@@ -3672,7 +3727,7 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
         // try next host
       }
     }
-    if (cachedPos) {
+    if (!forceFresh && cachedPos) {
       return {
         success: true,
         positions: cachedPos.positions,
@@ -3843,14 +3898,16 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
         if (json.code === 0 && Array.isArray(json.data)) {
           const positions: ExchangePositionItem[] = [];
           for (const p of json.data) {
-            const size = Math.abs(Number(p.positionAmt || p.availableAmt || 0));
+            const rawAmt = Number(p.positionAmt || p.availableAmt || 0);
+            const size = Math.abs(rawAmt);
             if (!(size > 0)) continue;
             const sym = String(p.symbol || '');
             const entryPrice = Number(p.avgPrice || 0);
             if (!(entryPrice > 0)) continue;
             const markPrice = Number(p.markPrice || entryPrice);
             const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
-            const isShort = String(p.positionSide || '').toUpperCase() === 'SHORT';
+            const posSide = String(p.positionSide || '').toUpperCase();
+            const isShort = posSide === 'SHORT' || (posSide !== 'LONG' && rawAmt < 0);
             const marginUsdt = Number(p.margin || (size * entryPrice) / lev);
             positions.push({
               pair: symbolToFreqtradePair(sym),

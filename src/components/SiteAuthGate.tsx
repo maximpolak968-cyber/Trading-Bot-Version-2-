@@ -25,6 +25,7 @@ export interface AuthSessionState {
   owner_login: string;
   authenticated: boolean;
   role: 'owner' | 'client';
+  user_id?: string;
   login: string;
   account_id?: string;
   client_code?: string;
@@ -432,8 +433,8 @@ export const SiteSettingsModal: React.FC<SiteSettingsModalProps> = ({
                   onChange={(e) => setInviteRole(e.target.value as 'client' | 'owner')}
                   className="px-2.5 py-1.5 rounded bg-[#181b20] border border-[#2d333f] text-white"
                 >
-                  <option value="client">Просмотр (без API-ключей)</option>
-                  <option value="owner">Полный доступ</option>
+                  <option value="client">Изолированный кабинет (свои API-ключи)</option>
+                  <option value="owner">Полный доступ (владелец)</option>
                 </select>
                 <button
                   type="submit"
@@ -460,7 +461,7 @@ export const SiteSettingsModal: React.FC<SiteSettingsModalProps> = ({
                           <div className="flex items-center gap-2">
                             <span className="font-semibold text-white truncate">{inv.label}</span>
                             <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-[#00b4d8]/15 text-[#38bdf8]">
-                              {inv.role === 'owner' ? 'Полный' : 'Просмотр'}
+                              {inv.role === 'owner' ? 'Полный' : 'Кабинет'}
                             </span>
                             <span className="text-[10px] text-[#9ca3af]">
                               Входов: {inv.uses_count}

@@ -292,6 +292,7 @@ export class SqliteBotDatabase {
       ['synced_accounts_json', "TEXT DEFAULT '[]'"],
       ['open_timestamp', 'INTEGER'],
       ['close_timestamp', 'INTEGER'],
+      ['user_id', "TEXT DEFAULT 'owner'"],
     ];
     for (const [col, def] of extraTradeCols) {
       try {
@@ -307,10 +308,20 @@ export class SqliteBotDatabase {
       ['passphrase_raw', 'TEXT'],
       ['connected_at', 'INTEGER DEFAULT 0'],
       ['is_testnet', 'INTEGER DEFAULT 0'],
+      ['user_id', "TEXT DEFAULT 'owner'"],
     ];
     for (const [col, def] of extraAccCols) {
       try {
         this.db.exec(`ALTER TABLE exchange_accounts ADD COLUMN ${col} ${def}`);
+      } catch {
+        // column already exists
+      }
+    }
+
+    const extraDrawingCols = [['user_id', "TEXT DEFAULT 'owner'"]];
+    for (const [col, def] of extraDrawingCols) {
+      try {
+        this.db.exec(`ALTER TABLE chart_drawings ADD COLUMN ${col} ${def}`);
       } catch {
         // column already exists
       }
@@ -543,7 +554,7 @@ export class SqliteBotDatabase {
           is_owner: true,
           client_access_code: 'BYBIT-ENV1',
           enabled: true,
-          copy_trading: true,
+          copy_trading: false,
           copy_multiplier: 1.0,
           max_leverage: 25,
           balance_usdt: 1000,
@@ -551,6 +562,7 @@ export class SqliteBotDatabase {
           last_sync: new Date().toISOString().replace('T', ' ').slice(0, 19),
           connected_at: Date.now(),
           is_testnet: String(process.env.BYBIT_TESTNET || '').toLowerCase() === 'true',
+          user_id: 'owner',
         });
       }
 
@@ -572,7 +584,7 @@ export class SqliteBotDatabase {
           is_owner: true,
           client_access_code: 'BINANCE-ENV1',
           enabled: true,
-          copy_trading: true,
+          copy_trading: false,
           copy_multiplier: 1.0,
           max_leverage: 25,
           balance_usdt: 1000,
@@ -580,6 +592,7 @@ export class SqliteBotDatabase {
           last_sync: new Date().toISOString().replace('T', ' ').slice(0, 19),
           connected_at: Date.now(),
           is_testnet: String(process.env.BINANCE_TESTNET || '').toLowerCase() === 'true',
+          user_id: 'owner',
         });
       }
     } catch {
@@ -686,8 +699,18 @@ export class SqliteBotDatabase {
     }
   }
 
-  public getRecentOrders(limit = 150): any[] {
+  public getRecentOrders(limit = 150, userId?: string): any[] {
     try {
+      if (userId) {
+        return this.db
+          .prepare(
+            `SELECT orders.* FROM orders
+             INNER JOIN trades ON orders.trade_id = trades.id
+             WHERE COALESCE(trades.user_id, 'owner') = ?
+             ORDER BY orders.id DESC LIMIT ?`
+          )
+          .all(userId, limit);
+      }
       return this.db
         .prepare(`SELECT * FROM orders ORDER BY id DESC LIMIT ?`)
         .all(limit);
@@ -696,11 +719,17 @@ export class SqliteBotDatabase {
     }
   }
 
-  public getPnlAnalytics(): any {
+  public getPnlAnalytics(userId?: string): any {
     try {
-      const closed = this.db
-        .prepare(`SELECT * FROM trades WHERE is_open = 0 ORDER BY close_date DESC`)
-        .all() as any[];
+      const closed = (userId
+        ? this.db
+            .prepare(
+              `SELECT * FROM trades WHERE is_open = 0 AND COALESCE(user_id, 'owner') = ? ORDER BY close_date DESC`
+            )
+            .all(userId)
+        : this.db
+            .prepare(`SELECT * FROM trades WHERE is_open = 0 ORDER BY close_date DESC`)
+            .all()) as any[];
       let totalGross = 0;
       let totalNet = 0;
       let totalFees = 0;
@@ -808,7 +837,7 @@ export class SqliteBotDatabase {
             tp_manual_override, sl_manual_override, dca_manual_override,
             planned_dca_json, orders_json, initial_open_rate,
             account_id, account_name, parent_trade_id,
-            current_rate, synced_accounts_json, open_timestamp, close_timestamp
+            current_rate, synced_accounts_json, open_timestamp, close_timestamp, user_id
           ) VALUES (
             ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
@@ -822,7 +851,7 @@ export class SqliteBotDatabase {
             ?, ?, ?,
             ?, ?, ?,
             ?, ?, ?,
-            ?, ?, ?, ?
+            ?, ?, ?, ?, ?
           )
         `);
         stmt.run(
@@ -878,7 +907,8 @@ export class SqliteBotDatabase {
           trade.current_rate ?? trade.open_rate,
           syncedAccJson,
           openTs,
-          closeTs
+          closeTs,
+          trade.user_id || 'owner'
         );
       } else {
         const stmt = this.db.prepare(`
@@ -894,7 +924,8 @@ export class SqliteBotDatabase {
             next_dca_price = ?, tp_manual_override = ?, sl_manual_override = ?,
             dca_manual_override = ?, planned_dca_json = ?, orders_json = ?,
             account_id = ?, account_name = ?, parent_trade_id = ?,
-            current_rate = ?, synced_accounts_json = ?, open_timestamp = ?, close_timestamp = ?
+            current_rate = ?, synced_accounts_json = ?, open_timestamp = ?, close_timestamp = ?,
+            user_id = ?
           WHERE id = ?
         `);
         stmt.run(
@@ -941,6 +972,7 @@ export class SqliteBotDatabase {
           syncedAccJson,
           openTs,
           closeTs,
+          trade.user_id || 'owner',
           trade.trade_id
         );
       }
@@ -1080,6 +1112,7 @@ export class SqliteBotDatabase {
           exchange: String(r.exchange || 'binance'),
           account_id: String(r.account_id || 'master'),
           account_name: String(r.account_name || 'Master'),
+          user_id: String(r.user_id || 'owner'),
           parent_trade_id: r.parent_trade_id ? Number(r.parent_trade_id) : undefined,
           synced_accounts: syncedAccounts.length > 0 ? syncedAccounts : undefined,
           amount: Number(r.amount || 0),
@@ -1267,11 +1300,13 @@ export class SqliteBotDatabase {
     }
   }
 
-  public getChartDrawingsForPair(pair: string): any[] {
+  public getChartDrawingsForPair(pair: string, userId = 'owner'): any[] {
     try {
       const rows = this.db
-        .prepare(`SELECT * FROM chart_drawings WHERE pair = ? ORDER BY rowid ASC`)
-        .all(pair.toUpperCase());
+        .prepare(
+          `SELECT * FROM chart_drawings WHERE pair = ? AND COALESCE(user_id, 'owner') = ? ORDER BY rowid ASC`
+        )
+        .all(pair.toUpperCase(), userId);
       return rows.map((r: any) => {
         let pts: any[] = [];
         try {
@@ -1287,6 +1322,7 @@ export class SqliteBotDatabase {
           color: String(r.color || '#2962ff'),
           text: r.text ? String(r.text) : undefined,
           locked: Boolean(r.locked),
+          user_id: String(r.user_id || 'owner'),
           created_at: String(r.created_at || ''),
         };
       });
@@ -1303,20 +1339,22 @@ export class SqliteBotDatabase {
     color: string;
     text?: string;
     locked?: boolean;
+    user_id?: string;
     created_at: string;
   }) {
     try {
       this.db
         .prepare(
-          `INSERT INTO chart_drawings (id, pair, tool, points_json, color, text, locked, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO chart_drawings (id, pair, tool, points_json, color, text, locked, user_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              pair = excluded.pair,
              tool = excluded.tool,
              points_json = excluded.points_json,
              color = excluded.color,
              text = excluded.text,
-             locked = excluded.locked`
+             locked = excluded.locked,
+             user_id = excluded.user_id`
         )
         .run(
           drawing.id,
@@ -1326,6 +1364,7 @@ export class SqliteBotDatabase {
           drawing.color || '#2962ff',
           drawing.text ?? null,
           drawing.locked ? 1 : 0,
+          drawing.user_id || 'owner',
           drawing.created_at || new Date().toISOString().replace('T', ' ').slice(0, 19)
         );
     } catch (e) {
@@ -1333,17 +1372,25 @@ export class SqliteBotDatabase {
     }
   }
 
-  public deleteChartDrawing(id: string) {
+  public deleteChartDrawing(id: string, userId?: string) {
     try {
-      this.db.prepare(`DELETE FROM chart_drawings WHERE id = ?`).run(id);
+      if (userId) {
+        this.db
+          .prepare(`DELETE FROM chart_drawings WHERE id = ? AND COALESCE(user_id, 'owner') = ?`)
+          .run(id, userId);
+      } else {
+        this.db.prepare(`DELETE FROM chart_drawings WHERE id = ?`).run(id);
+      }
     } catch {
       // ignore
     }
   }
 
-  public clearChartDrawingsForPair(pair: string) {
+  public clearChartDrawingsForPair(pair: string, userId = 'owner') {
     try {
-      this.db.prepare(`DELETE FROM chart_drawings WHERE pair = ?`).run(pair.toUpperCase());
+      this.db
+        .prepare(`DELETE FROM chart_drawings WHERE pair = ? AND COALESCE(user_id, 'owner') = ?`)
+        .run(pair.toUpperCase(), userId);
     } catch {
       // ignore
     }
@@ -1366,6 +1413,7 @@ export class SqliteBotDatabase {
         connected_at: Number(r.connected_at || 0),
         has_passphrase: Boolean(r.has_passphrase),
         is_owner: Boolean(r.is_owner),
+        user_id: String(r.user_id || 'owner'),
         client_access_code: String(r.client_access_code),
         enabled: Boolean(r.enabled),
         copy_trading: Boolean(r.copy_trading),
@@ -1389,8 +1437,8 @@ export class SqliteBotDatabase {
         id, name, owner_label, exchange, market_type, api_key_masked,
         has_passphrase, is_owner, client_access_code, enabled,
         copy_trading, copy_multiplier, max_leverage, balance_usdt,
-        status, last_sync, api_key_raw, api_secret_raw, passphrase_raw, connected_at, is_testnet
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        status, last_sync, api_key_raw, api_secret_raw, passphrase_raw, connected_at, is_testnet, user_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         owner_label = excluded.owner_label,
@@ -1403,6 +1451,7 @@ export class SqliteBotDatabase {
         status = excluded.status,
         last_sync = excluded.last_sync,
         is_testnet = excluded.is_testnet,
+        user_id = excluded.user_id,
         api_key_raw = COALESCE(excluded.api_key_raw, exchange_accounts.api_key_raw),
         api_secret_raw = COALESCE(excluded.api_secret_raw, exchange_accounts.api_secret_raw),
         passphrase_raw = COALESCE(excluded.passphrase_raw, exchange_accounts.passphrase_raw),
@@ -1429,7 +1478,8 @@ export class SqliteBotDatabase {
       acc.api_secret_raw ?? null,
       acc.passphrase_raw ?? null,
       acc.connected_at || Date.now(),
-      acc.is_testnet ? 1 : 0
+      acc.is_testnet ? 1 : 0,
+      acc.user_id || 'owner'
     );
   }
 
@@ -1446,6 +1496,21 @@ export class SqliteBotDatabase {
     try {
       this.db.prepare(`DELETE FROM exchange_accounts WHERE id = ?`).run(id);
       this.syncAccountsBackupFile(true);
+    } catch {
+      // ignore
+    }
+  }
+
+  public clearExchangeAccountsForUser(userId: string, explicitUserClear = false) {
+    try {
+      this.db
+        .prepare(`DELETE FROM exchange_accounts WHERE COALESCE(user_id, 'owner') = ?`)
+        .run(userId);
+      if (userId === 'owner') {
+        this.db.prepare(`DELETE FROM signals`).run();
+        this.db.prepare(`DELETE FROM bot_levels WHERE manual_override = 0`).run();
+      }
+      this.syncAccountsBackupFile(explicitUserClear);
     } catch {
       // ignore
     }

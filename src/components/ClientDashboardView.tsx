@@ -78,7 +78,7 @@ export const ClientDashboardView: React.FC<ClientDashboardViewProps> = ({
       <div className="flex-1 min-h-screen bg-[#131722] text-[#e2e8f0] flex items-center justify-center">
         <div className="flex items-center gap-3 text-sm text-[#9ca3af]">
           <RefreshCw className="w-5 h-5 animate-spin text-[#2962ff]" />
-          <span>Подключение к личному кабинету копитрейдинга...</span>
+          <span>Подключение к личному кабинету автоторговли...</span>
         </div>
       </div>
     );
@@ -126,7 +126,7 @@ export const ClientDashboardView: React.FC<ClientDashboardViewProps> = ({
               </span>
             </div>
             <div className="text-[11px] text-[#9ca3af]">
-              Автоматический пропорциональный копитрейдинг • Изолированный профиль
+              Автономная торговля бота • Изолированный профиль
             </div>
           </div>
         </div>
@@ -227,7 +227,7 @@ export const ClientDashboardView: React.FC<ClientDashboardViewProps> = ({
           <div className="bg-[#181c27] border border-[#2a2e39] rounded p-3.5 flex flex-col justify-between">
             <span className="text-[11px] font-medium text-[#9ca3af] uppercase tracking-wider flex items-center gap-1.5">
               <ShieldCheck className="w-3.5 h-3.5 text-[#10b981]" />
-              Статус копирования
+              Статус автоторговли
             </span>
             <div className="text-sm font-bold font-mono text-[#10b981] mt-2 flex items-center gap-1.5">
               <span className="w-2 h-2 rounded-full bg-[#10b981] animate-ping" />
@@ -260,7 +260,7 @@ export const ClientDashboardView: React.FC<ClientDashboardViewProps> = ({
                 Ваши открытые позиции ({data.open_trades.length})
               </span>
               <span className="text-xs text-[#9ca3af]">
-                (Пропорционально скопированы по вашей ставке ${stakeAmount})
+                (Автономные сделки бота по ставке ${stakeAmount})
               </span>
             </div>
             <span className="text-xs font-mono text-[#9ca3af]">Плечо: {acc.leverage}x</span>

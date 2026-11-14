@@ -25,7 +25,6 @@ import {
 import { SqliteBotDatabase } from './src/bot/sqliteStore.ts';
 import {
   testExchangeConnection,
-  calculateClientProportionalOrder,
   executeExchangeFuturesOrder,
   placeOrUpdateExchangeTakeProfitOrder,
   isSimulatedTestApiKey,
@@ -320,11 +319,14 @@ async function processFastWsTradeClose(
           notes: `[WS FAST TP] Closed at ${actualClosePrice} (Mark: ${markPrice}, Bid: ${latestExec.bestBid}, Ask: ${latestExec.bestAsk}), Net PnL: +${trade.profit_abs} USDT`,
         });
 
-        if ((!trade.account_id || trade.account_id === 'master') && trade.campaign_id) {
+        if (trade.campaign_id) {
           const sibling = tradesStore.find(
             (s) =>
               s.is_open &&
-              (!s.account_id || s.account_id === 'master') &&
+              resolveTradeUserId(s) === resolveTradeUserId(trade) &&
+              (trade.account_id
+                ? s.account_id === trade.account_id
+                : !s.account_id || s.account_id === 'master') &&
               s.campaign_id === trade.campaign_id &&
               s.trade_id !== trade.trade_id
           );
@@ -335,12 +337,9 @@ async function processFastWsTradeClose(
         }
 
         if (targetAcc) {
+          const accScopeId = getTargetAccountIdForRecord(targetAcc);
           const remOpen = tradesStore.filter(
-            (x) =>
-              x.is_open &&
-              (targetAccId === 'master'
-                ? !x.account_id || x.account_id === 'master'
-                : x.account_id === targetAccId)
+            (x) => x.is_open && tradeMatchesAccount(x, targetAcc, accScopeId)
           );
           targetAcc.open_trades_count = remOpen.length;
           targetAcc.used_margin_usdt = Number(
@@ -352,23 +351,16 @@ async function processFastWsTradeClose(
         }
       });
 
-      if (!trade.account_id || trade.account_id === 'master') {
-        await closeClientCopiesForMasterTrade(
-          trade,
-          actualClosePrice,
-          now,
-          nowStr,
-          reasonTag
-        );
-      }
-      cooldownPairs.set(trade.pair, Date.now());
+      const tradeUserId = resolveTradeUserId(trade);
+      cooldownPairs.set(`${targetAcc?.id || targetAccId}:${trade.pair}`, Date.now());
       appendLog(
         'freqtrade.bot.exit',
         'INFO',
-        `⚡ [WS FAST TP] [${trade.pair}] #${trade.trade_id}: мгновенно закрыто по потоку биржи @ ${actualClosePrice}$ (Mark: ${markPrice}$) | Чистый PnL: +${trade.profit_abs}$ (комиссия: ${trade.fee_total}$)`
+        `⚡ [WS FAST TP] [${trade.pair}] #${trade.trade_id} (${targetAcc?.name || targetAccId}): мгновенно закрыто по потоку биржи @ ${actualClosePrice}$ (Mark: ${markPrice}$) | Чистый PnL: +${trade.profit_abs}$ (комиссия: ${trade.fee_total}$)`,
+        { userId: tradeUserId }
       );
       broadcastTradeLifecycleEvent('trade:closed', trade);
-      scheduleScopeStateSync(targetAccId);
+      scheduleScopeStateSync(tradeUserId);
     });
   } finally {
     fastTpInFlightIds.delete(tradeId);
@@ -1367,6 +1359,7 @@ interface FreqtradeTrade {
   exchange: string;
   account_id?: string;
   account_name?: string;
+  user_id?: string;
   parent_trade_id?: number;
   synced_accounts?: string[];
   amount: number;
@@ -1853,20 +1846,40 @@ let blacklist: string[] = [
   'EUR/USDT:USDT',
 ];
 let pairLocks: any[] = [];
-const botLogs: any[] = [];
+const botLogs: Array<{
+  timestamp: string;
+  epoch: number;
+  logger: string;
+  level: string;
+  message: string;
+  userId?: string;
+  publicMarket?: boolean;
+}> = [];
 const cooldownPairs = new Map<string, number>();
+let ownerManuallyStoppedBot = false;
 
-function appendLog(logger: string, level: 'INFO' | 'DEBUG' | 'WARNING' | 'ERROR', message: string) {
+function appendLog(
+  logger: string,
+  level: 'INFO' | 'DEBUG' | 'WARNING' | 'ERROR',
+  message: string,
+  scope?: { userId?: string; publicMarket?: boolean }
+) {
   const now = new Date();
   const formatted = now.toISOString().replace('T', ' ').slice(0, 19);
+  const isDefaultPublic =
+    scope?.publicMarket !== undefined
+      ? scope.publicMarket
+      : logger === 'freqtrade.scanner' || logger === 'freqtrade.worker';
   botLogs.push({
     timestamp: formatted,
     epoch: now.getTime(),
     logger,
     level,
     message,
+    userId: scope?.userId,
+    publicMarket: isDefaultPublic,
   });
-  if (botLogs.length > 250) botLogs.shift();
+  if (botLogs.length > 350) botLogs.shift();
 }
 
 let tradesStore: FreqtradeTrade[] = [];
@@ -1895,6 +1908,7 @@ interface ChartDrawingObject {
   color: string;
   text?: string;
   locked?: boolean;
+  user_id?: string;
   created_at: string;
 }
 
@@ -1911,6 +1925,7 @@ interface ExchangeAccountRecord {
   api_key_masked: string;
   has_passphrase?: boolean;
   is_owner: boolean;
+  user_id: string;
   client_access_code: string;
   enabled: boolean;
   copy_trading: boolean;
@@ -1934,7 +1949,15 @@ interface ExchangeAccountRecord {
   network_label?: string;
 }
 
-function hasConnectedExchangeAccount(): boolean {
+function serializeAccountForClient(acc: ExchangeAccountRecord) {
+  const { api_key_raw: _k, api_secret_raw: _s, passphrase_raw: _p, ...safe } = acc;
+  return safe;
+}
+
+function hasConnectedExchangeAccount(userId?: string): boolean {
+  if (userId) {
+    return exchangeAccountsStore.some((a) => a.enabled && (a.user_id || 'owner') === userId);
+  }
   return exchangeAccountsStore.some((a) => a.enabled);
 }
 
@@ -1968,19 +1991,44 @@ function getCompoundedAccountBalance(accountId = 'master'): {
   closedNetProfit: number;
   compoundedBalance: number;
 } {
-  if (!hasConnectedExchangeAccount()) {
-    return { baseDeposit: 0, closedNetProfit: 0, compoundedBalance: 0 };
-  }
   if (accountId === 'master') {
-    const ownerAcc =
-      exchangeAccountsStore.find((a) => a.enabled && a.is_owner) ||
-      exchangeAccountsStore.find((a) => a.enabled);
-    const rawBalance = Number(
-      ownerAcc?.wallet_balance_usdt ?? ownerAcc?.balance_usdt ?? botConfig.starting_balance ?? 5000
-    );
+    const ownerAccs = getMasterScopeOwnerAccounts();
+    if (ownerAccs.length === 0) {
+      return { baseDeposit: 0, closedNetProfit: 0, compoundedBalance: 0 };
+    }
+    const ownerAcc = ownerAccs[0];
     const closedNetProfit = tradesStore
-      .filter((t) => !t.is_open && (!t.account_id || t.account_id === 'master'))
+      .filter((t) => !t.is_open && isTradeInMasterScope(t))
       .reduce((sum, t) => sum + (t.net_profit ?? t.profit_abs ?? 0), 0);
+
+    if (ownerAccs.length > 1) {
+      let sumWallet = 0;
+      let sumBaseDep = 0;
+      for (const a of ownerAccs) {
+        const wBal = Number(a.wallet_balance_usdt ?? a.balance_usdt ?? 0);
+        const targetId = getTargetAccountIdForRecord(a);
+        const aClosed = tradesStore
+          .filter((t) => !t.is_open && tradeMatchesAccount(t, a, targetId))
+          .reduce((s, t) => s + (t.net_profit ?? t.profit_abs ?? 0), 0);
+        sumWallet += wBal;
+        const isReal = Boolean(a.api_key_raw && !isSimulatedTestApiKey(a.api_key_raw));
+        sumBaseDep += isReal ? inferInitialDeposit(a, wBal, aClosed) : wBal;
+      }
+      const anySim = ownerAccs.some(
+        (a) => !a.api_key_raw || isSimulatedTestApiKey(a.api_key_raw)
+      );
+      return {
+        baseDeposit: Number(sumBaseDep.toFixed(2)),
+        closedNetProfit: Number(closedNetProfit.toFixed(2)),
+        compoundedBalance: Number(
+          Math.max(0, anySim ? sumWallet + closedNetProfit : sumWallet).toFixed(2)
+        ),
+      };
+    }
+
+    const rawBalance = Number(
+      ownerAcc?.wallet_balance_usdt ?? ownerAcc?.balance_usdt ?? botConfig.starting_balance ?? 0
+    );
     const isRealExchangeAcc = Boolean(
       ownerAcc?.api_key_raw && !isSimulatedTestApiKey(ownerAcc.api_key_raw)
     );
@@ -1998,16 +2046,20 @@ function getCompoundedAccountBalance(accountId = 'master'): {
       compoundedBalance: Number(Math.max(10, rawBalance + closedNetProfit).toFixed(2)),
     };
   }
-  const clientAcc = exchangeAccountsStore.find((a) => a.id === accountId);
-  const rawBalance = Number(clientAcc?.wallet_balance_usdt ?? clientAcc?.balance_usdt ?? 1000);
+  const targetAcc = exchangeAccountsStore.find((a) => a.id === accountId);
+  if (!targetAcc) {
+    return { baseDeposit: 0, closedNetProfit: 0, compoundedBalance: 0 };
+  }
+  const targetId = getTargetAccountIdForRecord(targetAcc);
+  const rawBalance = Number(targetAcc.wallet_balance_usdt ?? targetAcc.balance_usdt ?? 1000);
   const closedNetProfit = tradesStore
-    .filter((t) => !t.is_open && t.account_id === accountId)
+    .filter((t) => !t.is_open && tradeMatchesAccount(t, targetAcc, targetId))
     .reduce((sum, t) => sum + (t.net_profit ?? t.profit_abs ?? 0), 0);
-  const isRealClientAcc = Boolean(
-    clientAcc?.api_key_raw && !isSimulatedTestApiKey(clientAcc.api_key_raw)
+  const isRealAcc = Boolean(
+    targetAcc.api_key_raw && !isSimulatedTestApiKey(targetAcc.api_key_raw)
   );
-  if (isRealClientAcc) {
-    const baseDep = inferInitialDeposit(clientAcc, rawBalance, closedNetProfit);
+  if (isRealAcc) {
+    const baseDep = inferInitialDeposit(targetAcc, rawBalance, closedNetProfit);
     return {
       baseDeposit: baseDep,
       closedNetProfit: Number(closedNetProfit.toFixed(2)),
@@ -2396,37 +2448,33 @@ async function initializeBotTrades() {
     cleanTrades.unshift(t);
   }
 
-  // 4. Восстанавливаем связь synced_accounts для сделок владельца по привязанным сделкам клиентов (parent_trade_id)
   for (const t of cleanTrades) {
-    if (!t.account_id || t.account_id === 'master') {
-      const linkedClients = cleanTrades.filter(
-        (ct) => ct.account_id && ct.account_id !== 'master' && ct.parent_trade_id === t.trade_id
-      );
-      if (linkedClients.length > 0) {
-        t.synced_accounts = Array.from(
-          new Set([...(t.synced_accounts || []), ...linkedClients.map((c) => c.account_name || 'Client')])
-        );
-      }
+    const acc = t.account_id && t.account_id !== 'master'
+      ? exchangeAccountsStore.find((a) => a.id === t.account_id)
+      : resolveExchangeAccountRecord('master');
+    if (acc && (!t.user_id || t.user_id === 'owner') && (acc.user_id || 'owner') !== 'owner') {
+      t.user_id = acc.user_id;
     }
+    if (!t.user_id) t.user_id = 'owner';
     sqliteDb.upsertTrade(t);
   }
 
   tradesStore = cleanTrades;
 
   // Строгое правило: без подключенного биржевого аккаунта бот остановлен (но все существующие сделки в БД сохранены)
-  botConfig.state = hasActiveExchange ? 'running' : 'stopped';
+  botConfig.state = hasActiveExchange && !ownerManuallyStoppedBot ? 'running' : 'stopped';
 
   const maxExistingId = tradesStore.reduce((m, t) => Math.max(m, t.trade_id || 0), 0);
   nextTradeId = maxExistingId + 1;
 
   const openMasterCount = tradesStore.filter(
-    (t) => t.is_open && (!t.account_id || t.account_id === 'master')
+    (t) => t.is_open && resolveTradeUserId(t) === 'owner'
   ).length;
   const averagedMasterCount = tradesStore.filter(
-    (t) => t.is_open && (!t.account_id || t.account_id === 'master') && (t.dca_count || 0) > 0
+    (t) => t.is_open && resolveTradeUserId(t) === 'owner' && (t.dca_count || 0) > 0
   ).length;
   const totalDcaStepsRestored = tradesStore
-    .filter((t) => t.is_open && (!t.account_id || t.account_id === 'master'))
+    .filter((t) => t.is_open && resolveTradeUserId(t) === 'owner')
     .reduce((sum, t) => sum + (t.dca_count || 0), 0);
 
   appendLog(
@@ -2434,12 +2482,14 @@ async function initializeBotTrades() {
     hasActiveExchange ? 'INFO' : 'WARNING',
     hasActiveExchange
       ? `Starting ScalpBot (${botConfig.version}) | Strategy: ${botConfig.strategy} (${botConfig.timeframe}) | Leverage: ${botConfig.leverage}x ${botConfig.margin_mode} | Active Exchanges: ${exchangeAccountsStore.filter((a) => a.enabled).length}`
-      : `ScalpBot ожидает подключения биржи (state: STOPPED). Подключите API-ключи во вкладке «API / Клиенты» для запуска анализа и торговли.`
+      : `ScalpBot ожидает подключения биржи (state: STOPPED). Подключите API-ключи во вкладке «API / Биржи» для запуска анализа и торговли.`,
+    { publicMarket: true }
   );
   appendLog(
     'freqtrade.database',
     'INFO',
-    `🔄 Восстановлено состояние из trades.sqlite после старта/перезапуска: открытых сделок владельца=${openMasterCount} (из них усреднённых=${averagedMasterCount}, шагов DCA=${totalDcaStepsRestored}), всего сделок в памяти=${tradesStore.length}, аккаунтов=${exchangeAccountsStore.length}`
+    `🔄 Восстановлено состояние из trades.sqlite после старта/перезапуска: открытых сделок владельца=${openMasterCount} (из них усреднённых=${averagedMasterCount}, шагов DCA=${totalDcaStepsRestored}), всего сделок в памяти=${tradesStore.length}, аккаунтов=${exchangeAccountsStore.length}`,
+    { userId: 'owner' }
   );
 
   if (hasActiveExchange) {
@@ -2455,6 +2505,16 @@ async function initializeBotTrades() {
 }
 
 let lastExchangeBalanceSyncTs = 0;
+const accInitialPosSynced = new Set<string>();
+
+function isOwnerAccountRecord(acc: ExchangeAccountRecord | undefined): boolean {
+  if (!acc) return false;
+  return (acc.user_id || 'owner') === 'owner';
+}
+
+function getMasterScopeOwnerAccounts(): ExchangeAccountRecord[] {
+  return exchangeAccountsStore.filter((a) => a.enabled && (a.user_id || 'owner') === 'owner');
+}
 
 function resolveExchangeAccountRecord(
   accOrId: ExchangeAccountRecord | string | undefined
@@ -2462,10 +2522,53 @@ function resolveExchangeAccountRecord(
   if (!accOrId) return undefined;
   if (typeof accOrId !== 'string') return accOrId;
   if (accOrId === 'master') {
-    const active = exchangeAccountsStore.filter((a) => a.enabled);
-    return active.find((a) => a.is_owner) || active[0];
+    const ownerPool = exchangeAccountsStore.filter((a) => (a.user_id || 'owner') === 'owner');
+    const activeOwner = ownerPool.filter((a) => a.enabled);
+    return (
+      activeOwner.find((a) => a.is_owner) ||
+      activeOwner[0] ||
+      ownerPool.find((a) => a.is_owner) ||
+      ownerPool[0]
+    );
   }
   return exchangeAccountsStore.find((a) => a.id === accOrId);
+}
+
+function getTargetAccountIdForRecord(acc: ExchangeAccountRecord): string {
+  if ((acc.user_id || 'owner') !== 'owner') {
+    return acc.id;
+  }
+  const primary = resolveExchangeAccountRecord('master');
+  if (primary && primary.id === acc.id) return 'master';
+  return acc.id;
+}
+
+function resolveTradeUserId(t: FreqtradeTrade): string {
+  if (t.user_id && t.user_id !== 'owner') return t.user_id;
+  if (t.account_id && t.account_id !== 'master') {
+    const acc = exchangeAccountsStore.find((a) => a.id === t.account_id);
+    if (acc?.user_id) return acc.user_id;
+  }
+  return t.user_id || 'owner';
+}
+
+function isTradeInMasterScope(t: FreqtradeTrade): boolean {
+  return resolveTradeUserId(t) === 'owner';
+}
+
+function tradeMatchesAccount(
+  t: FreqtradeTrade,
+  acc: ExchangeAccountRecord,
+  targetAccountId: string
+): boolean {
+  if ((acc.user_id || 'owner') !== resolveTradeUserId(t)) return false;
+  if (targetAccountId === 'master') {
+    return (
+      ((!t.account_id || t.account_id === 'master') && t.exchange === acc.exchange) ||
+      t.account_id === acc.id
+    );
+  }
+  return t.account_id === targetAccountId || t.account_id === acc.id;
 }
 
 function getAccountCredentialsFromStore(
@@ -2543,7 +2646,8 @@ async function dispatchOrderToExchangeAccount(
       appendLog(
         `freqtrade.exchange.${acc.exchange}`,
         'INFO',
-        `✅ [${netTag} LIVE ORDER] Исполнен ордер на бирже (${acc.name}): ${params.action} [${params.pair}] ${orderRes.side} ${orderRes.qty} @ ${orderRes.price}$ (комиссия: ${orderRes.commission_usdt ?? 0}$) | OrderID: ${orderRes.order_id}`
+        `✅ [${netTag} LIVE ORDER] Исполнен ордер на бирже (${acc.name}): ${params.action} [${params.pair}] ${orderRes.side} ${orderRes.qty} @ ${orderRes.price}$ (комиссия: ${orderRes.commission_usdt ?? 0}$) | OrderID: ${orderRes.order_id}`,
+        { userId: acc.user_id || 'owner' }
       );
       // При OPEN синхронизацию запускает сам createScalpBotPosition ПОСЛЕ записи сделки в БД, чтобы исключить гонку и дубли
       if (params.action !== 'OPEN') {
@@ -2553,7 +2657,8 @@ async function dispatchOrderToExchangeAccount(
       appendLog(
         `freqtrade.exchange.${acc.exchange}`,
         'ERROR',
-        `❌ [${netTag} ORDER REJECTED] Биржа отклонила ордер (${acc.name}) при ${params.action} [${params.pair}]: ${orderRes.error || 'Неизвестная ошибка биржи'}`
+        `❌ [${netTag} ORDER REJECTED] Биржа отклонила ордер (${acc.name}) при ${params.action} [${params.pair}]: ${orderRes.error || 'Неизвестная ошибка биржи'}`,
+        { userId: acc.user_id || 'owner' }
       );
     }
   }
@@ -2568,7 +2673,7 @@ function reconcileExchangeAccountOpenDuplicates(targetAccountId: string): void {
     if (!t.is_open) continue;
     const tAcc = t.account_id || 'master';
     if (tAcc !== targetAccountId) continue;
-    const key = `${t.pair}::${t.is_short ? 'short' : 'long'}`;
+    const key = `${t.exchange}::${t.pair}::${t.is_short ? 'short' : 'long'}`;
     const arr = grouped.get(key) || [];
     arr.push(t);
     grouped.set(key, arr);
@@ -2609,27 +2714,164 @@ function reconcileExchangeAccountOpenDuplicates(targetAccountId: string): void {
   }
 }
 
+async function enrichImportedPositionMtfLevelsAsync(
+  tradeId: number,
+  acc: ExchangeAccountRecord,
+  pos: {
+    pair: string;
+    is_short: boolean;
+    entry_price: number;
+    take_profit?: number;
+  },
+  creds: NonNullable<ReturnType<typeof getAccountCredentialsFromStore>>
+): Promise<void> {
+  try {
+    const [{ candles: c1w }, { candles: c1d }, { candles: c4h }, { candles: c1h }] =
+      await Promise.all([
+        fetchRealCandles(pos.pair, '1w', 300),
+        fetchRealCandles(pos.pair, '1d', 1000),
+        fetchRealCandles(pos.pair, '4h', 1000),
+        fetchRealCandles(pos.pair, '1h', 200),
+      ]);
+    const refreshedLvls = await getOrComputeMtfBotLevels(
+      pos.pair,
+      botConfig.timeframe,
+      true
+    ).catch(() => [] as BotChartLevel[]);
+
+    const liveTrade = tradesStore.find((t) => t.trade_id === tradeId && t.is_open);
+    if (!liveTrade) return;
+
+    const entryRate = liveTrade.open_rate;
+    const lev = liveTrade.leverage || acc.max_leverage || 25;
+    const stakeUsdt = liveTrade.stake_amount || 25;
+    const posTp = Number(pos.take_profit || 0);
+
+    const manualSup = refreshedLvls.find(
+      (l) =>
+        l.role === 'support' &&
+        l.manual_override &&
+        !l.id.startsWith('lvl-') &&
+        l.price < entryRate
+    );
+    const manualRes = refreshedLvls.find(
+      (l) =>
+        l.role === 'resistance' &&
+        l.manual_override &&
+        !l.id.startsWith('lvl-') &&
+        l.price > entryRate
+    );
+    const manualDcaSup =
+      manualSup && (entryRate - manualSup.price) / Math.max(1e-8, entryRate) >= 0.028
+        ? manualSup
+        : undefined;
+    const manualDcaRes =
+      manualRes && (manualRes.price - entryRate) / Math.max(1e-8, entryRate) >= 0.028
+        ? manualRes
+        : undefined;
+    const hasManualSup = Boolean(manualDcaSup);
+    const hasManualRes = Boolean(manualDcaRes);
+
+    if (c4h.length >= 20) {
+      const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d, undefined, c1w);
+      liveTrade.support_level = manualSup ? roundPrice(manualSup.price) : roundPrice(mtf.key_4h_support);
+      liveTrade.resistance_level = manualRes ? roundPrice(manualRes.price) : roundPrice(mtf.key_4h_resistance);
+
+      if (!liveTrade.tp_manual_override && !(posTp > 0)) {
+        liveTrade.take_profit_abs = roundPrice(
+          liveTrade.is_short ? mtf.recommended_tp_short : mtf.recommended_tp_long
+        );
+      }
+
+      if (!liveTrade.dca_manual_override) {
+        const strongDca = findStrongestDcaLevel(c4h, c1d, entryRate, liveTrade.is_short, 2.8, 95.0, c1w);
+        const dcaPrice1 =
+          !liveTrade.is_short && manualDcaSup
+            ? roundPrice(manualDcaSup.price)
+            : liveTrade.is_short && manualDcaRes
+            ? roundPrice(manualDcaRes.price)
+            : roundPrice(strongDca.price);
+        const dcaPrice2 = roundPrice(strongDca.second_price);
+        const dcaSource =
+          (!liveTrade.is_short && manualDcaSup) || (liveTrade.is_short && manualDcaRes)
+            ? 'MANUAL_LVL'
+            : strongDca.source;
+
+        liveTrade.planned_dca_levels = [
+          {
+            step: 1,
+            label: `DCA 1 (${dcaSource})`,
+            price: dcaPrice1,
+            stake_amount: stakeUsdt,
+            amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice1)).toFixed(4)),
+            distance_pct: Number((((dcaPrice1 - entryRate) / entryRate) * 100).toFixed(2)),
+            manual_override: (!liveTrade.is_short && hasManualSup) || (liveTrade.is_short && hasManualRes),
+          },
+          {
+            step: 2,
+            label: `DCA 2 (${liveTrade.is_short ? 'Abs Peak' : 'Abs Bottom'})`,
+            price: dcaPrice2,
+            stake_amount: stakeUsdt,
+            amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice2)).toFixed(4)),
+            distance_pct: Number((((dcaPrice2 - entryRate) / entryRate) * 100).toFixed(2)),
+            manual_override: false,
+          },
+        ];
+        liveTrade.next_dca_price = dcaPrice1;
+        liveTrade.plan_notes = `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) и проанализирована (1D=${mtf.d1_trend} | SUP=${liveTrade.support_level}$ | RES=${liveTrade.resistance_level}$ | DCA1=${dcaPrice1}$ | DCA2=${dcaPrice2}$)`;
+      }
+
+      recalculateTradeMetrics(liveTrade, false);
+      if (!liveTrade.tp_manual_override && liveTrade.min_profitable_tp) {
+        liveTrade.take_profit_abs = liveTrade.is_short
+          ? Math.min(liveTrade.take_profit_abs || liveTrade.min_profitable_tp, liveTrade.min_profitable_tp)
+          : Math.max(liveTrade.take_profit_abs || liveTrade.min_profitable_tp, liveTrade.min_profitable_tp);
+        recalculateTradeMetrics(liveTrade, false);
+      }
+
+      sqliteDb.upsertTrade(liveTrade);
+
+      if (!(posTp > 0) && liveTrade.take_profit_abs && liveTrade.take_profit_abs > 0) {
+        placeOrUpdateExchangeTakeProfitOrder(creds, {
+          pair: pos.pair,
+          isShort: liveTrade.is_short,
+          quantity: liveTrade.amount,
+          takeProfitPrice: liveTrade.take_profit_abs,
+        }).catch(() => {});
+      }
+
+      broadcastTradeLifecycleEvent('trade:updated', liveTrade);
+      scheduleScopeStateSync(resolveTradeUserId(liveTrade));
+    }
+  } catch {
+    // ignore background candle enrichment errors
+  }
+}
+
 async function syncPositionsAndHistoryFromExchanges(
   acc: ExchangeAccountRecord,
-  forceReanalyzeOpen = false
+  forceReanalyzeOpen = false,
+  forceFreshFetch = false
 ): Promise<void> {
   const creds = getAccountCredentialsFromStore(acc);
   if (!creds || isSimulatedTestApiKey(creds.apiKey)) return;
 
-  const masterOwnerAcc = resolveExchangeAccountRecord('master');
-  const isEffectiveMaster = Boolean(acc.is_owner || (masterOwnerAcc && acc.id === masterOwnerAcc.id));
-  const targetAccountId = isEffectiveMaster ? 'master' : acc.id;
-  const targetAccountName = isEffectiveMaster ? 'Master' : acc.name;
+  const targetAccountId = getTargetAccountIdForRecord(acc);
+  const targetAccountName = targetAccountId === 'master' ? 'Master' : acc.name;
 
   reconcileExchangeAccountOpenDuplicates(targetAccountId);
 
   try {
-    // 1. Всегда запрашиваем ТОЛЬКО открытые позиции с биржи (закрытую историю биржи НЕ импортируем при подключении!)
-    const openPosRes = await fetchExchangeOpenPositions(creds);
+    // 1. Всегда запрашиваем открытые позиции с биржи; при первом запуске/ручном обновлении обходим кэш (forceFresh)
+    const shouldForceFresh = Boolean(forceReanalyzeOpen || forceFreshFetch || !accInitialPosSynced.has(acc.id));
+    const openPosRes = await fetchExchangeOpenPositions(creds, shouldForceFresh);
 
     if (openPosRes.success) {
+      accInitialPosSynced.add(acc.id);
       let totalPosUnrealized = 0;
       let totalPosMargin = 0;
+      let anyLifecycleChange = false;
+
       for (const pos of openPosRes.positions) {
         totalPosUnrealized += Number(pos.unrealized_pnl || 0);
         totalPosMargin += Number(pos.margin_usdt || 0);
@@ -2640,9 +2882,7 @@ async function syncPositionsAndHistoryFromExchanges(
         const existingOpen = tradesStore.find(
           (t) =>
             t.is_open &&
-            (targetAccountId === 'master'
-              ? !t.account_id || t.account_id === 'master'
-              : t.account_id === targetAccountId) &&
+            tradeMatchesAccount(t, acc, targetAccountId) &&
             t.pair === pos.pair &&
             t.is_short === pos.is_short
         );
@@ -2667,141 +2907,19 @@ async function syncPositionsAndHistoryFromExchanges(
             existingOpen.leverage = pos.leverage || existingOpen.leverage;
           }
 
-          // При отсутствии плановых DCA ИЛИ при подключении / восстановлении связи анализируем открытую позицию (1D -> 4H)
+          // При отсутствии плановых DCA ИЛИ при подключении / восстановлении связи доанализируем асинхронно, не тормозя синхронизацию других позиций
           const hasExistingPlannedDca =
             Array.isArray(existingOpen.planned_dca_levels) &&
             existingOpen.planned_dca_levels.length >= 2 &&
             existingOpen.planned_dca_levels.every((l) => l.price > 0);
-          const hasManualDcaStep1 = Boolean(existingOpen.planned_dca_levels?.[0]?.manual_override);
-          const hasManualDcaStep2 = Boolean(existingOpen.planned_dca_levels?.[1]?.manual_override);
-
           if (!existingOpen.dca_manual_override && (!hasExistingPlannedDca || forceReanalyzeOpen)) {
-            try {
-              const [{ candles: c1w }, { candles: c1d }, { candles: c4h }, { candles: c1h }] =
-                await Promise.all([
-                  fetchRealCandles(pos.pair, '1w', 300),
-                  fetchRealCandles(pos.pair, '1d', 1000),
-                  fetchRealCandles(pos.pair, '4h', 1000),
-                  fetchRealCandles(pos.pair, '1h', 200),
-                ]);
-              if (c4h.length >= 20) {
-                const refreshedLvls = await getOrComputeMtfBotLevels(
-                  pos.pair,
-                  botConfig.timeframe,
-                  forceReanalyzeOpen
-                ).catch(() => [] as BotChartLevel[]);
-                const manualSup = refreshedLvls.find(
-                  (l) =>
-                    l.role === 'support' &&
-                    l.manual_override &&
-                    !l.id.startsWith('lvl-') &&
-                    l.price < existingOpen.open_rate
-                );
-                const manualRes = refreshedLvls.find(
-                  (l) =>
-                    l.role === 'resistance' &&
-                    l.manual_override &&
-                    !l.id.startsWith('lvl-') &&
-                    l.price > existingOpen.open_rate
-                );
-                const manualDcaSup =
-                  manualSup &&
-                  (existingOpen.open_rate - manualSup.price) / Math.max(1e-8, existingOpen.open_rate) >= 0.028
-                    ? manualSup
-                    : undefined;
-                const manualDcaRes =
-                  manualRes &&
-                  (manualRes.price - existingOpen.open_rate) / Math.max(1e-8, existingOpen.open_rate) >= 0.028
-                    ? manualRes
-                    : undefined;
-                const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d, undefined, c1w);
-                const strongDca = findStrongestDcaLevel(
-                  c4h,
-                  c1d,
-                  existingOpen.open_rate,
-                  existingOpen.is_short,
-                  2.8,
-                  95.0,
-                  c1w
-                );
-                existingOpen.support_level = manualSup
-                  ? roundPrice(manualSup.price)
-                  : roundPrice(mtf.key_4h_support);
-                existingOpen.resistance_level = manualRes
-                  ? roundPrice(manualRes.price)
-                  : roundPrice(mtf.key_4h_resistance);
-
-                const lev = existingOpen.leverage || pos.leverage || acc.max_leverage || 25;
-                const dcaStake = Math.max(5, existingOpen.stake_amount || 25);
-                const boundDca1 =
-                  !existingOpen.is_short && manualDcaSup
-                    ? roundPrice(manualDcaSup.price)
-                    : existingOpen.is_short && manualDcaRes
-                    ? roundPrice(manualDcaRes.price)
-                    : roundPrice(strongDca.price);
-                const boundDca2 = roundPrice(strongDca.second_price);
-
-                if (!existingOpen.planned_dca_levels || existingOpen.planned_dca_levels.length < 2) {
-                  existingOpen.planned_dca_levels = [
-                    {
-                      step: 1,
-                      label: `DCA 1 (${(!existingOpen.is_short && manualDcaSup) || (existingOpen.is_short && manualDcaRes) ? 'MANUAL_LVL' : strongDca.source})`,
-                      price: boundDca1,
-                      stake_amount: dcaStake,
-                      amount: Number(((dcaStake * lev) / Math.max(1e-8, boundDca1)).toFixed(4)),
-                      distance_pct: Number(
-                        (((boundDca1 - existingOpen.open_rate) / existingOpen.open_rate) * 100).toFixed(2)
-                      ),
-                      manual_override: Boolean((!existingOpen.is_short && manualDcaSup) || (existingOpen.is_short && manualDcaRes)),
-                    },
-                    {
-                      step: 2,
-                      label: `DCA 2 (${existingOpen.is_short ? 'Abs Peak' : 'Abs Bottom'})`,
-                      price: boundDca2,
-                      stake_amount: dcaStake,
-                      amount: Number(((dcaStake * lev) / Math.max(1e-8, boundDca2)).toFixed(4)),
-                      distance_pct: Number(
-                        (((boundDca2 - existingOpen.open_rate) / existingOpen.open_rate) * 100).toFixed(2)
-                      ),
-                      manual_override: false,
-                    },
-                  ];
-                } else {
-                  if (!hasManualDcaStep1) {
-                    existingOpen.planned_dca_levels[0].price = boundDca1;
-                    existingOpen.planned_dca_levels[0].label = `DCA 1 (${strongDca.source})`;
-                    existingOpen.planned_dca_levels[0].distance_pct = Number(
-                      (((boundDca1 - existingOpen.open_rate) / existingOpen.open_rate) * 100).toFixed(2)
-                    );
-                  }
-                  if (!hasManualDcaStep2) {
-                    existingOpen.planned_dca_levels[1].price = boundDca2;
-                    existingOpen.planned_dca_levels[1].label = `DCA 2 (${existingOpen.is_short ? 'Abs Peak' : 'Abs Bottom'})`;
-                    existingOpen.planned_dca_levels[1].distance_pct = Number(
-                      (((boundDca2 - existingOpen.open_rate) / existingOpen.open_rate) * 100).toFixed(2)
-                    );
-                  }
-                }
-                existingOpen.next_dca_price = existingOpen.planned_dca_levels[0].price;
-
-                if (
-                  !existingOpen.tp_manual_override &&
-                  (!existingOpen.take_profit_abs || existingOpen.take_profit_abs <= 0)
-                ) {
-                  existingOpen.take_profit_abs = roundPrice(
-                    existingOpen.is_short ? mtf.recommended_tp_short : mtf.recommended_tp_long
-                  );
-                }
-              }
-            } catch {
-              // ignore transient candle fetch error
-            }
+            void enrichImportedPositionMtfLevelsAsync(existingOpen.trade_id, acc, pos, creds);
           }
           recalculateTradeMetrics(existingOpen, false);
           sqliteDb.upsertTrade(existingOpen);
         } else {
-          // На бирже есть открытая позиция, которой еще нет на сайте (подключение бота или восстановление связи с сервером) —
-          // СРАЗУ проводим полный Top-Down анализ 1D -> 4H по всей истории, выставляем глобальные уровни, DCA по глобальным SUP/RES + абс. экстремуму и биржевой TP!
+          // На бирже есть открытая позиция, которой еще нет на сайте — НЕМЕДЛЕННО добавляем её в UI с базовыми уровнями,
+          // а глубокий 1W->1D->4H анализ запускаем параллельно в фоне (и обновляем карточку по готовности)!
           const id = nextTradeId++;
           const openTs = pos.created_time > 0 ? pos.created_time : Date.now();
           const openDateStr = new Date(openTs).toISOString().replace('T', ' ').slice(0, 19);
@@ -2814,83 +2932,14 @@ async function syncPositionsAndHistoryFromExchanges(
           const posSl = Number(pos.stop_loss || 0);
           const feeRate = getExchangeTakerFeeRate(acc.exchange);
 
-          let analyzedSup = roundPrice(pos.is_short ? entryRate * 0.985 : entryRate * 0.968);
-          let analyzedRes = roundPrice(pos.is_short ? entryRate * 1.032 : entryRate * 1.015);
-          let analyzedTp =
+          const analyzedSup = roundPrice(pos.is_short ? entryRate * 0.985 : entryRate * 0.968);
+          const analyzedRes = roundPrice(pos.is_short ? entryRate * 1.032 : entryRate * 1.015);
+          const analyzedTp =
             posTp > 0
               ? roundPrice(posTp)
               : roundPrice(pos.is_short ? entryRate * (1 - 0.012) : entryRate * (1 + 0.012));
-          let dcaPrice1 = roundPrice(pos.is_short ? entryRate * 1.032 : entryRate * 0.968);
-          let dcaPrice2 = roundPrice(pos.is_short ? entryRate * 1.068 : entryRate * 0.935);
-          let dcaSource = '1D/4H_GLOBAL';
-          let d1TrendLabel = 'NEUTRAL';
-          let hasManualSup = false;
-          let hasManualRes = false;
-
-          try {
-            const [{ candles: c1w }, { candles: c1d }, { candles: c4h }, { candles: c1h }] =
-              await Promise.all([
-                fetchRealCandles(pos.pair, '1w', 300),
-                fetchRealCandles(pos.pair, '1d', 1000),
-                fetchRealCandles(pos.pair, '4h', 1000),
-                fetchRealCandles(pos.pair, '1h', 200),
-              ]);
-            const refreshedLvls = await getOrComputeMtfBotLevels(
-              pos.pair,
-              botConfig.timeframe,
-              true
-            ).catch(() => [] as BotChartLevel[]);
-            const manualSup = refreshedLvls.find(
-              (l) =>
-                l.role === 'support' &&
-                l.manual_override &&
-                !l.id.startsWith('lvl-') &&
-                l.price < entryRate
-            );
-            const manualRes = refreshedLvls.find(
-              (l) =>
-                l.role === 'resistance' &&
-                l.manual_override &&
-                !l.id.startsWith('lvl-') &&
-                l.price > entryRate
-            );
-            const manualDcaSup =
-              manualSup && (entryRate - manualSup.price) / Math.max(1e-8, entryRate) >= 0.028
-                ? manualSup
-                : undefined;
-            const manualDcaRes =
-              manualRes && (manualRes.price - entryRate) / Math.max(1e-8, entryRate) >= 0.028
-                ? manualRes
-                : undefined;
-            hasManualSup = Boolean(manualDcaSup);
-            hasManualRes = Boolean(manualDcaRes);
-
-            if (c4h.length >= 20) {
-              const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d, undefined, c1w);
-              d1TrendLabel = mtf.d1_trend;
-              analyzedSup = manualSup ? roundPrice(manualSup.price) : roundPrice(mtf.key_4h_support);
-              analyzedRes = manualRes ? roundPrice(manualRes.price) : roundPrice(mtf.key_4h_resistance);
-              if (!(posTp > 0)) {
-                analyzedTp = roundPrice(
-                  pos.is_short ? mtf.recommended_tp_short : mtf.recommended_tp_long
-                );
-              }
-              const strongDca = findStrongestDcaLevel(c4h, c1d, entryRate, pos.is_short, 2.8, 95.0, c1w);
-              dcaPrice1 =
-                !pos.is_short && manualDcaSup
-                  ? roundPrice(manualDcaSup.price)
-                  : pos.is_short && manualDcaRes
-                  ? roundPrice(manualDcaRes.price)
-                  : roundPrice(strongDca.price);
-              dcaPrice2 = roundPrice(strongDca.second_price);
-              dcaSource =
-                (!pos.is_short && manualDcaSup) || (pos.is_short && manualDcaRes)
-                  ? 'MANUAL_LVL'
-                  : strongDca.source;
-            }
-          } catch {
-            // fallback to structural percentages if offline
-          }
+          const dcaPrice1 = roundPrice(pos.is_short ? entryRate * 1.032 : entryRate * 0.968);
+          const dcaPrice2 = roundPrice(pos.is_short ? entryRate * 1.068 : entryRate * 0.935);
 
           const importedTrade: FreqtradeTrade = {
             trade_id: id,
@@ -2902,7 +2951,7 @@ async function syncPositionsAndHistoryFromExchanges(
             exchange: acc.exchange,
             account_id: targetAccountId,
             account_name: targetAccountName,
-            synced_accounts: [acc.name],
+            user_id: acc.user_id || 'owner',
             amount: Number(pos.size.toFixed(4)),
             initial_amount: Number(pos.size.toFixed(4)),
             stake_amount: stakeUsdt,
@@ -2952,12 +3001,12 @@ async function syncPositionsAndHistoryFromExchanges(
             planned_dca_levels: [
               {
                 step: 1,
-                label: `DCA 1 (${dcaSource})`,
+                label: 'DCA 1 (1D/4H_GLOBAL)',
                 price: dcaPrice1,
                 stake_amount: stakeUsdt,
                 amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice1)).toFixed(4)),
                 distance_pct: Number((((dcaPrice1 - entryRate) / entryRate) * 100).toFixed(2)),
-                manual_override: (!pos.is_short && hasManualSup) || (pos.is_short && hasManualRes),
+                manual_override: false,
               },
               {
                 step: 2,
@@ -2971,7 +3020,7 @@ async function syncPositionsAndHistoryFromExchanges(
             ],
             support_level: analyzedSup,
             resistance_level: analyzedRes,
-            plan_notes: `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) и проанализирована (1D=${d1TrendLabel} | SUP=${analyzedSup}$ | RES=${analyzedRes}$ | DCA1=${dcaPrice1}$ | DCA2=${dcaPrice2}$)`,
+            plan_notes: `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) — выполняется MTF-анализ 1D/4H...`,
             trade_state: 'WAITING_PULLBACK',
             next_dca_price: dcaPrice1,
             tp_manual_override: posTp > 0,
@@ -2987,13 +3036,10 @@ async function syncPositionsAndHistoryFromExchanges(
             recalculateTradeMetrics(importedTrade, false);
           }
 
-          // Финальная проверка перед вставкой на случай, если сделка уже открыта другим асинхронным потоком пока загружались свечи
           const raceExisting = tradesStore.find(
             (t) =>
               t.is_open &&
-              (targetAccountId === 'master'
-                ? !t.account_id || t.account_id === 'master'
-                : t.account_id === targetAccountId) &&
+              tradeMatchesAccount(t, acc, targetAccountId) &&
               t.pair === pos.pair &&
               t.is_short === pos.is_short
           );
@@ -3003,28 +3049,23 @@ async function syncPositionsAndHistoryFromExchanges(
 
           tradesStore.unshift(importedTrade);
           sqliteDb.upsertTrade(importedTrade);
-
-          // Если на самой бирже еще не стоял Take-Profit ордер — выставляем наш рассчитанный безубыточный/профитный TP на биржу
-          if (!(posTp > 0) && importedTrade.take_profit_abs && importedTrade.take_profit_abs > 0) {
-            placeOrUpdateExchangeTakeProfitOrder(creds, {
-              pair: pos.pair,
-              isShort: pos.is_short,
-              quantity: importedTrade.amount,
-              takeProfitPrice: importedTrade.take_profit_abs,
-            }).catch(() => {});
-          }
+          broadcastTradeLifecycleEvent('trade:opened', importedTrade);
+          anyLifecycleChange = true;
 
           appendLog(
             `freqtrade.exchange.${acc.exchange}`,
             'INFO',
-            `🔄 [OPEN POSITION ANALYZED] Подтянута и проанализирована (1D->4H) открытая сделка с биржи ${acc.exchange.toUpperCase()} (${acc.name}): #${id} [${pos.pair}] ${pos.is_short ? 'SHORT' : 'LONG'} ${lev}x @ ${entryRate}$ | Global SUP: ${analyzedSup}$ | RES: ${analyzedRes}$ | TP: ${importedTrade.take_profit_abs}$ | DCA1: ${dcaPrice1}$ | DCA2: ${dcaPrice2}$`
+            `🔄 [OPEN POSITION SYNC] Мгновенно подтянута открытая сделка с биржи ${acc.exchange.toUpperCase()} (${acc.name}): #${id} [${pos.pair}] ${pos.is_short ? 'SHORT' : 'LONG'} ${lev}x @ ${entryRate}$ | TP: ${importedTrade.take_profit_abs}$`,
+            { userId: acc.user_id || 'owner' }
           );
+
+          // Запускаем глубокий анализ свечей 1W->1D->4H в фоне, не блокируя остальные позиции
+          void enrichImportedPositionMtfLevelsAsync(id, acc, pos, creds);
         }
       }
 
       acc.open_trades_count = openPosRes.positions.length;
       acc.unrealized_pnl = Number(totalPosUnrealized.toFixed(4));
-      // Всегда актуализируем маржу, эквити и свободный баланс аккаунта 1:1 с биржей
       acc.used_margin_usdt = Number(totalPosMargin.toFixed(2));
       const walletRef = acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0;
       if (walletRef > 0) {
@@ -3043,16 +3084,12 @@ async function syncPositionsAndHistoryFromExchanges(
       const stalePhantomIds = new Set<number>();
       for (const localT of tradesStore) {
         if (!localT.is_open) continue;
-        const belongsToAcc =
-          targetAccountId === 'master'
-            ? !localT.account_id || localT.account_id === 'master'
-            : localT.account_id === targetAccountId;
-        if (!belongsToAcc) continue;
+        if (!tradeMatchesAccount(localT, acc, targetAccountId)) continue;
         const hasSimOrder =
           Array.isArray(localT.orders) &&
           localT.orders.some((o: any) => String(o?.id || '').startsWith('sim-'));
         const noEnabledAccountForExchange = !enabledExchangesSet.has(localT.exchange);
-        const wrongExchangeForClient = targetAccountId !== 'master' && localT.exchange !== acc.exchange;
+        const wrongExchangeForClient = localT.exchange !== acc.exchange;
         if (hasSimOrder || noEnabledAccountForExchange || wrongExchangeForClient) {
           stalePhantomIds.add(localT.trade_id);
         }
@@ -3062,20 +3099,17 @@ async function syncPositionsAndHistoryFromExchanges(
           sqliteDb.deleteTrade(pid);
         }
         tradesStore = tradesStore.filter((t) => !stalePhantomIds.has(t.trade_id));
+        anyLifecycleChange = true;
       }
 
-      // Сначала зачищаем возможные локальные дубли, затем сверяем исчезнувшие позиции 1 к 1
       reconcileExchangeAccountOpenDuplicates(targetAccountId);
 
-      // 3. ТОЛЬКО для уже отслеженных ботом открытых сделок на ЭТОЙ бирже, которые исчезли из списка открытых на бирже:
-      // если биржа подтверждает реальное закрытие — пишем в историю ровно 1 раз; если подтверждения закрытия нет — удаляем фантом!
+      // 3. ТОЛЬКО для уже отслеженных ботом открытых сделок на ЭТОМ аккаунте/бирже, которые исчезли из списка открытых на бирже:
       const localOpenForAcc = tradesStore.filter(
         (t) =>
           t.is_open &&
           t.exchange === acc.exchange &&
-          (targetAccountId === 'master'
-            ? !t.account_id || t.account_id === 'master'
-            : t.account_id === targetAccountId) &&
+          tradeMatchesAccount(t, acc, targetAccountId) &&
           !activePositionKeys.has(getPosLockKey(targetAccountId, t.pair, t.is_short)) &&
           Date.now() - (t.open_timestamp || 0) > 20_000
       );
@@ -3117,7 +3151,8 @@ async function syncPositionsAndHistoryFromExchanges(
             appendLog(
               `freqtrade.exchange.${acc.exchange}`,
               'WARNING',
-              `🧹 Удалена фантомная локальная сделка #${localTrade.trade_id} [${localTrade.pair}], отсутствующая и среди открытых, и среди закрытых на бирже ${acc.exchange.toUpperCase()}.`
+              `🧹 Удалена фантомная локальная сделка #${localTrade.trade_id} [${localTrade.pair}], отсутствующая и среди открытых, и среди закрытых на бирже ${acc.exchange.toUpperCase()}.`,
+              { userId: acc.user_id || 'owner' }
             );
             continue;
           }
@@ -3149,16 +3184,24 @@ async function syncPositionsAndHistoryFromExchanges(
           recalculateTradeMetrics(localTrade, false);
 
           sqliteDb.upsertTrade(localTrade);
+          broadcastTradeLifecycleEvent('trade:closed', localTrade);
+          anyLifecycleChange = true;
           appendLog(
             `freqtrade.exchange.${acc.exchange}`,
             'INFO',
-            `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] закрыта на бирже ${acc.exchange.toUpperCase()} @ ${closePrice}$ | Реальный PnL биржи: ${localTrade.profit_abs}$ (Комиссия: ${localTrade.fee_total}$)`
+            `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] закрыта на бирже ${acc.exchange.toUpperCase()} @ ${closePrice}$ | Реальный PnL биржи: ${localTrade.profit_abs}$ (Комиссия: ${localTrade.fee_total}$)`,
+            { userId: acc.user_id || 'owner' }
           );
         }
 
         if (phantomIdsToDelete.size > 0) {
           tradesStore = tradesStore.filter((t) => !phantomIdsToDelete.has(t.trade_id));
+          anyLifecycleChange = true;
         }
+      }
+
+      if (anyLifecycleChange) {
+        scheduleScopeStateSync(acc.user_id || 'owner');
       }
     }
   } catch {
@@ -3228,7 +3271,8 @@ async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
           appendLog(
             'freqtrade.exchange.sync',
             'INFO',
-            `🔄 Синхронизирован счёт биржи ${check.network_label || acc.exchange.toUpperCase()} (${acc.name}): Баланс=${acc.balance_usdt.toFixed(2)} USDT | Плавающий PnL=${acc.unrealized_pnl >= 0 ? '+' : ''}${acc.unrealized_pnl.toFixed(2)} USDT | Пинг: ${check.latency_ms} мс`
+            `🔄 Синхронизирован счёт биржи ${check.network_label || acc.exchange.toUpperCase()} (${acc.name}): Баланс=${acc.balance_usdt.toFixed(2)} USDT | Плавающий PnL=${acc.unrealized_pnl >= 0 ? '+' : ''}${acc.unrealized_pnl.toFixed(2)} USDT | Пинг: ${check.latency_ms} мс`,
+            { userId: acc.user_id || 'owner' }
           );
         }
       } else {
@@ -3239,124 +3283,24 @@ async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
           appendLog(
             'freqtrade.exchange.sync',
             'WARNING',
-            `⚠️ Проверка связи с биржей ${acc.exchange.toUpperCase()} (${acc.name}): ${check.message}`
+            `⚠️ Проверка связи с биржей ${acc.exchange.toUpperCase()} (${acc.name}): ${check.message}`,
+            { userId: acc.user_id || 'owner' }
           );
         }
       }
       // Синхронизируем реальные открытые позиции и закрытые сделки с биржи
-      await syncPositionsAndHistoryFromExchanges(acc);
+      await syncPositionsAndHistoryFromExchanges(acc, false, force);
     } catch {
       // ignore transient network error
     }
   }
 }
 
-async function closeClientCopiesForMasterTrade(
-  masterTrade: FreqtradeTrade,
-  closeRate: number,
-  now: number,
-  nowStr: string,
-  exitReason: string
-): Promise<void> {
-  if (masterTrade.account_id && masterTrade.account_id !== 'master') return;
-  const clientCopies = tradesStore.filter(
-    (ct) =>
-      ct.is_open &&
-      ct.account_id &&
-      ct.account_id !== 'master' &&
-      (ct.parent_trade_id === masterTrade.trade_id ||
-        (ct.pair === masterTrade.pair &&
-          ct.is_short === masterTrade.is_short &&
-          (masterTrade.campaign_id ? ct.campaign_id === masterTrade.campaign_id : true)))
-  );
-
-  for (const ct of clientCopies) {
-    ct.current_rate = closeRate;
-    recalculateTradeMetrics(ct, false);
-    const clientGuard = verifySafeProfitableClose(ct, undefined, closeRate);
-    // ЗАПРЕТ ЗАКРЫТИЯ В МИНУС: проверяем чистый профит с учетом всех комиссий и резерва на проскальзывание
-    if (!clientGuard.ok) {
-      sqliteDb.upsertTrade(ct);
-      appendLog(
-        'freqtrade.copytrading',
-        'INFO',
-        `🛡️ Zero-Loss Guard: позиция клиента #${ct.trade_id} (${ct.account_name}) оставлена открытой (${clientGuard.reason}). Ожидание уверенного чистого плюса.`
-      );
-      continue;
-    }
-
-    const clientAcc = exchangeAccountsStore.find((a) => a.id === ct.account_id);
-    let clientCloseRes: PlacedOrderResult | null = null;
-    if (clientAcc) {
-      clientCloseRes = await dispatchOrderToExchangeAccount(clientAcc, {
-        pair: ct.pair,
-        action: 'CLOSE',
-        isShort: ct.is_short,
-        quantity: ct.amount,
-        referencePrice: closeRate,
-        leverage: ct.leverage || 25,
-      });
-      if (!isSimulatedTestApiKey(clientAcc.api_key_raw) && !clientCloseRes?.success) {
-        appendLog(
-          'freqtrade.copytrading',
-          'WARNING',
-          `⚠️ Не удалось закрыть копи-сделку #${ct.trade_id} клиента «${clientAcc.name}» на бирже: ${clientCloseRes?.error || 'Ордер отклонён'}`
-        );
-        continue;
-      }
-    }
-
-    const effectiveCloseRate =
-      clientCloseRes?.success && clientCloseRes.price > 0 ? roundPrice(clientCloseRes.price) : closeRate;
-    const effectiveNow =
-      clientCloseRes?.exchange_time && clientCloseRes.exchange_time > 0 ? clientCloseRes.exchange_time : now;
-    const effectiveNowStr = new Date(effectiveNow).toISOString().replace('T', ' ').slice(0, 19);
-
-    sqliteDb.runInTransaction(() => {
-      ct.is_open = false;
-      ct.close_rate = effectiveCloseRate;
-      ct.current_rate = effectiveCloseRate;
-      ct.close_date = effectiveNowStr;
-      ct.close_timestamp = effectiveNow;
-      if (clientCloseRes?.commission_usdt && clientCloseRes.commission_usdt > 0) {
-        ct.fee_close = Number(clientCloseRes.commission_usdt.toFixed(4));
-      }
-      ct.exit_reason = `copy_${exitReason}`;
-      ct.trade_state = 'CLOSED';
-      ct.planned_dca_levels = [];
-      recalculateTradeMetrics(ct, false);
-      sqliteDb.upsertTrade(ct);
-      sqliteDb.recordOrder({
-        trade_id: ct.trade_id,
-        pair: ct.pair,
-        order_type: 'market',
-        side: ct.is_short ? 'buy' : 'sell',
-        price: effectiveCloseRate,
-        amount: ct.amount,
-        cost: Number((effectiveCloseRate * ct.amount).toFixed(4)),
-        fee: ct.fee_close || 0,
-        realized_pnl: ct.net_profit || ct.profit_abs,
-        action_type: 'COPY_EXIT',
-        notes: `Copy exit on master closure: ${exitReason} @ ${effectiveCloseRate}`,
-      });
-    });
-
-    if (clientAcc) {
-      const netProfit = ct.net_profit || ct.profit_abs;
-      const { compoundedBalance } = getCompoundedAccountBalance(clientAcc.id);
-      appendLog(
-        'freqtrade.copytrading',
-        'INFO',
-        `💰 Клиент «${clientAcc.name}» (${clientAcc.exchange.toUpperCase()}): позиция #${ct.trade_id} синхронно закрыта в чистый плюс (+${netProfit}$, комиссия учтена). Реинвест-баланс: $${compoundedBalance}`
-      );
-    }
-  }
-}
-
 /**
- * Core ScalpBot processing loop (ported 1:1 from freqtrade/bot/freqtradebot.py::process):
- * 1. Updates active trades, checks Target TP, user-dragged SL, 4H Hedge leg exit, Strategy Exit with Pullback Guard, and Smart Level DCA.
- * 2. Scans active pairs (Volatility + 24h Gainers/Losers + Pairlist) for new entries when >= 1 API account is enabled.
+ * Core ScalpBot processing loop:
+ * 1. Updates ALL active enabled accounts' open trades (Target TP, SL, 4H Hedge Leg, Zero-Loss Guard, Smart Level DCA).
+ * 2. Scans active pairs once per cycle and independently opens positions for every enabled exchange account
+ *    based on each account's own wallet balance (0.5% stake), max leverage, and exchange tradability.
  */
 let isBotCycleRunning = false;
 async function runScalpBotCycle(waitForActive = false) {
@@ -3385,47 +3329,44 @@ async function runScalpBotCycle(waitForActive = false) {
     await syncRealExchangeBalancesIfNeeded(false);
 
     const activeAccounts = exchangeAccountsStore.filter((a) => a.enabled);
-    const ownerAcc = activeAccounts.find((a) => a.is_owner) || activeAccounts[0];
-    const isRealOwnerAcc = Boolean(
-      ownerAcc?.api_key_raw && !isSimulatedTestApiKey(ownerAcc.api_key_raw)
-    );
+    if (activeAccounts.length === 0) return;
 
-    // Если основной аккаунт подключен к реальной бирже (или Testnet/Demo), всегда синхронизируем позиции перед проверкой TP и DCA
-    let liveExchangePosMap = new Map<string, { mark_price: number; unrealized_pnl: number; size: number }>();
-    if (ownerAcc && isRealOwnerAcc) {
-      const creds = getAccountCredentialsFromStore(ownerAcc);
-      if (creds) {
-        const livePosRes = await fetchExchangeOpenPositions(creds);
-        if (livePosRes.success) {
-          for (const p of livePosRes.positions) {
-            liveExchangePosMap.set(`${p.pair}:${p.is_short ? 'S' : 'L'}`, {
-              mark_price: p.mark_price,
-              unrealized_pnl: p.unrealized_pnl,
-              size: p.size,
-            });
-          }
+    // Fetch live exchange positions for ALL real enabled accounts (keyed strictly per account ID)
+    const liveExchangePosMap = new Map<string, { mark_price: number; unrealized_pnl: number; size: number }>();
+    for (const acc of activeAccounts) {
+      if (!acc?.api_key_raw || isSimulatedTestApiKey(acc.api_key_raw)) continue;
+      const creds = getAccountCredentialsFromStore(acc);
+      if (!creds) continue;
+      const livePosRes = await fetchExchangeOpenPositions(creds);
+      if (livePosRes.success) {
+        for (const p of livePosRes.positions) {
+          liveExchangePosMap.set(`${acc.id}:${p.pair}:${p.is_short ? 'S' : 'L'}`, {
+            mark_price: p.mark_price,
+            unrealized_pnl: p.unrealized_pnl,
+            size: p.size,
+          });
         }
       }
     }
 
-    // Always refresh live prices on any open client trades first from real-time WS Mark Price
-    for (const ct of tradesStore) {
-      if (ct.is_open && ct.account_id && ct.account_id !== 'master') {
-        refreshTradeLivePriceFromWs(ct);
-        recalculateTradeMetrics(ct, false);
-      }
-    }
+    const openTrades = tradesStore.filter((t) => {
+      if (!t.is_open) return false;
+      const matchedAcc = resolveExchangeAccountRecord(t.account_id || 'master');
+      return Boolean(matchedAcc && matchedAcc.enabled && tradeMatchesAccount(t, matchedAcc, getTargetAccountIdForRecord(matchedAcc)));
+    });
 
-    const openTrades = tradesStore.filter(
-      (t) => t.is_open && (!t.account_id || t.account_id === 'master')
-    );
-
-    // 1. Evaluate all currently open master trades (TP, SL, 4H Hedge Leg, Pullback Exit Guard, Smart Level DCA)
+    // 1. Evaluate all currently open trades across all enabled accounts (TP, SL, 4H Hedge Leg, Smart Level DCA)
     for (const trade of openTrades) {
+      const tradeAcc = resolveExchangeAccountRecord(trade.account_id || 'master');
+      if (!tradeAcc || !tradeAcc.enabled) continue;
+      const tradeAccScopeId = getTargetAccountIdForRecord(tradeAcc);
+      const tradeUserId = resolveTradeUserId(trade);
       const { candles: candles1h } = await fetchRealCandles(trade.pair, trade.timeframe || botConfig.timeframe, 60);
       if (!candles1h || candles1h.length === 0) continue;
 
-      const liveExPos = liveExchangePosMap.get(`${trade.pair}:${trade.is_short ? 'S' : 'L'}`);
+      const liveExPos = liveExchangePosMap.get(
+        `${tradeAcc.id}:${trade.pair}:${trade.is_short ? 'S' : 'L'}`
+      );
       const execInfo = getFuturesExecutionPrice(trade.pair, trade.is_short, true, trade.exchange);
       const currentPrice =
         execInfo && execInfo.markPrice > 0
@@ -3452,14 +3393,6 @@ async function runScalpBotCycle(waitForActive = false) {
         trade.exchange_synced_at = Date.now();
       }
       recalculateTradeMetrics(trade, false);
-
-      // Sync current_rate to any open client copies for this pair
-      for (const ct of tradesStore) {
-        if (ct.is_open && ct.account_id && ct.account_id !== 'master' && ct.pair === trade.pair) {
-          refreshTradeLivePriceFromWs(ct);
-          recalculateTradeMetrics(ct, false);
-        }
-      }
 
       // ZERO-LOSS EXCHANGE GUARD: проверяем чистый PnL по фактической цене исполнения стакана (Bid/Ask) и Mark Price
       const execUnrealized =
@@ -3488,13 +3421,13 @@ async function runScalpBotCycle(waitForActive = false) {
           : currentPrice >= trade.take_profit_abs || closeExecPrice >= trade.take_profit_abs;
         if (isTpHit && closeProfitGuard.ok) {
           let closedInCycle = false;
-          const lockKey = getPosLockKey(trade.account_id || 'master', trade.pair, trade.is_short);
+          const lockKey = getPosLockKey(trade.account_id || tradeAccScopeId, trade.pair, trade.is_short);
           await withPositionLock(lockKey, async () => {
             if (!trade.is_open) {
               closedInCycle = true;
               return;
             }
-            const closeOrderRes = await dispatchOrderToExchangeAccount(ownerAcc, {
+            const closeOrderRes = await dispatchOrderToExchangeAccount(tradeAcc, {
               pair: trade.pair,
               action: 'CLOSE',
               isShort: trade.is_short,
@@ -3502,7 +3435,7 @@ async function runScalpBotCycle(waitForActive = false) {
               referencePrice: closeExecPrice,
               leverage: trade.leverage || 25,
             });
-            if (ownerAcc && !isSimulatedTestApiKey(ownerAcc.api_key_raw) && !closeOrderRes?.success) {
+            if (tradeAcc && !isSimulatedTestApiKey(tradeAcc.api_key_raw) && !closeOrderRes?.success) {
               return;
             }
 
@@ -3553,7 +3486,8 @@ async function runScalpBotCycle(waitForActive = false) {
                 const sibling = tradesStore.find(
                   (s) =>
                     s.is_open &&
-                    (!s.account_id || s.account_id === 'master') &&
+                    resolveTradeUserId(s) === tradeUserId &&
+                    tradeMatchesAccount(s, tradeAcc, tradeAccScopeId) &&
                     s.campaign_id === trade.campaign_id &&
                     s.trade_id !== trade.trade_id
                 );
@@ -3563,27 +3497,28 @@ async function runScalpBotCycle(waitForActive = false) {
                   appendLog(
                     'freqtrade.bot.hedge',
                     'INFO',
-                    `🏦 Hedge Campaign ${trade.campaign_id}: закрыта нога ${trade.pair} (${trade.is_short ? 'SHORT' : 'LONG'}) в чистый плюс +${trade.profit_abs}$ (после комиссии ${trade.fee_total}$). Вторая нога выводится в плюс через Smart DCA.`
+                    `🏦 Hedge Campaign ${trade.campaign_id} (${tradeAcc.name}): закрыта нога ${trade.pair} (${trade.is_short ? 'SHORT' : 'LONG'}) в чистый плюс +${trade.profit_abs}$ (после комиссии ${trade.fee_total}$). Вторая нога выводится в плюс через Smart DCA.`,
+                    { userId: tradeUserId }
                   );
                 }
               }
 
-              if (ownerAcc) {
-                const remMasterOpen = tradesStore.filter(
-                  (t) => t.is_open && (!t.account_id || t.account_id === 'master')
+              if (tradeAcc) {
+                const remAccOpen = tradesStore.filter(
+                  (t) => t.is_open && tradeMatchesAccount(t, tradeAcc, tradeAccScopeId)
                 );
-                ownerAcc.open_trades_count = remMasterOpen.length;
-                ownerAcc.used_margin_usdt = Number(remMasterOpen.reduce((s, t) => s + (t.stake_amount || 0), 0).toFixed(2));
-                ownerAcc.unrealized_pnl = Number(remMasterOpen.reduce((s, t) => s + (t.profit_abs || 0), 0).toFixed(4));
+                tradeAcc.open_trades_count = remAccOpen.length;
+                tradeAcc.used_margin_usdt = Number(remAccOpen.reduce((s, t) => s + (t.stake_amount || 0), 0).toFixed(2));
+                tradeAcc.unrealized_pnl = Number(remAccOpen.reduce((s, t) => s + (t.profit_abs || 0), 0).toFixed(4));
               }
             });
 
-            await closeClientCopiesForMasterTrade(trade, actualClosePrice, now, nowStr, 'roi_target_tp');
-            cooldownPairs.set(trade.pair, Date.now());
+            cooldownPairs.set(`${tradeAcc.id}:${trade.pair}`, Date.now());
             appendLog(
               'freqtrade.bot.exit',
               'INFO',
-              `🎯 Target TP Hit [${trade.pair}] #${trade.trade_id}: закрыто по реальной цене биржи ${actualClosePrice}$ | Чистый PnL: +${trade.profit_abs}$ (комиссия: ${trade.fee_total}$)`
+              `🎯 Target TP Hit [${trade.pair}] #${trade.trade_id} (${tradeAcc.name}): закрыто по реальной цене биржи ${actualClosePrice}$ | Чистый PnL: +${trade.profit_abs}$ (комиссия: ${trade.fee_total}$)`,
+              { userId: tradeUserId }
             );
             broadcastTradeLifecycleEvent('trade:closed', trade);
             closedInCycle = true;
@@ -3598,9 +3533,9 @@ async function runScalpBotCycle(waitForActive = false) {
           trade.take_profit_abs = trade.min_profitable_tp;
           recalculateTradeMetrics(trade, false);
           sqliteDb.upsertTrade(trade);
-          const ownerCreds = getAccountCredentialsFromStore(ownerAcc);
-          if (ownerCreds && !isSimulatedTestApiKey(ownerCreds.apiKey) && trade.take_profit_abs > 0) {
-            placeOrUpdateExchangeTakeProfitOrder(ownerCreds, {
+          const tradeCreds = getAccountCredentialsFromStore(tradeAcc);
+          if (tradeCreds && !isSimulatedTestApiKey(tradeCreds.apiKey) && trade.take_profit_abs > 0) {
+            placeOrUpdateExchangeTakeProfitOrder(tradeCreds, {
               pair: trade.pair,
               isShort: trade.is_short,
               quantity: trade.amount,
@@ -3619,13 +3554,13 @@ async function runScalpBotCycle(waitForActive = false) {
             : currentPrice >= trade.min_profitable_tp && closeExecPrice >= trade.min_profitable_tp;
           if (reachedMinProfit) {
             let closedHedgeInCycle = false;
-            const lockKey = getPosLockKey(trade.account_id || 'master', trade.pair, trade.is_short);
+            const lockKey = getPosLockKey(trade.account_id || tradeAccScopeId, trade.pair, trade.is_short);
             await withPositionLock(lockKey, async () => {
               if (!trade.is_open) {
                 closedHedgeInCycle = true;
                 return;
               }
-              const closeOrderRes = await dispatchOrderToExchangeAccount(ownerAcc, {
+              const closeOrderRes = await dispatchOrderToExchangeAccount(tradeAcc, {
                 pair: trade.pair,
                 action: 'CLOSE',
                 isShort: trade.is_short,
@@ -3633,7 +3568,7 @@ async function runScalpBotCycle(waitForActive = false) {
                 referencePrice: closeExecPrice,
                 leverage: trade.leverage || 25,
               });
-              if (ownerAcc && !isSimulatedTestApiKey(ownerAcc.api_key_raw) && !closeOrderRes?.success) {
+              if (tradeAcc && !isSimulatedTestApiKey(tradeAcc.api_key_raw) && !closeOrderRes?.success) {
                 return;
               }
 
@@ -3679,20 +3614,21 @@ async function runScalpBotCycle(waitForActive = false) {
                   action_type: 'HEDGE_PROFIT_EXIT',
                   notes: `2-я нога хеджа выведена в чистый плюс +${trade.profit_abs} USDT (комиссия: ${trade.fee_total} USDT)`,
                 });
-                if (ownerAcc) {
-                  const remMasterOpen = tradesStore.filter(
-                    (t) => t.is_open && (!t.account_id || t.account_id === 'master')
+                if (tradeAcc) {
+                  const remAccOpen = tradesStore.filter(
+                    (t) => t.is_open && tradeMatchesAccount(t, tradeAcc, tradeAccScopeId)
                   );
-                  ownerAcc.open_trades_count = remMasterOpen.length;
-                  ownerAcc.used_margin_usdt = Number(remMasterOpen.reduce((s, t) => s + (t.stake_amount || 0), 0).toFixed(2));
-                  ownerAcc.unrealized_pnl = Number(remMasterOpen.reduce((s, t) => s + (t.profit_abs || 0), 0).toFixed(4));
+                  tradeAcc.open_trades_count = remAccOpen.length;
+                  tradeAcc.used_margin_usdt = Number(remAccOpen.reduce((s, t) => s + (t.stake_amount || 0), 0).toFixed(2));
+                  tradeAcc.unrealized_pnl = Number(remAccOpen.reduce((s, t) => s + (t.profit_abs || 0), 0).toFixed(4));
                 }
               });
-              await closeClientCopiesForMasterTrade(trade, actualClosePrice, now, nowStr, 'hedge_breakeven_profit');
+              cooldownPairs.set(`${tradeAcc.id}:${trade.pair}`, Date.now());
               appendLog(
                 'freqtrade.bot.hedge',
                 'INFO',
-                `⚖️ 2-я нога хеджа #${trade.trade_id} [${trade.pair}] выведена в чистый плюс по ${actualClosePrice}$ (+${trade.profit_abs}$ после комиссий ${trade.fee_total}$). Обе ноги кампании закрыты в плюс!`
+                `⚖️ 2-я нога хеджа #${trade.trade_id} [${trade.pair}] (${tradeAcc.name}) выведена в чистый плюс по ${actualClosePrice}$ (+${trade.profit_abs}$ после комиссий ${trade.fee_total}$). Обе ноги кампании закрыты в плюс!`,
+                { userId: tradeUserId }
               );
               broadcastTradeLifecycleEvent('trade:closed', trade);
               closedHedgeInCycle = true;
@@ -3710,13 +3646,13 @@ async function runScalpBotCycle(waitForActive = false) {
           : currentPrice >= nextDcaTarget;
 
         if (reachedDcaLevel) {
-          const { compoundedBalance: totalDeposit } = getCompoundedAccountBalance('master');
+          const { compoundedBalance: totalDeposit } = getCompoundedAccountBalance(tradeAcc.id);
           const localUsedMargin = tradesStore
-            .filter((t) => t.is_open && (!t.account_id || t.account_id === 'master'))
+            .filter((t) => t.is_open && tradeMatchesAccount(t, tradeAcc, tradeAccScopeId))
             .reduce((acc, t) => acc + t.stake_amount, 0);
-          const isRealOwner = Boolean(ownerAcc?.api_key_raw && !isSimulatedTestApiKey(ownerAcc.api_key_raw));
+          const isRealOwner = Boolean(tradeAcc?.api_key_raw && !isSimulatedTestApiKey(tradeAcc.api_key_raw));
           const usedMargin = isRealOwner
-            ? Math.max(localUsedMargin, Number(ownerAcc?.used_margin_usdt || 0))
+            ? Math.max(localUsedMargin, Number(tradeAcc?.used_margin_usdt || 0))
             : localUsedMargin;
 
           const riskCheck = canExecuteDca(
@@ -3778,7 +3714,7 @@ async function runScalpBotCycle(waitForActive = false) {
 
               // 2. Dynamic DCA calculation: pulls average entry price as close to current reversal price as possible (within ~0.8%)
               const otherCoinsCount = tradesStore.filter(
-                (t) => t.is_open && (!t.account_id || t.account_id === 'master') && t.pair !== trade.pair
+                (t) => t.is_open && (tradeAcc ? tradeMatchesAccount(t, tradeAcc, tradeAccScopeId) : (!t.account_id || t.account_id === 'master')) && t.pair !== trade.pair
               ).length;
               const dynamicDca = calculateDynamicDcaAmount({
                 currentAmount: trade.amount,
@@ -3803,7 +3739,7 @@ async function runScalpBotCycle(waitForActive = false) {
               const dcaMultiplierRatio = addStake / Math.max(1, prevMasterStake);
 
               // Исполняем реальный рыночный ордер усреднения (DCA) на бирже владельца
-              const dcaOrderRes = await dispatchOrderToExchangeAccount(ownerAcc, {
+              const dcaOrderRes = await dispatchOrderToExchangeAccount(tradeAcc, {
                 pair: trade.pair,
                 action: 'DCA',
                 isShort: trade.is_short,
@@ -3811,7 +3747,7 @@ async function runScalpBotCycle(waitForActive = false) {
                 referencePrice: currentPrice,
                 leverage: trade.leverage || botConfig.leverage || 25,
               });
-              if (ownerAcc && !isSimulatedTestApiKey(ownerAcc.api_key_raw) && !dcaOrderRes?.success) {
+              if (tradeAcc && !isSimulatedTestApiKey(tradeAcc.api_key_raw) && !dcaOrderRes?.success) {
                 continue;
               }
               if (dcaOrderRes?.success && !dcaOrderRes.is_simulated_test && dcaOrderRes.qty > 0) {
@@ -3857,12 +3793,13 @@ async function runScalpBotCycle(waitForActive = false) {
                 const candidateSibling = tradesStore.find(
                   (s) =>
                     s.is_open &&
-                    (!s.account_id || s.account_id === 'master') &&
+                    resolveTradeUserId(s) === tradeUserId &&
+                    tradeMatchesAccount(s, tradeAcc, tradeAccScopeId) &&
                     s.campaign_id === trade.campaign_id &&
                     s.trade_id !== trade.trade_id
                 );
                 if (candidateSibling && (candidateSibling.net_profit ?? candidateSibling.profit_abs) > 0) {
-                  siblingCloseRes = await dispatchOrderToExchangeAccount(ownerAcc, {
+                  siblingCloseRes = await dispatchOrderToExchangeAccount(tradeAcc, {
                     pair: candidateSibling.pair,
                     action: 'CLOSE',
                     isShort: candidateSibling.is_short,
@@ -3870,7 +3807,7 @@ async function runScalpBotCycle(waitForActive = false) {
                     referencePrice: currentPrice,
                     leverage: candidateSibling.leverage || 25,
                   });
-                  if (!ownerAcc || isSimulatedTestApiKey(ownerAcc.api_key_raw) || siblingCloseRes?.success) {
+                  if (!tradeAcc || isSimulatedTestApiKey(tradeAcc.api_key_raw) || siblingCloseRes?.success) {
                     siblingToClose = candidateSibling;
                   }
                 }
@@ -3916,7 +3853,8 @@ async function runScalpBotCycle(waitForActive = false) {
                   appendLog(
                     'freqtrade.bot.hedge',
                     'INFO',
-                    `🏦 Hedge Reversal [${trade.pair}]: зафиксирован чистый профит по ${siblingToClose.is_short ? 'SHORT' : 'LONG'} (+${siblingToClose.profit_abs}$ после комиссии). Вторая нога максимально усредняется для подтягивания цены к рынку!`
+                    `🏦 Hedge Reversal [${trade.pair}] (${tradeAcc.name}): зафиксирован чистый профит по ${siblingToClose.is_short ? 'SHORT' : 'LONG'} (+${siblingToClose.profit_abs}$ после комиссии). Вторая нога максимально усредняется для подтягивания цены к рынку!`,
+                    { userId: tradeUserId }
                   );
                 }
 
@@ -4000,12 +3938,12 @@ async function runScalpBotCycle(waitForActive = false) {
                 sqliteDb.upsertTrade(trade);
 
                 // Сразу обновляем биржевой ордер Take-Profit на новую цену TP после усреднения (строго >= min_profitable_tp)
-                const ownerCreds = getAccountCredentialsFromStore(ownerAcc);
-                if (ownerCreds && !isSimulatedTestApiKey(ownerCreds.apiKey) && trade.take_profit_abs > 0) {
+                const tradeCreds = getAccountCredentialsFromStore(tradeAcc);
+                if (tradeCreds && !isSimulatedTestApiKey(tradeCreds.apiKey) && trade.take_profit_abs > 0) {
                   const safeExchangeTp = !trade.tp_manual_override && trade.min_profitable_tp
                     ? (trade.is_short ? Math.min(trade.take_profit_abs, trade.min_profitable_tp) : Math.max(trade.take_profit_abs, trade.min_profitable_tp))
                     : trade.take_profit_abs;
-                  placeOrUpdateExchangeTakeProfitOrder(ownerCreds, {
+                  placeOrUpdateExchangeTakeProfitOrder(tradeCreds, {
                     pair: trade.pair,
                     isShort: trade.is_short,
                     quantity: trade.amount,
@@ -4031,134 +3969,14 @@ async function runScalpBotCycle(waitForActive = false) {
               });
 
               if (siblingToClose) {
-                await closeClientCopiesForMasterTrade(
-                  siblingToClose,
-                  siblingToClose.close_rate || currentPrice,
-                  now,
-                  nowStr,
-                  'hedge_level_reversal_profit'
-                );
-              }
-
-              // Execute proportional DCA on all open client copy-trades linked to this master trade (awaiting exchange confirmation!)
-              const clientCopies = tradesStore.filter(
-                (ct) =>
-                  ct.is_open &&
-                  ct.account_id &&
-                  ct.account_id !== 'master' &&
-                  (ct.parent_trade_id === trade.trade_id ||
-                    (ct.pair === trade.pair && ct.is_short === trade.is_short))
-              );
-              for (const ct of clientCopies) {
-                const clientAcc = exchangeAccountsStore.find((a) => a.id === ct.account_id);
-                const clientAddStake = Number((ct.stake_amount * dcaMultiplierRatio).toFixed(2));
-                const clientAddNotional = clientAddStake * (ct.leverage || 25);
-                let clientAddAmount = Number((clientAddNotional / Math.max(1e-8, actualDcaPrice)).toFixed(4));
-                let clientDcaRes: PlacedOrderResult | null = null;
-                if (clientAcc) {
-                  clientDcaRes = await dispatchOrderToExchangeAccount(clientAcc, {
-                    pair: ct.pair,
-                    action: 'DCA',
-                    isShort: ct.is_short,
-                    quantity: clientAddAmount,
-                    referencePrice: actualDcaPrice,
-                    leverage: ct.leverage || 25,
-                  });
-                  if (!isSimulatedTestApiKey(clientAcc.api_key_raw) && !clientDcaRes?.success) {
-                    appendLog(
-                      'freqtrade.copytrading',
-                      'WARNING',
-                      `⚠️ Биржа клиента «${clientAcc.name}» отклонила DCA #${nextStep} по [${ct.pair}]: ${clientDcaRes?.error || 'Ордер отклонён'}`
-                    );
-                    continue;
-                  }
-                  if (clientDcaRes?.success && !clientDcaRes.is_simulated_test && clientDcaRes.qty > 0) {
-                    clientAddAmount = clientDcaRes.qty;
-                  }
-                }
-                const effClientDcaPrice =
-                  clientDcaRes?.success && clientDcaRes.price > 0
-                    ? roundPrice(clientDcaRes.price)
-                    : actualDcaPrice;
-                sqliteDb.runInTransaction(() => {
-                  const clientPrevRate = ct.open_rate;
-                  const clientNewTotalAmount = Number((ct.amount + clientAddAmount).toFixed(4));
-                  const clientNewAvgRate = roundPrice(
-                    (clientPrevRate * ct.amount + effClientDcaPrice * clientAddAmount) /
-                      Math.max(1e-8, clientNewTotalAmount)
-                  );
-                  ct.open_rate = clientNewAvgRate;
-                  ct.amount = clientNewTotalAmount;
-                  ct.stake_amount = Number((ct.stake_amount + clientAddStake).toFixed(2));
-                  ct.dca_count = nextStep;
-                  ct.last_dca_date = nowStr;
-                  ct.trade_state = 'DCA_ACTIVE';
-                  ct.enter_tag = trade.enter_tag;
-                  ct.next_dca_price = trade.next_dca_price;
-                  const clientLev = ct.leverage || 25;
-                  ct.planned_dca_levels = (trade.planned_dca_levels || []).map((lvl) => ({
-                    ...lvl,
-                    stake_amount: clientAddStake,
-                    amount: Number(((clientAddStake * clientLev) / Math.max(1e-8, lvl.price)).toFixed(4)),
-                    distance_pct: Number(
-                      (((lvl.price - clientNewAvgRate) / Math.max(1e-8, clientNewAvgRate)) * 100).toFixed(2)
-                    ),
-                  }));
-                  ct.dca_manual_override = Boolean(trade.dca_manual_override);
-                  ct.orders.push({
-                    id: clientDcaRes?.order_id || `ord-${ct.trade_id}-${nextStep}`,
-                    step: nextStep,
-                    label: `Smart DCA #${nextStep} (${nextStrongDca.source})`,
-                    side: ct.is_short ? 'short' : 'long',
-                    price: effClientDcaPrice,
-                    amount: clientAddAmount,
-                    stake_amount: clientAddStake,
-                    timestamp: now,
-                    date: nowStr,
-                  });
-                  recalculateTradeMetrics(ct, false);
-                  if (!ct.tp_manual_override) {
-                    ct.take_profit_abs = resolvePostDcaTakeProfit(
-                      clientNewAvgRate,
-                      ct.is_short,
-                      postDcaMtf,
-                      ct.min_profitable_tp
-                    );
-                    recalculateTradeMetrics(ct, false);
-                  }
-                  sqliteDb.upsertTrade(ct);
-                  const clientCreds = clientAcc ? getAccountCredentialsFromStore(clientAcc) : null;
-                  if (clientCreds && !isSimulatedTestApiKey(clientCreds.apiKey) && ct.take_profit_abs > 0) {
-                    placeOrUpdateExchangeTakeProfitOrder(clientCreds, {
-                      pair: ct.pair,
-                      isShort: ct.is_short,
-                      quantity: ct.amount,
-                      takeProfitPrice: ct.take_profit_abs,
-                    }).catch(() => {});
-                  }
-                  sqliteDb.recordOrder({
-                    trade_id: ct.trade_id,
-                    pair: ct.pair,
-                    order_type: 'market',
-                    side: ct.is_short ? 'sell' : 'buy',
-                    price: effClientDcaPrice,
-                    amount: clientAddAmount,
-                    cost: clientAddStake,
-                    fee:
-                      clientDcaRes?.commission_usdt && clientDcaRes.commission_usdt > 0
-                        ? Number(clientDcaRes.commission_usdt.toFixed(4))
-                        : Number((effClientDcaPrice * clientAddAmount * TAKER_FEE_RATE).toFixed(4)),
-                    realized_pnl: 0,
-                    action_type: `CLIENT_DCA_STEP_${nextStep}`,
-                    notes: `Client Smart DCA #${nextStep} at ${effClientDcaPrice}, New Avg: ${clientNewAvgRate}`,
-                  });
-                });
+                broadcastTradeLifecycleEvent('trade:closed', siblingToClose);
               }
 
               appendLog(
                 'freqtrade.bot.dca',
                 'INFO',
-                `✅ Smart DCA #${nextStep} [${trade.pair}]: +${addAmount} монет @ ${actualDcaPrice}$ ($${addStake} маржи) | Новая средняя: ${newAvgOpenRate}$ (подтянута к цене на ${dynamicDca.pullDistancePct}%) | Безубыток (с комиссией): ${trade.breakeven_price}$ | Пост-DCA TP: ${trade.take_profit_abs}$ | След. DCA: ${trade.next_dca_price}$`
+                `✅ Smart DCA #${nextStep} [${trade.pair}] (${tradeAcc.name}): +${addAmount} монет @ ${actualDcaPrice}$ ($${addStake} маржи) | Новая средняя: ${newAvgOpenRate}$ (подтянута к цене на ${dynamicDca.pullDistancePct}%) | Безубыток (с комиссией): ${trade.breakeven_price}$ | Пост-DCA TP: ${trade.take_profit_abs}$ | След. DCA: ${trade.next_dca_price}$`,
+                { userId: tradeUserId }
               );
               broadcastTradeLifecycleEvent('trade:updated', trade);
             }
@@ -4167,94 +3985,6 @@ async function runScalpBotCycle(waitForActive = false) {
       }
 
       sqliteDb.upsertTrade(trade);
-    }
-
-    // 1E. Also check independent client trades for their own TP hit (strictly enforcing Zero-Loss Exchange Guard)
-    const independentClientTrades = tradesStore.filter(
-      (ct) => ct.is_open && ct.account_id && ct.account_id !== 'master' && ct.take_profit_abs > 0
-    );
-    for (const ct of independentClientTrades) {
-      refreshTradeLivePriceFromWs(ct);
-      recalculateTradeMetrics(ct, false);
-      const execInfo = getFuturesExecutionPrice(ct.pair, ct.is_short, true, ct.exchange);
-      const livePrice =
-        execInfo && execInfo.markPrice > 0 ? roundPrice(execInfo.markPrice) : ct.current_rate;
-      const closeExecPrice =
-        execInfo && execInfo.executionPrice > 0 ? roundPrice(execInfo.executionPrice) : livePrice;
-      if (livePrice <= 0) continue;
-
-      const isTpHit = ct.is_short
-        ? livePrice <= ct.take_profit_abs || closeExecPrice <= ct.take_profit_abs
-        : livePrice >= ct.take_profit_abs || closeExecPrice >= ct.take_profit_abs;
-      const clientGuard = verifySafeProfitableClose(ct, undefined, closeExecPrice);
-      if (isTpHit && clientGuard.ok) {
-        const cLockKey = getPosLockKey(ct.account_id!, ct.pair, ct.is_short);
-        await withPositionLock(cLockKey, async () => {
-          if (!ct.is_open) return;
-          const clientAcc = exchangeAccountsStore.find((a) => a.id === ct.account_id);
-          let clientCloseRes: PlacedOrderResult | null = null;
-          if (clientAcc) {
-            clientCloseRes = await dispatchOrderToExchangeAccount(clientAcc, {
-              pair: ct.pair,
-              action: 'CLOSE',
-              isShort: ct.is_short,
-              quantity: ct.amount,
-              referencePrice: closeExecPrice,
-              leverage: ct.leverage || 25,
-            });
-            if (!isSimulatedTestApiKey(clientAcc.api_key_raw) && !clientCloseRes?.success) {
-              return;
-            }
-          }
-          const actualClientClosePrice =
-            clientCloseRes?.success && clientCloseRes.price > 0
-              ? roundPrice(clientCloseRes.price)
-              : closeExecPrice;
-          const now =
-            clientCloseRes?.exchange_time && clientCloseRes.exchange_time > 0
-              ? clientCloseRes.exchange_time
-              : Date.now();
-          const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
-          sqliteDb.runInTransaction(() => {
-            ct.is_open = false;
-            ct.close_rate = actualClientClosePrice;
-            ct.current_rate = actualClientClosePrice;
-            ct.close_date = nowStr;
-            ct.close_timestamp = now;
-            if (clientCloseRes?.commission_usdt && clientCloseRes.commission_usdt > 0) {
-              ct.fee_close = Number(clientCloseRes.commission_usdt.toFixed(4));
-            }
-            ct.exit_reason = 'client_roi_target_tp';
-            ct.trade_state = 'CLOSED';
-            ct.planned_dca_levels = [];
-            recalculateTradeMetrics(ct, false);
-            sqliteDb.upsertTrade(ct);
-            sqliteDb.recordOrder({
-              trade_id: ct.trade_id,
-              pair: ct.pair,
-              order_type: 'market',
-              side: ct.is_short ? 'buy' : 'sell',
-              price: actualClientClosePrice,
-              amount: ct.amount,
-              cost: Number((actualClientClosePrice * ct.amount).toFixed(4)),
-              fee: ct.fee_close || 0,
-              realized_pnl: ct.net_profit || ct.profit_abs,
-              action_type: 'CLIENT_TAKE_PROFIT',
-              notes: `Client Target TP hit at ${actualClientClosePrice}, Net PnL: +${ct.profit_abs}`,
-            });
-            if (clientAcc) {
-              const netProfit = ct.net_profit || ct.profit_abs;
-              const { compoundedBalance } = getCompoundedAccountBalance(clientAcc.id);
-              appendLog(
-                'freqtrade.copytrading',
-                'INFO',
-                `🎯 Клиент «${clientAcc.name}»: закрыт TP по #${ct.trade_id} @ ${actualClientClosePrice}$ (+${netProfit}$ чистыми). Баланс: $${compoundedBalance}`
-              );
-            }
-          });
-          broadcastTradeLifecycleEvent('trade:closed', ct);
-        });
-      }
     }
 
     // 2. Scan for new entries ONLY if bot state === 'running', owner has NOT paused new entries, AND at least 1 API account is enabled
@@ -4267,43 +3997,57 @@ async function runScalpBotCycle(waitForActive = false) {
 
     // Scan all active USDT-M Futures with volume >= $50M, prioritized by 24h price swing / volatility
     const candidatePairs = await fetchTopVolatileFuturesPairs(50_000_000);
-    const activeClientAccounts = exchangeAccountsStore.filter(
-      (a) => !a.is_owner && a.enabled && a.copy_trading
-    );
+    const openedPerAccount = new Map<string, number>();
 
     let scannedCount = 0;
     let openedInThisCycle = 0;
     for (const pair of candidatePairs) {
       if (blacklist.includes(pair)) continue;
-      const lastCd = cooldownPairs.get(pair) || 0;
-      if (Date.now() - lastCd < 3 * 60_000) continue; // 3-minute fast scalp re-entry cooldown after profitable TP or rejected order
 
-      // Проверяем, что пара реально торгуется (status === TRADING и PERPETUAL) на бирже/сети подключенного аккаунта
-      if (
-        ownerAcc &&
-        !(await isPairTradableOnExchange(pair, ownerAcc.exchange, ownerAcc.is_testnet))
-      ) {
+      // Determine which enabled accounts are eligible to evaluate this pair
+      const eligiblePreTradability = activeAccounts.filter((acc) => {
+        if ((openedPerAccount.get(acc.id) || 0) >= 3) return false;
+        const lastCd = cooldownPairs.get(`${acc.id}:${pair}`) || 0;
+        if (Date.now() - lastCd < 3 * 60_000) return false;
+        const accScopeId = getTargetAccountIdForRecord(acc);
+        const accOpen = tradesStore.filter((t) => t.is_open && tradeMatchesAccount(t, acc, accScopeId));
+        if (accOpen.some((t) => t.pair === pair)) return false;
+        if (accOpen.length >= botConfig.max_open_trades) return false;
+        const { compoundedBalance: accDeposit } = getCompoundedAccountBalance(acc.id);
+        const accUsedMargin = accOpen.reduce((sum, t) => sum + t.stake_amount, 0);
+        return accDeposit > 0 && (accUsedMargin / accDeposit) * 100 < 40.0;
+      });
+
+      if (eligiblePreTradability.length === 0) {
+        // Stop early if every active account has hit max_open_trades or per-cycle cap
+        const anyAccountCanStillOpenMore = activeAccounts.some((acc) => {
+          if ((openedPerAccount.get(acc.id) || 0) >= 3) return false;
+          const accScopeId = getTargetAccountIdForRecord(acc);
+          const accOpenCount = tradesStore.filter(
+            (t) => t.is_open && tradeMatchesAccount(t, acc, accScopeId)
+          ).length;
+          return accOpenCount < botConfig.max_open_trades;
+        });
+        if (!anyAccountCanStillOpenMore) break;
         continue;
       }
 
-      const currentMasterOpen = tradesStore.filter(
-        (t) => t.is_open && (!t.account_id || t.account_id === 'master')
-      );
-      const masterHasPair = currentMasterOpen.some((t) => t.pair === pair);
-
-      // Check if any connected client is missing an analyzed position on this pair
-      const clientsMissingPair = activeClientAccounts.filter(
-        (acc) => !tradesStore.some((ct) => ct.is_open && ct.account_id === acc.id && ct.pair === pair)
-      );
-
-      // If master already has this pair AND all connected clients also have this pair, skip to next coin
-      if (masterHasPair && clientsMissingPair.length === 0) continue;
-      if (!masterHasPair && currentMasterOpen.length >= botConfig.max_open_trades && clientsMissingPair.length === 0) {
-        break;
+      // Check exchange tradability once per distinct (exchange, is_testnet)
+      const tradableByNet = new Map<string, boolean>();
+      const eligibleAccounts: ExchangeAccountRecord[] = [];
+      for (const acc of eligiblePreTradability) {
+        const netKey = `${acc.exchange}:${Boolean(acc.is_testnet)}`;
+        let ok = tradableByNet.get(netKey);
+        if (ok === undefined) {
+          ok = await isPairTradableOnExchange(pair, acc.exchange, acc.is_testnet);
+          tradableByNet.set(netKey, ok);
+        }
+        if (ok) eligibleAccounts.push(acc);
       }
+      if (eligibleAccounts.length === 0) continue;
 
       scannedCount++;
-      if (scannedCount > 24) break; // Analyze top 24 most volatile pairs per cycle for high capital turnover
+      if (scannedCount > 24) break;
 
       // Top-Down Анализ: 1W (300 свечей) -> 1D (вся доступная история) -> 4H (500 свечей) -> 1H (200 свечей)
       const [{ candles: c1w }, { candles: c1h }, { candles: c4h }, { candles: c1d }] =
@@ -4339,10 +4083,7 @@ async function runScalpBotCycle(waitForActive = false) {
       const customSup = manualSupLvl?.price || mtf.key_4h_support;
       const customRes = manualResLvl?.price || mtf.key_4h_resistance;
 
-      // СТРАТЕГИЯ №1: ScalpingStrategy (краткосрочный скальпинг Лонг/Шорт от глобальных уровней/зон и по тренду)
       const sig = evaluateScalpingStrategy(c1h, customSup, customRes, mtf.institutional_levels);
-
-      // СТРАТЕГИЯ №2 (ОТДЕЛЬНАЯ): GlobalHedgeStrategy (2-сторонние сделки LONG+SHORT в среднесрок 4H и долгосрок 1D)
       const hedgeEval = evaluateGlobalHedgeStrategy(c1h, c4h, c1d, mtf, btcGuard.isSafe, c1w);
 
       const last1hCandle = c1h[c1h.length - 1];
@@ -4358,7 +4099,6 @@ async function runScalpBotCycle(waitForActive = false) {
       );
       const effectiveTrend = mtf.market_trend || 'NEUTRAL';
 
-      // Record multi-coin market scan in signals table so user sees full market analysis across volatile coins
       sqliteDb.recordSignal({
         pair,
         signal_type: 'MTF_SCAN',
@@ -4378,289 +4118,164 @@ async function runScalpBotCycle(waitForActive = false) {
         reason: `Top-Down 1D->4H [${pair}]: Trend=${effectiveTrend} (1D=${mtf.d1_trend} RSI=${mtf.rsi_1d}, 4H=${mtf.h4_trend} RSI=${mtf.rsi_4h}, 1H=${mtf.h1_trend} RSI=${mtf.rsi_1h}) | Global Sup=${roundPrice(customSup)} Res=${roundPrice(customRes)} | Scalp=${sig.enter_tag || 'NONE'} | GlobalHedge=${hedgeEval.should_open_hedge ? hedgeEval.horizon : 'WAIT'}`,
       });
 
-      // CASE A: Master does NOT have this pair open yet -> Autonomous choice between Strategy 1 (ScalpingStrategy) and Strategy 2 (GlobalHedgeStrategy):
-      if (!masterHasPair && currentMasterOpen.length < botConfig.max_open_trades) {
-        const { compoundedBalance: totalDeposit } = getCompoundedAccountBalance('master');
-        const usedMargin = currentMasterOpen.reduce((acc, t) => acc + t.stake_amount, 0);
-        const masterMarginOk = totalDeposit > 0 && (usedMargin / totalDeposit) * 100 < 40.0;
+      const btcAllowsLong =
+        btcGuard.isSafe &&
+        (btcGuard.btcTrend !== 'BEARISH' || effectiveTrend === 'BULLISH' || mtf.dist_to_4h_sup_pct <= 1.2);
+
+      // Independently execute entry decision on each eligible enabled account
+      for (const acc of eligibleAccounts) {
+        const accScopeId = getTargetAccountIdForRecord(acc);
+        const accOpen = tradesStore.filter((t) => t.is_open && tradeMatchesAccount(t, acc, accScopeId));
+        if (accOpen.some((t) => t.pair === pair)) continue;
+        if (accOpen.length >= botConfig.max_open_trades) continue;
+        const { compoundedBalance: accDeposit } = getCompoundedAccountBalance(acc.id);
+        const accUsedMargin = accOpen.reduce((sum, t) => sum + t.stake_amount, 0);
+        if (accDeposit <= 0 || (accUsedMargin / accDeposit) * 100 >= 40.0) continue;
+
         const canOpenHedgeStrategy =
-          hedgeEval.should_open_hedge &&
-          currentMasterOpen.length + 2 <= botConfig.max_open_trades;
+          hedgeEval.should_open_hedge && accOpen.length + 2 <= botConfig.max_open_trades;
+        const accOpts = {
+          accountId: acc.id,
+          accountName: acc.name,
+          strategyName: 'ScalpingStrategy',
+          candles1w: c1w,
+          preloadedPairLevels: pairLevels,
+        };
 
-        // Safe check for LONG: BTC must not be flash dumping AND if BTC is in a bearish trend, only allow Long if the coin itself is strongly bullish or bouncing right off 4H/1D global support
-        const btcAllowsLong =
-          btcGuard.isSafe &&
-          (btcGuard.btcTrend !== 'BEARISH' || effectiveTrend === 'BULLISH' || mtf.dist_to_4h_sup_pct <= 1.2);
-
-        if (masterMarginOk) {
-          try {
-            if (effectiveTrend === 'BEARISH') {
-              // Market trend for this coin is BEARISH -> prioritize ScalpingStrategy SHORT or GlobalHedgeStrategy if inside wide 4H/1D channel
-              if (sig.enter_short && mtf.allow_short) {
-                await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, {
-                  strategyName: 'ScalpingStrategy',
-                  candles1w: c1w,
-                });
-                openedInThisCycle++;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              } else if (
-                mtf.allow_short &&
-                mtf.dist_to_4h_sup_pct >= 0.85 &&
-                mtf.rsi_1h >= 20.0 &&
-                mtf.rsi_1h <= 65.0 &&
-                isPullbackToRes &&
-                (isRed1h || sig.wt1 <= sig.wt2) &&
-                livePrice <= sig.ema_slow * 1.003
-              ) {
-                await createScalpBotPosition(
-                  pair,
-                  'short',
-                  livePrice,
-                  mtf,
-                  c4h,
-                  c1d,
-                  'Scalp_Trend_Short',
-                  { strategyName: 'ScalpingStrategy', candles1w: c1w }
-                );
-                openedInThisCycle++;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              } else if (canOpenHedgeStrategy) {
-                await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d, {
-                  horizon: hedgeEval.horizon,
-                  longTpPrice: hedgeEval.long_tp_price,
-                  shortTpPrice: hedgeEval.short_tp_price,
-                  candles1w: c1w,
-                });
-                openedInThisCycle += 2;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              } else if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
-                await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, {
-                  strategyName: 'ScalpingStrategy',
-                  candles1w: c1w,
-                });
-                openedInThisCycle++;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              }
-            } else if (effectiveTrend === 'BULLISH') {
-              // Market trend for this coin is BULLISH -> prioritize ScalpingStrategy LONG or GlobalHedgeStrategy in wide 4H/1D channel
-              if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
-                await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, {
-                  strategyName: 'ScalpingStrategy',
-                  candles1w: c1w,
-                });
-                openedInThisCycle++;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              } else if (
-                btcAllowsLong &&
-                mtf.allow_long &&
-                mtf.dist_to_4h_res_pct >= 0.85 &&
-                mtf.rsi_1h >= 35.0 &&
-                mtf.rsi_1h <= 80.0 &&
-                isPullbackToSup &&
-                (isGreen1h || sig.wt1 >= sig.wt2) &&
-                livePrice >= sig.ema_slow * 0.997
-              ) {
-                await createScalpBotPosition(
-                  pair,
-                  'long',
-                  livePrice,
-                  mtf,
-                  c4h,
-                  c1d,
-                  'Scalp_Trend_Long',
-                  { strategyName: 'ScalpingStrategy', candles1w: c1w }
-                );
-                openedInThisCycle++;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              } else if (canOpenHedgeStrategy) {
-                await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d, {
-                  horizon: hedgeEval.horizon,
-                  longTpPrice: hedgeEval.long_tp_price,
-                  shortTpPrice: hedgeEval.short_tp_price,
-                  candles1w: c1w,
-                });
-                openedInThisCycle += 2;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              } else if (sig.enter_short && mtf.allow_short) {
-                await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, {
-                  strategyName: 'ScalpingStrategy',
-                  candles1w: c1w,
-                });
-                openedInThisCycle++;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              }
-            } else {
-              // NEUTRAL / WIDE GLOBAL CHANNEL -> GlobalHedgeStrategy (Medium/Long-Term 2-way) or ScalpingStrategy at channel edges
-              if (canOpenHedgeStrategy) {
-                await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d, {
-                  horizon: hedgeEval.horizon,
-                  longTpPrice: hedgeEval.long_tp_price,
-                  shortTpPrice: hedgeEval.short_tp_price,
-                  candles1w: c1w,
-                });
-                openedInThisCycle += 2;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              } else if (sig.enter_short && mtf.allow_short) {
-                await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, {
-                  strategyName: 'ScalpingStrategy',
-                  candles1w: c1w,
-                });
-                openedInThisCycle++;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              } else if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
-                await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, {
-                  strategyName: 'ScalpingStrategy',
-                  candles1w: c1w,
-                });
-                openedInThisCycle++;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              } else if (
-                mtf.allow_short &&
-                mtf.rsi_1d >= 20 &&
-                mtf.rsi_4h >= 35 &&
-                mtf.rsi_1h >= 55 &&
-                mtf.pos_4h_pct >= 60 &&
-                mtf.dist_to_4h_sup_pct >= 0.85 &&
-                isRed1h
-              ) {
-                await createScalpBotPosition(
-                  pair,
-                  'short',
-                  livePrice,
-                  mtf,
-                  c4h,
-                  c1d,
-                  'Scalp_Overbought_Short',
-                  { strategyName: 'ScalpingStrategy', candles1w: c1w }
-                );
-                openedInThisCycle++;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              } else if (
-                btcAllowsLong &&
-                mtf.allow_long &&
-                mtf.rsi_1d <= 80 &&
-                mtf.rsi_4h <= 65 &&
-                mtf.rsi_1h <= 45 &&
-                mtf.pos_4h_pct <= 40 &&
-                mtf.dist_to_4h_res_pct >= 0.85 &&
-                isGreen1h
-              ) {
-                await createScalpBotPosition(
-                  pair,
-                  'long',
-                  livePrice,
-                  mtf,
-                  c4h,
-                  c1d,
-                  'Scalp_Oversold_Long',
-                  { strategyName: 'ScalpingStrategy', candles1w: c1w }
-                );
-                openedInThisCycle++;
-                if (openedInThisCycle >= 3) break;
-                continue;
-              }
-            }
-          } catch (entryErr: any) {
-            cooldownPairs.set(pair, Date.now());
-            appendLog(
-              'freqtrade.bot.entry',
-              'WARNING',
-              `⚠️ Не удалось открыть сделку [${pair}] на бирже: ${entryErr?.message || 'Ошибка биржи'}`
-            );
-          }
-        }
-      }
-
-      // CASE B: Master ALREADY has an old open trade on this pair, and a new Client connected later.
-      // We NEVER blindly copy Master's old entry price; instead we open for the new Client ONLY if current live market analysis gives a valid entry signal!
-      if (masterHasPair && clientsMissingPair.length > 0) {
-        const masterTradeOnPair = currentMasterOpen.find((t) => t.pair === pair);
-        const entrySide: 'long' | 'short' | null =
-          sig.enter_short && mtf.allow_short
-            ? 'short'
-            : sig.enter_long && btcGuard.isSafe && mtf.allow_long
-            ? 'long'
-            : effectiveTrend === 'BEARISH' && mtf.allow_short && isRed1h
-            ? 'short'
-            : effectiveTrend === 'BULLISH' && btcGuard.isSafe && mtf.allow_long && isGreen1h
-            ? 'long'
-            : null;
-
-        if (entrySide) {
-          for (const clientAcc of clientsMissingPair) {
-            const clientOpenTrades = tradesStore.filter(
-              (ct) => ct.is_open && ct.account_id === clientAcc.id
-            );
-            const clientUsedMargin = clientOpenTrades.reduce((s, t) => s + t.stake_amount, 0);
-            const { compoundedBalance: clientDeposit } = getCompoundedAccountBalance(clientAcc.id);
-            if (
-              clientOpenTrades.length < botConfig.max_open_trades &&
-              (clientUsedMargin / Math.max(1, clientDeposit)) * 100 < 40.0
+        try {
+          if (effectiveTrend === 'BEARISH') {
+            if (sig.enter_short && mtf.allow_short) {
+              await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
+              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
+              openedInThisCycle++;
+            } else if (
+              mtf.allow_short &&
+              mtf.dist_to_4h_sup_pct >= 0.85 &&
+              mtf.rsi_1h >= 20.0 &&
+              mtf.rsi_1h <= 65.0 &&
+              isPullbackToRes &&
+              (isRed1h || sig.wt1 <= sig.wt2) &&
+              livePrice <= sig.ema_slow * 1.003
             ) {
-              const { clientStakeUsdt } = calculateClientProportionalOrder({
-                clientBalanceUsdt: clientDeposit,
-                entryPrice: livePrice,
-                leverage: clientAcc.max_leverage || botConfig.leverage || 25,
-                stakePercent: 0.005,
-                minStakeUsdt: 5,
+              await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, 'Scalp_Trend_Short', accOpts);
+              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
+              openedInThisCycle++;
+            } else if (canOpenHedgeStrategy) {
+              await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d, {
+                accountId: acc.id,
+                accountName: acc.name,
+                horizon: hedgeEval.horizon,
+                longTpPrice: hedgeEval.long_tp_price,
+                shortTpPrice: hedgeEval.short_tp_price,
+                candles1w: c1w,
               });
-              try {
-                await createScalpBotPosition(
-                  pair,
-                  entrySide,
-                  livePrice,
-                  mtf,
-                  c4h,
-                  c1d,
-                  `${sig.enter_tag} (Analyzed Client Entry)`,
-                  {
-                    accountId: clientAcc.id,
-                    accountName: clientAcc.name,
-                    stake: clientStakeUsdt,
-                    leverage: clientAcc.max_leverage || botConfig.leverage || 25,
-                    isCopyChild: true,
-                    parentTradeId: masterTradeOnPair?.trade_id,
-                  }
-                );
-              } catch {
-                // logged by dispatchOrderToExchangeAccount
-              }
+              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 2);
+              openedInThisCycle += 2;
+            } else if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
+              await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
+              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
+              openedInThisCycle++;
+            }
+          } else if (effectiveTrend === 'BULLISH') {
+            if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
+              await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
+              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
+              openedInThisCycle++;
+            } else if (
+              btcAllowsLong &&
+              mtf.allow_long &&
+              mtf.dist_to_4h_res_pct >= 0.85 &&
+              mtf.rsi_1h >= 35.0 &&
+              mtf.rsi_1h <= 80.0 &&
+              isPullbackToSup &&
+              (isGreen1h || sig.wt1 >= sig.wt2) &&
+              livePrice >= sig.ema_slow * 0.997
+            ) {
+              await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, 'Scalp_Trend_Long', accOpts);
+              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
+              openedInThisCycle++;
+            } else if (canOpenHedgeStrategy) {
+              await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d, {
+                accountId: acc.id,
+                accountName: acc.name,
+                horizon: hedgeEval.horizon,
+                longTpPrice: hedgeEval.long_tp_price,
+                shortTpPrice: hedgeEval.short_tp_price,
+                candles1w: c1w,
+              });
+              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 2);
+              openedInThisCycle += 2;
+            } else if (sig.enter_short && mtf.allow_short) {
+              await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
+              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
+              openedInThisCycle++;
+            }
+          } else {
+            if (canOpenHedgeStrategy) {
+              await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d, {
+                accountId: acc.id,
+                accountName: acc.name,
+                horizon: hedgeEval.horizon,
+                longTpPrice: hedgeEval.long_tp_price,
+                shortTpPrice: hedgeEval.short_tp_price,
+                candles1w: c1w,
+              });
+              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 2);
+              openedInThisCycle += 2;
+            } else if (sig.enter_short && mtf.allow_short) {
+              await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
+              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
+              openedInThisCycle++;
+            } else if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
+              await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
+              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
+              openedInThisCycle++;
+            } else if (
+              mtf.allow_short &&
+              mtf.rsi_1d >= 20 &&
+              mtf.rsi_4h >= 35 &&
+              mtf.rsi_1h >= 55 &&
+              mtf.pos_4h_pct >= 60 &&
+              mtf.dist_to_4h_sup_pct >= 0.85 &&
+              isRed1h
+            ) {
+              await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, 'Scalp_Overbought_Short', accOpts);
+              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
+              openedInThisCycle++;
+            } else if (
+              btcAllowsLong &&
+              mtf.allow_long &&
+              mtf.rsi_1d <= 80 &&
+              mtf.rsi_4h <= 65 &&
+              mtf.rsi_1h <= 45 &&
+              mtf.pos_4h_pct <= 40 &&
+              mtf.dist_to_4h_res_pct >= 0.85 &&
+              isGreen1h
+            ) {
+              await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, 'Scalp_Oversold_Long', accOpts);
+              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
+              openedInThisCycle++;
             }
           }
+        } catch (entryErr: any) {
+          cooldownPairs.set(`${acc.id}:${pair}`, Date.now());
+          appendLog(
+            'freqtrade.bot.entry',
+            'WARNING',
+            `⚠️ Не удалось открыть сделку [${pair}] (${acc.name}): ${entryErr?.message || 'Ошибка биржи'}`,
+            { userId: acc.user_id || 'owner' }
+          );
         }
       }
     }
 
     if (scannedCount > 0) {
-      const openMasterAfter = tradesStore.filter(
-        (t) => t.is_open && (!t.account_id || t.account_id === 'master')
-      );
-      const scalpCount = openMasterAfter.filter(
-        (t) => !t.campaign_id && !String(t.enter_tag || '').toLowerCase().includes('hedge')
-      ).length;
-      const hedgeCount = openMasterAfter.length - scalpCount;
-      const accSummary = activeAccounts
-        .map(
-          (a) =>
-            `${a.name} [${a.network_label || (a.is_testnet ? `${a.exchange.toUpperCase()} TESTNET` : a.exchange.toUpperCase())}]: ${a.balance_usdt.toFixed(2)} USDT`
-        )
-        .join(', ');
+      const totalOpenAfter = tradesStore.filter((t) => t.is_open).length;
       appendLog(
         'freqtrade.scanner',
         'INFO',
-        `🔍 Цикл авто-анализа завершён: проверено ${scannedCount} пар | Открыто за цикл: ${openedInThisCycle} | Активно: ${openMasterAfter.length} (Скальпинг: ${scalpCount}, Хедж: ${hedgeCount}) | Биржи: ${accSummary}`
+        `🔍 Цикл авто-анализа завершён: проверено ${scannedCount} пар | Открыто за цикл: ${openedInThisCycle} | Активных аккаунтов: ${activeAccounts.length} | Всего активных сделок в системе: ${totalOpenAfter}`,
+        { publicMarket: true }
       );
     }
   } catch (err) {
@@ -4677,6 +4292,8 @@ async function openHedgeCampaign(
   candles4h: RawCandle[],
   candles1d: RawCandle[],
   customOpts?: {
+    accountId?: string;
+    accountName?: string;
     stake?: number;
     leverage?: number;
     skipClientSync?: boolean;
@@ -4687,39 +4304,33 @@ async function openHedgeCampaign(
   }
 ): Promise<{ longTrade: FreqtradeTrade; shortTrade: FreqtradeTrade | null }> {
   const cleanPair = pair.toUpperCase();
-  const campaignId = `hedge-${cleanPair.split(':')[0].replace('/', '')}-${Date.now()}`;
+  const targetAcc = resolveExchangeAccountRecord(customOpts?.accountId || 'master');
+  if (!targetAcc || !targetAcc.enabled) {
+    throw new Error('Целевой биржевой аккаунт не подключён или поставлен на паузу');
+  }
+  const targetUserId = targetAcc.user_id || 'owner';
+  const campaignId = `hedge-${cleanPair.split(':')[0].replace('/', '')}-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
   const horizonTag = customOpts?.horizon === 'LONG_TERM_1D' ? '1D_LongTerm_Hedge' : '4H_MedTerm_Hedge';
   const hedgeTimeframe = customOpts?.horizon === 'LONG_TERM_1D' ? '1d' : '4h';
 
-  // 1. Одновременно проверяем/включаем режим хеджирования (Hedge Mode) на активных аккаунтах и предзагружаем уровни пары без задержки
-  const activeAccounts = exchangeAccountsStore.filter((a) => a.enabled);
-  const ownerAcc = activeAccounts.find((a) => a.is_owner) || activeAccounts[0];
-  const ownerCreds = ownerAcc ? getAccountCredentialsFromStore(ownerAcc) : null;
-
-  const [hedgeCheckList, preloadedPairLevels] = await Promise.all([
-    Promise.all(
-      activeAccounts.map(async (acc) => {
-        const creds = getAccountCredentialsFromStore(acc);
-        if (!creds) return { accId: acc.id, enabled: true, message: 'No creds' };
-        const res = await ensureExchangeHedgeMode(creds, cleanPair);
-        return { accId: acc.id, ...res };
-      })
-    ),
+  // 1. Check/enable Hedge Mode ONLY for the target account and pre-load pair levels in parallel
+  const targetCreds = getAccountCredentialsFromStore(targetAcc);
+  const [targetHedgeStatus, preloadedPairLevels] = await Promise.all([
+    targetCreds ? ensureExchangeHedgeMode(targetCreds, cleanPair) : Promise.resolve({ enabled: true, message: 'No creds' }),
     getOrComputeMtfBotLevels(cleanPair, hedgeTimeframe),
   ]);
 
-  const ownerHedgeStatus = hedgeCheckList.find((h) => h.accId === ownerAcc?.id);
   const canOpenBothSides =
-    !ownerCreds || isSimulatedTestApiKey(ownerCreds.apiKey) || (ownerHedgeStatus?.enabled ?? true);
+    !targetCreds || isSimulatedTestApiKey(targetCreds.apiKey) || (targetHedgeStatus?.enabled ?? true);
 
   if (!canOpenBothSides) {
-    // Если биржа заблокирована в One-Way Mode из-за других открытых позиций — открываем ногу по тренду, чтобы биржа не схлопнула встречный ордер
     const fallbackSide: 'long' | 'short' =
       mtf.d1_trend === 'BEARISH' || mtf.d1_trend === 'MILD_BEARISH' ? 'short' : 'long';
     appendLog(
       'freqtrade.bot.hedge',
       'WARNING',
-      `⚠️ [${cleanPair}] На бирже активен режим One-Way Mode (${ownerHedgeStatus?.message || 'переключение на Hedge Mode требует закрытия текущих сделок'}). Открываю среднесрочную сделку по тренду (${fallbackSide.toUpperCase()}) без схлопывания.`
+      `⚠️ [${cleanPair}] (${targetAcc.name}) На бирже активен режим One-Way Mode (${targetHedgeStatus?.message || 'переключение на Hedge Mode требует закрытия текущих сделок'}). Открываю среднесрочную сделку по тренду (${fallbackSide.toUpperCase()}) без схлопывания.`,
+      { userId: targetUserId }
     );
     const singleTrade = await createScalpBotPosition(
       cleanPair,
@@ -4731,6 +4342,8 @@ async function openHedgeCampaign(
       fallbackSide === 'short' ? `${horizonTag}_Short` : `${horizonTag}_Long`,
       {
         ...customOpts,
+        accountId: targetAcc.id,
+        accountName: customOpts?.accountName || targetAcc.name,
         customTp: fallbackSide === 'short' ? customOpts?.shortTpPrice : customOpts?.longTpPrice,
         campaignId,
         preloadedPairLevels,
@@ -4744,10 +4357,11 @@ async function openHedgeCampaign(
   appendLog(
     'freqtrade.bot.hedge',
     'INFO',
-    `⚖️ [GlobalHedgeStrategy] Открываю 2-стороннюю кампанию (${customOpts?.horizon === 'LONG_TERM_1D' ? 'ДОЛГОСРОК 1D' : 'СРЕДНЕСРОК 4H'}) ${campaignId} [${cleanPair}] @ ${entryPrice}$: параллельный вход LONG + SHORT от глобальных уровней (0.5% депозит / 25x плечо)`
+    `⚖️ [GlobalHedgeStrategy] (${targetAcc.name}) Открываю 2-стороннюю кампанию (${customOpts?.horizon === 'LONG_TERM_1D' ? 'ДОЛГОСРОК 1D' : 'СРЕДНЕСРОК 4H'}) ${campaignId} [${cleanPair}] @ ${entryPrice}$: параллельный вход LONG + SHORT (0.5% от депозита аккаунта)`,
+    { userId: targetUserId }
   );
 
-  // 2. Открываем LONG и SHORT строго параллельно (Promise.all) без малейшей задержки между ногами!
+  // 2. Open LONG and SHORT in parallel for this target account
   const [longTrade, shortTrade] = await Promise.all([
     createScalpBotPosition(
       cleanPair,
@@ -4759,6 +4373,8 @@ async function openHedgeCampaign(
       `${horizonTag}_Long`,
       {
         ...customOpts,
+        accountId: targetAcc.id,
+        accountName: customOpts?.accountName || targetAcc.name,
         customTp: customOpts?.longTpPrice,
         campaignId,
         preloadedPairLevels,
@@ -4776,6 +4392,8 @@ async function openHedgeCampaign(
       `${horizonTag}_Short`,
       {
         ...customOpts,
+        accountId: targetAcc.id,
+        accountName: customOpts?.accountName || targetAcc.name,
         customTp: customOpts?.shortTpPrice,
         campaignId,
         preloadedPairLevels,
@@ -4813,25 +4431,24 @@ async function createScalpBotPosition(
     candles1w?: RawCandle[];
   }
 ): Promise<FreqtradeTrade> {
-  const activeAccounts = exchangeAccountsStore.filter((a) => a.enabled);
-  if (activeAccounts.length === 0) {
-    throw new Error('Бот не может открывать сделки без подключенной биржи (API)');
+  const targetExchangeAcc = resolveExchangeAccountRecord(customOpts?.accountId || 'master');
+  if (!targetExchangeAcc || !targetExchangeAcc.enabled) {
+    throw new Error('Бот не может открывать сделки без подключенного и активного биржевого аккаунта');
   }
 
   const cleanPair = pair.toUpperCase();
   const isShort = side === 'short';
   let entryRate = roundPrice(entryPrice);
-  const targetAccId = customOpts?.accountId || 'master';
-  const masterLockKey = getPosLockKey(targetAccId, cleanPair, isShort);
+  const targetAccId = getTargetAccountIdForRecord(targetExchangeAcc);
+  const targetUserId = targetExchangeAcc.user_id || 'owner';
+  const accLockKey = getPosLockKey(targetExchangeAcc.id, cleanPair, isShort);
 
-  const createdTrade = await withPositionLock(masterLockKey, async () => {
+  const createdTrade = await withPositionLock(accLockKey, async () => {
     // Защита от дублирования: не открывать вторую сделку в ту же сторону на одной и той же монете для одного аккаунта
     const existingSameSide = tradesStore.find(
       (t) =>
         t.is_open &&
-        (targetAccId === 'master'
-          ? !t.account_id || t.account_id === 'master'
-          : t.account_id === targetAccId) &&
+        tradeMatchesAccount(t, targetExchangeAcc, targetAccId) &&
         t.pair === cleanPair &&
         t.is_short === isShort
     );
@@ -4846,14 +4463,8 @@ async function createScalpBotPosition(
       return existingSameSide;
     }
 
-    const ownerAcc = activeAccounts.find((a) => a.is_owner) || activeAccounts[0];
-    const targetExchangeAcc =
-      targetAccId === 'master'
-        ? ownerAcc
-        : activeAccounts.find((a) => a.id === targetAccId) || ownerAcc;
-
-    const { compoundedBalance: totalDeposit } = getCompoundedAccountBalance('master');
-    // Dynamic compounded stake: strictly 0.5% of current compounded account equity ($25 on $5000, growing automatically with closed net profit)
+    const { compoundedBalance: totalDeposit } = getCompoundedAccountBalance(targetExchangeAcc.id);
+    // Dynamic compounded stake: strictly 0.5% of THIS account's own wallet equity
     const dynamicStake = Math.max(
       botConfig.min_stake_amount || 5,
       Number((totalDeposit * 0.005).toFixed(2))
@@ -4864,7 +4475,7 @@ async function createScalpBotPosition(
     const leverage =
       customOpts?.leverage && customOpts.leverage >= 1
         ? Math.round(customOpts.leverage)
-        : (botConfig.leverage || 25);
+        : (targetExchangeAcc.max_leverage || botConfig.leverage || 25);
 
     const notional = stake * leverage;
     let amount = Number((notional / Math.max(1e-8, entryRate)).toFixed(4));
@@ -5054,7 +4665,7 @@ async function createScalpBotPosition(
       quote_currency: quote || 'USDT',
       is_open: true,
       is_short: isShort,
-      exchange: targetExchangeAcc?.exchange || ownerAcc?.exchange || activeAccounts[0]?.exchange || 'binance',
+      exchange: targetExchangeAcc.exchange || 'binance',
       amount,
       initial_amount: amount,
       stake_amount: stake,
@@ -5100,9 +4711,9 @@ async function createScalpBotPosition(
       pullback_min_profit_pct: 0.5,
       plan_notes: planNotes,
       campaign_id: customOpts?.campaignId,
+      user_id: targetUserId,
       account_id: targetAccId,
-      account_name: customOpts?.accountName || 'Master',
-      parent_trade_id: customOpts?.parentTradeId,
+      account_name: customOpts?.accountName || targetExchangeAcc.name || 'Main',
       orders: [initialOrderEntry],
       planned_dca_levels: [
         {
@@ -5126,280 +4737,62 @@ async function createScalpBotPosition(
       ],
     };
 
-    // Атомарная запись в SQLite: предварительно исполняем копи-ордера на биржах клиентов (под защитой lock-ключа от дублей) и сохраняем всё в одной транзакции
-    const liveMarketCandlePrice =
-      candles4h.length > 0 ? candles4h[candles4h.length - 1].close : entryRate;
-
-    const preparedClientEntries: Array<{
-      acc: ExchangeAccountRecord;
-      clientLev: number;
-      clientDeposit: number;
-      clientStakeUsdt: number;
-      notionalUsdt: number;
-      coinAmount: number;
-      entryPrice: number;
-      orderId?: string;
-      feeOpen?: number;
-    }> = [];
-    const acquiredClientLockKeys: string[] = [];
-
-    try {
-      if (!customOpts?.isCopyChild && !customOpts?.skipClientSync && targetAccId === 'master') {
-        const priceDeviationPct =
-          liveMarketCandlePrice > 0
-            ? Math.abs(entryRate - liveMarketCandlePrice) / liveMarketCandlePrice
-            : 0;
-        const isLiveMarketEntry = priceDeviationPct <= 0.05;
-
-        if (isLiveMarketEntry) {
-          const copyAccounts = exchangeAccountsStore.filter(
-            (a) => !a.is_owner && a.enabled && a.copy_trading
-          );
-          const seenCodes = new Set<string>();
-
-          for (const acc of copyAccounts) {
-            const codeKey = acc.client_access_code || acc.id;
-            if (seenCodes.has(codeKey)) continue;
-            seenCodes.add(codeKey);
-
-            const clientLockKey = getPosLockKey(acc.id, cleanPair, isShort);
-            if (activePositionKeys.has(clientLockKey)) continue;
-
-            const alreadyCopied = tradesStore.some(
-              (ct) =>
-                ct.is_open &&
-                ct.account_id === acc.id &&
-                ct.pair === cleanPair &&
-                ct.is_short === isShort
-            );
-            if (alreadyCopied) continue;
-
-            const clientOpenTrades = tradesStore.filter(
-              (ct) => ct.is_open && ct.account_id === acc.id
-            );
-            if (clientOpenTrades.length >= botConfig.max_open_trades) continue;
-            const { compoundedBalance: clientDeposit } = getCompoundedAccountBalance(acc.id);
-            const clientUsedMargin = clientOpenTrades.reduce((s, t) => s + t.stake_amount, 0);
-            if (clientDeposit > 0 && (clientUsedMargin / clientDeposit) * 100 >= 40.0) {
-              appendLog(
-                'freqtrade.copytrading',
-                'WARNING',
-                `⚠️ Пропущен вход [${cleanPair}] для клиента «${acc.name}»: задействовано более 40% маржи ($${clientUsedMargin} из $${clientDeposit})`
-              );
-              continue;
-            }
-
-            activePositionKeys.add(clientLockKey);
-            acquiredClientLockKeys.push(clientLockKey);
-
-            const clientLev = acc.max_leverage || leverage || 25;
-            const { clientStakeUsdt, notionalUsdt, coinAmount } = calculateClientProportionalOrder({
-              clientBalanceUsdt: clientDeposit,
-              entryPrice: entryRate,
-              leverage: clientLev,
-              stakePercent: 0.005,
-              minStakeUsdt: 5,
-            });
-
-            const clientOrderRes = await dispatchOrderToExchangeAccount(acc, {
-              pair: cleanPair,
-              action: 'OPEN',
-              isShort,
-              quantity: coinAmount,
-              referencePrice: entryRate,
-              leverage: clientLev,
-            });
-
-            if (!isSimulatedTestApiKey(acc.api_key_raw) && !clientOrderRes?.success) {
-              appendLog(
-                'freqtrade.copytrading',
-                'WARNING',
-                `⚠️ Биржа клиента «${acc.name}» (${acc.exchange.toUpperCase()}) отклонила копи-вход [${cleanPair}]: ${clientOrderRes?.error || 'Ордер отклонён'}`
-              );
-              continue;
-            }
-
-            const effQty =
-              clientOrderRes?.success && !clientOrderRes.is_simulated_test && clientOrderRes.qty > 0
-                ? clientOrderRes.qty
-                : coinAmount;
-            const effPrice =
-              clientOrderRes?.success && !clientOrderRes.is_simulated_test && clientOrderRes.price > 0
-                ? roundPrice(clientOrderRes.price)
-                : entryRate;
-
-            preparedClientEntries.push({
-              acc,
-              clientLev,
-              clientDeposit,
-              clientStakeUsdt,
-              notionalUsdt,
-              coinAmount: effQty,
-              entryPrice: effPrice,
-              orderId: clientOrderRes?.order_id,
-              feeOpen: clientOrderRes?.commission_usdt,
-            });
-          }
-        }
-      }
-
-      sqliteDb.runInTransaction(() => {
+    sqliteDb.runInTransaction(() => {
+      recalculateTradeMetrics(newTrade, false);
+      if (!hasCustomTp && newTrade.min_profitable_tp && newTrade.min_profitable_tp > 0) {
+        newTrade.take_profit_abs = newTrade.is_short
+          ? Math.min(newTrade.take_profit_abs || newTrade.min_profitable_tp, newTrade.min_profitable_tp)
+          : Math.max(newTrade.take_profit_abs || newTrade.min_profitable_tp, newTrade.min_profitable_tp);
         recalculateTradeMetrics(newTrade, false);
-        if (!hasCustomTp && newTrade.min_profitable_tp && newTrade.min_profitable_tp > 0) {
-          newTrade.take_profit_abs = newTrade.is_short
-            ? Math.min(newTrade.take_profit_abs || newTrade.min_profitable_tp, newTrade.min_profitable_tp)
-            : Math.max(newTrade.take_profit_abs || newTrade.min_profitable_tp, newTrade.min_profitable_tp);
-          recalculateTradeMetrics(newTrade, false);
-        }
-
-        tradesStore.unshift(newTrade);
-        sqliteDb.upsertTrade(newTrade);
-        // Сразу после открытия позиции выставляем нативный Take-Profit ордер напрямую на биржу (строго не ниже защитного порога безубытка!)
-        const targetCreds = getAccountCredentialsFromStore(targetExchangeAcc);
-        if (targetCreds && !isSimulatedTestApiKey(targetCreds.apiKey) && newTrade.take_profit_abs > 0) {
-          const safeExchangeTp =
-            !newTrade.tp_manual_override && newTrade.min_profitable_tp
-              ? newTrade.is_short
-                ? Math.min(newTrade.take_profit_abs, newTrade.min_profitable_tp)
-                : Math.max(newTrade.take_profit_abs, newTrade.min_profitable_tp)
-              : newTrade.take_profit_abs;
-          placeOrUpdateExchangeTakeProfitOrder(targetCreds, {
-            pair: cleanPair,
-            isShort,
-            quantity: newTrade.amount,
-            takeProfitPrice: safeExchangeTp,
-          }).catch(() => {});
-        }
-        sqliteDb.recordOrder({
-          trade_id: id,
-          pair: cleanPair,
-          order_type: 'market',
-          side: isShort ? 'sell' : 'buy',
-          price: entryRate,
-          amount,
-          cost: stake,
-          fee: newTrade.fee_open || Number((entryRate * amount * TAKER_FEE_RATE).toFixed(4)),
-          realized_pnl: 0,
-          action_type: 'INITIAL_ENTRY',
-          notes: planNotes,
-        });
-        sqliteDb.recordSignal({
-          pair: cleanPair,
-          signal_type: 'ENTRY',
-          direction: side,
-          confidence: 0.88,
-          price: entryRate,
-          reason: planNotes,
-        });
-
-        if (preparedClientEntries.length > 0) {
-          const syncedNames: string[] = [];
-          for (const item of preparedClientEntries) {
-            const { acc, clientLev, clientDeposit, clientStakeUsdt, notionalUsdt, coinAmount, entryPrice: clEntryPrice, orderId, feeOpen } = item;
-            const duplicateClient = tradesStore.some(
-              (ct) => ct.is_open && ct.account_id === acc.id && ct.pair === cleanPair && ct.is_short === isShort
-            );
-            if (duplicateClient) continue;
-
-            const clientTradeId = nextTradeId++;
-            const clientOrderObj: TradeOrderEntry & { commission_usdt?: number } = {
-              id: orderId || `ord-${clientTradeId}-0`,
-              step: 0,
-              label: `Анализ + Вход (${acc.name}): #1 (${isShort ? 'Шорт' : 'Лонг'})`,
-              side: isShort ? 'short' : 'long',
-              price: clEntryPrice,
-              amount: coinAmount,
-              stake_amount: clientStakeUsdt,
-              timestamp: now,
-              date: nowStr,
-            };
-            if (feeOpen && feeOpen > 0) {
-              clientOrderObj.commission_usdt = Number(feeOpen.toFixed(4));
-            }
-            const clientTrade: FreqtradeTrade = {
-              ...newTrade,
-              trade_id: clientTradeId,
-              parent_trade_id: newTrade.trade_id,
-              account_id: acc.id,
-              account_name: acc.name,
-              exchange: acc.exchange,
-              leverage: clientLev,
-              open_rate: clEntryPrice,
-              initial_open_rate: clEntryPrice,
-              current_rate: clEntryPrice,
-              stake_amount: clientStakeUsdt,
-              initial_stake: clientStakeUsdt,
-              amount: coinAmount,
-              initial_amount: coinAmount,
-              fee_open: feeOpen && feeOpen > 0 ? Number(feeOpen.toFixed(4)) : newTrade.fee_open,
-              synced_accounts: [acc.name],
-              orders: [clientOrderObj],
-              planned_dca_levels: newTrade.planned_dca_levels.map((l) => ({ ...l })),
-            };
-
-            recalculateTradeMetrics(clientTrade, false);
-            if (!clientTrade.tp_manual_override && clientTrade.min_profitable_tp && clientTrade.min_profitable_tp > 0) {
-              clientTrade.take_profit_abs = clientTrade.is_short
-                ? Math.min(clientTrade.take_profit_abs || clientTrade.min_profitable_tp, clientTrade.min_profitable_tp)
-                : Math.max(clientTrade.take_profit_abs || clientTrade.min_profitable_tp, clientTrade.min_profitable_tp);
-              recalculateTradeMetrics(clientTrade, false);
-            }
-            tradesStore.unshift(clientTrade);
-            sqliteDb.upsertTrade(clientTrade);
-            const clientCreds = getAccountCredentialsFromStore(acc);
-            if (clientCreds && !isSimulatedTestApiKey(clientCreds.apiKey) && clientTrade.take_profit_abs > 0) {
-              const safeClientTp =
-                !clientTrade.tp_manual_override && clientTrade.min_profitable_tp
-                  ? clientTrade.is_short
-                    ? Math.min(clientTrade.take_profit_abs, clientTrade.min_profitable_tp)
-                    : Math.max(clientTrade.take_profit_abs, clientTrade.min_profitable_tp)
-                  : clientTrade.take_profit_abs;
-              placeOrUpdateExchangeTakeProfitOrder(clientCreds, {
-                pair: cleanPair,
-                isShort,
-                quantity: clientTrade.amount,
-                takeProfitPrice: safeClientTp,
-              }).catch(() => {});
-            }
-            sqliteDb.recordOrder({
-              trade_id: clientTradeId,
-              pair: cleanPair,
-              order_type: 'market',
-              side: isShort ? 'sell' : 'buy',
-              price: clEntryPrice,
-              amount: coinAmount,
-              cost: clientStakeUsdt,
-              fee: clientTrade.fee_open || Number((clEntryPrice * coinAmount * TAKER_FEE_RATE).toFixed(4)),
-              realized_pnl: 0,
-              action_type: 'CLIENT_INITIAL_ENTRY',
-              notes: `Analyzed entry for ${acc.name} (linked to #${newTrade.trade_id}): ${planNotes}`,
-            });
-            syncedNames.push(acc.name);
-
-            appendLog(
-              'freqtrade.copytrading',
-              'INFO',
-              `📋 Проанализирована и открыта позиция #${clientTradeId} для «${acc.name}» (${acc.exchange.toUpperCase()}): ${cleanPair} ${isShort ? 'SHORT' : 'LONG'} ${clientLev}x | Ставка 0.5%: $${clientStakeUsdt} (депозит $${clientDeposit}) | Объем: ${coinAmount} ($${notionalUsdt})`
-            );
-            broadcastTradeLifecycleEvent('trade:opened', clientTrade);
-          }
-
-          if (syncedNames.length > 0) {
-            newTrade.synced_accounts = syncedNames;
-            sqliteDb.upsertTrade(newTrade);
-          }
-        }
-      });
-    } finally {
-      for (const k of acquiredClientLockKeys) {
-        activePositionKeys.delete(k);
       }
-    }
+
+      tradesStore.unshift(newTrade);
+      sqliteDb.upsertTrade(newTrade);
+
+      // Сразу после открытия позиции выставляем нативный Take-Profit ордер напрямую на биржу (строго не ниже защитного порога безубытка!)
+      const targetCreds = getAccountCredentialsFromStore(targetExchangeAcc);
+      if (targetCreds && !isSimulatedTestApiKey(targetCreds.apiKey) && newTrade.take_profit_abs > 0) {
+        const safeExchangeTp =
+          !newTrade.tp_manual_override && newTrade.min_profitable_tp
+            ? newTrade.is_short
+              ? Math.min(newTrade.take_profit_abs, newTrade.min_profitable_tp)
+              : Math.max(newTrade.take_profit_abs, newTrade.min_profitable_tp)
+            : newTrade.take_profit_abs;
+        placeOrUpdateExchangeTakeProfitOrder(targetCreds, {
+          pair: cleanPair,
+          isShort,
+          quantity: newTrade.amount,
+          takeProfitPrice: safeExchangeTp,
+        }).catch(() => {});
+      }
+      sqliteDb.recordOrder({
+        trade_id: id,
+        pair: cleanPair,
+        order_type: 'market',
+        side: isShort ? 'sell' : 'buy',
+        price: entryRate,
+        amount,
+        cost: stake,
+        fee: newTrade.fee_open || Number((entryRate * amount * TAKER_FEE_RATE).toFixed(4)),
+        realized_pnl: 0,
+        action_type: 'INITIAL_ENTRY',
+        notes: planNotes,
+      });
+      sqliteDb.recordSignal({
+        pair: cleanPair,
+        signal_type: 'ENTRY',
+        direction: side,
+        confidence: 0.88,
+        price: entryRate,
+        reason: planNotes,
+      });
+    });
 
     appendLog(
       'freqtrade.bot',
       'INFO',
-      `🟢 Открыта позиция #${id} [${cleanPair}] ${isShort ? 'SHORT' : 'LONG'} ${leverage}x @ ${entryRate}$ | Маржа: ${stake}$ | TP (${tpHorizon}): ${newTrade.take_profit_abs}$ [${tpReason}] | Next DCA (${strongestDca.source}): ${nextDcaPrice}$ | Аккаунтов: ${activeAccounts.length}`
+      `🟢 Открыта позиция #${id} [${cleanPair}] (${targetExchangeAcc.name}) ${isShort ? 'SHORT' : 'LONG'} ${leverage}x @ ${entryRate}$ | Маржа 0.5%: ${stake}$ (депозит $${totalDeposit}) | TP (${tpHorizon}): ${newTrade.take_profit_abs}$ [${tpReason}] | Next DCA (${strongestDca.source}): ${nextDcaPrice}$`,
+      { userId: targetUserId }
     );
 
     subscribePairKlineStream(cleanPair, botConfig.timeframe || '1h');
@@ -5431,6 +4824,298 @@ async function startServer() {
     res.json({ status: 'pong' });
   });
 
+  interface ResolvedAuth {
+    authenticated: boolean;
+    userId: string;
+    role: 'owner' | 'client';
+    login?: string;
+    accountId?: string;
+    inviteId?: string;
+  }
+
+  function resolveScopeUserId(scopeOrAccountOrUserId?: string): string | null {
+    if (!scopeOrAccountOrUserId) return null;
+    if (scopeOrAccountOrUserId === 'owner' || scopeOrAccountOrUserId === 'master') {
+      return 'owner';
+    }
+    if (
+      scopeOrAccountOrUserId.startsWith('invite:') ||
+      scopeOrAccountOrUserId.startsWith('account:')
+    ) {
+      return scopeOrAccountOrUserId;
+    }
+    const acc = exchangeAccountsStore.find((a) => a.id === scopeOrAccountOrUserId);
+    return acc ? acc.user_id || 'owner' : null;
+  }
+
+  function resolveAuthFromCredentials(params: {
+    token?: string;
+    clientCode?: string;
+    accountId?: string;
+  }): ResolvedAuth {
+    const code = String(params.clientCode || '').trim().toUpperCase();
+    if (code) {
+      const byCode = exchangeAccountsStore.find(
+        (a) => a.client_access_code.toUpperCase() === code
+      );
+      if (byCode) {
+        const uId = byCode.user_id || `account:${byCode.id}`;
+        return {
+          authenticated: true,
+          userId: uId,
+          role: uId === 'owner' ? 'owner' : 'client',
+          login: byCode.name,
+          accountId: byCode.id,
+        };
+      }
+    }
+
+    const token = String(params.token || '').trim();
+    if (token) {
+      const verified = sqliteDb.verifyAuthToken(token);
+      if (verified.valid) {
+        if (verified.role === 'owner') {
+          return {
+            authenticated: true,
+            userId: 'owner',
+            role: 'owner',
+            login: verified.login,
+            inviteId: verified.inviteId,
+          };
+        }
+        if (verified.inviteId) {
+          return {
+            authenticated: true,
+            userId: `invite:${verified.inviteId}`,
+            role: 'client',
+            login: verified.login,
+            inviteId: verified.inviteId,
+          };
+        }
+        if (verified.accountId) {
+          const acc = exchangeAccountsStore.find((a) => a.id === verified.accountId);
+          return {
+            authenticated: true,
+            userId: acc?.user_id || `account:${verified.accountId}`,
+            role: 'client',
+            login: verified.login || acc?.name,
+            accountId: verified.accountId,
+          };
+        }
+      }
+    }
+
+    const cfg = sqliteDb.getSiteAuthConfig();
+    if (!cfg.require_login) {
+      const reqAccId = String(params.accountId || '').trim();
+      if (reqAccId && reqAccId !== 'master') {
+        const byId = exchangeAccountsStore.find((a) => a.id === reqAccId);
+        if (byId) {
+          const uId = byId.user_id || 'owner';
+          return {
+            authenticated: true,
+            userId: uId,
+            role: uId === 'owner' ? 'owner' : 'client',
+            login: byId.name,
+            accountId: byId.id,
+          };
+        }
+      }
+      return {
+        authenticated: true,
+        userId: 'owner',
+        role: 'owner',
+        login: cfg.owner_login,
+      };
+    }
+
+    return {
+      authenticated: false,
+      userId: '',
+      role: 'client',
+    };
+  }
+
+  function resolveRequestAuth(req: express.Request): ResolvedAuth {
+    const authHeader = String(req.headers.authorization || '');
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const clientCode = String(req.query.code || req.query.client || '').trim();
+    const reqAccId = String(req.query.account_id || '').trim();
+    return resolveAuthFromCredentials({ token, clientCode, accountId: reqAccId });
+  }
+
+  function requireAuth(req: express.Request, res: express.Response): ResolvedAuth | null {
+    const auth = resolveRequestAuth(req);
+    if (!auth.authenticated) {
+      res.status(401).json({ error: 'Требуется авторизация' });
+      return null;
+    }
+    return auth;
+  }
+
+  function requireOwner(req: express.Request, res: express.Response): ResolvedAuth | null {
+    const auth = requireAuth(req, res);
+    if (!auth) return null;
+    if (auth.role !== 'owner') {
+      res.status(403).json({ error: 'Доступно только владельцу терминала' });
+      return null;
+    }
+    return auth;
+  }
+
+  function getAccountsForUser(auth: {
+    userId: string;
+    role?: 'owner' | 'client';
+    accountId?: string;
+  }): ExchangeAccountRecord[] {
+    if (auth.role === 'client' && auth.accountId) {
+      return exchangeAccountsStore.filter((a) => a.id === auth.accountId);
+    }
+    return exchangeAccountsStore.filter((a) => (a.user_id || 'owner') === auth.userId);
+  }
+
+  function filterTradesForUserScope(auth: {
+    userId: string;
+    role?: 'owner' | 'client';
+    accountId?: string;
+  }): FreqtradeTrade[] {
+    const userAccs = getAccountsForUser(auth);
+    if (userAccs.length === 0) {
+      return [];
+    }
+    const connectedAt = userAccs.reduce((minTs, a) => {
+      const ts = a.connected_at || 0;
+      if (ts <= 0) return minTs;
+      return minTs === 0 ? ts : Math.min(minTs, ts);
+    }, 0);
+
+    return tradesStore.filter((t) => {
+      if (resolveTradeUserId(t) !== auth.userId) return false;
+      if (auth.role === 'client' && auth.accountId && t.account_id !== auth.accountId) {
+        return false;
+      }
+      if (t.is_open) return true;
+      if (t.enter_tag === 'EXCHANGE_HISTORY' || t.exit_reason === 'exchange_closed_pnl') {
+        return false;
+      }
+      const closedTs = t.close_timestamp || 0;
+      if (connectedAt > 0 && closedTs > 0 && closedTs < connectedAt - 1000) {
+        return false;
+      }
+      return true;
+    });
+  }
+
+  function getCompoundedBalanceForUser(
+    userAccs: ExchangeAccountRecord[],
+    scopedTrades: FreqtradeTrade[]
+  ): {
+    baseDeposit: number;
+    closedNetProfit: number;
+    compoundedBalance: number;
+  } {
+    const enabledAccs = userAccs.filter((a) => a.enabled);
+    if (enabledAccs.length === 0) {
+      return { baseDeposit: 0, closedNetProfit: 0, compoundedBalance: 0 };
+    }
+    let sumWallet = 0;
+    let sumBaseDep = 0;
+    let sumClosedProfit = 0;
+    let anySim = false;
+    for (const a of enabledAccs) {
+      const wBal = Number(a.wallet_balance_usdt ?? a.balance_usdt ?? 0);
+      const targetId = getTargetAccountIdForRecord(a);
+      const aClosed = scopedTrades
+        .filter((t) => !t.is_open && tradeMatchesAccount(t, a, targetId))
+        .reduce((s, t) => s + (t.net_profit ?? t.profit_abs ?? 0), 0);
+      const isReal = Boolean(a.api_key_raw && !isSimulatedTestApiKey(a.api_key_raw));
+      if (!isReal) anySim = true;
+      sumWallet += wBal;
+      sumClosedProfit += aClosed;
+      sumBaseDep += isReal ? inferInitialDeposit(a, wBal, aClosed) : wBal;
+    }
+    return {
+      baseDeposit: Number(sumBaseDep.toFixed(2)),
+      closedNetProfit: Number(sumClosedProfit.toFixed(2)),
+      compoundedBalance: Number(
+        Math.max(0, anySim ? sumWallet + sumClosedProfit : sumWallet).toFixed(2)
+      ),
+    };
+  }
+
+  function getAggregatedMetricsForUser(
+    userAccs: ExchangeAccountRecord[],
+    openTrades: FreqtradeTrade[],
+    closedTrades: FreqtradeTrade[]
+  ) {
+    const enabledAccs = userAccs.filter((a) => a.enabled);
+    const compounded = getCompoundedBalanceForUser(userAccs, [...openTrades, ...closedTrades]);
+    const localUsedStake = Number(openTrades.reduce((acc, t) => acc + t.stake_amount, 0).toFixed(2));
+    const localOpenPnl = Number(openTrades.reduce((acc, t) => acc + t.profit_abs, 0).toFixed(4));
+
+    if (enabledAccs.length === 0) {
+      return {
+        compounded,
+        baseDeposit: 0,
+        totalBalance: 0,
+        openProfitAbs: localOpenPnl,
+        equityBalance: Number(localOpenPnl.toFixed(4)),
+        usedStake: localUsedStake,
+        freeBalance: 0,
+      };
+    }
+
+    let sumWallet = 0;
+    let sumOpenPnl = 0;
+    let sumUsedStake = 0;
+    let sumFree = 0;
+    let anySim = false;
+    for (const a of enabledAccs) {
+      const aIsReal = Boolean(a.api_key_raw && !isSimulatedTestApiKey(a.api_key_raw));
+      if (!aIsReal) anySim = true;
+      const aTargetId = getTargetAccountIdForRecord(a);
+      const aOpen = openTrades.filter((t) => tradeMatchesAccount(t, a, aTargetId));
+      const wBal = Number(a.wallet_balance_usdt ?? a.balance_usdt ?? 0);
+      const aLocalUsed = aOpen.reduce((s, t) => s + t.stake_amount, 0);
+      const aLocalPnl = aOpen.reduce((s, t) => s + t.profit_abs, 0);
+      const aUsed =
+        aIsReal && typeof a.used_margin_usdt === 'number' && Number.isFinite(a.used_margin_usdt)
+          ? a.used_margin_usdt
+          : aLocalUsed;
+      const aFree =
+        aIsReal &&
+        typeof a.available_balance_usdt === 'number' &&
+        Number.isFinite(a.available_balance_usdt)
+          ? a.available_balance_usdt
+          : Math.max(0, wBal - aUsed);
+      const aPnl =
+        aIsReal && typeof a.unrealized_pnl === 'number' && aOpen.length > 0
+          ? a.unrealized_pnl
+          : aLocalPnl;
+      sumWallet += wBal;
+      sumOpenPnl += aPnl;
+      sumUsedStake += aUsed;
+      sumFree += aFree;
+    }
+
+    const totalBalance = anySim
+      ? Number(compounded.compoundedBalance.toFixed(2))
+      : Number(sumWallet.toFixed(4));
+    const openProfitAbs = Number(sumOpenPnl.toFixed(4));
+    const freeBalance = anySim
+      ? Number(Math.max(0, totalBalance - sumUsedStake).toFixed(2))
+      : Number(sumFree.toFixed(2));
+    return {
+      compounded,
+      baseDeposit: compounded.baseDeposit,
+      totalBalance,
+      openProfitAbs,
+      equityBalance: Number((totalBalance + openProfitAbs).toFixed(4)),
+      usedStake: Number(sumUsedStake.toFixed(2)),
+      freeBalance,
+    };
+  }
+
   // ============================================================================
   // АВТОРИЗАЦИЯ ВЛАДЕЛЬЦА САЙТА (ЧЕРЕЗ СЕКРЕТЫ) И ДОСТУП ПО ССЫЛКЕ (?invite=...)
   // ============================================================================
@@ -5449,10 +5134,12 @@ async function startServer() {
           login: consumed.label,
           inviteId: consumed.id,
         });
+        const uId = consumed.role === 'owner' ? 'owner' : `invite:${consumed.id}`;
         appendLog(
           'freqtrade.auth',
           'INFO',
-          `Вход по персональной ссылке доступа: ${consumed.label} (роль: ${consumed.role})`
+          `Вход по персональной ссылке доступа: ${consumed.label} (роль: ${consumed.role})`,
+          { userId: uId }
         );
         res.json({
           require_login: true,
@@ -5461,6 +5148,7 @@ async function startServer() {
           authenticated: true,
           role: consumed.role,
           login: consumed.label,
+          user_id: uId,
           token: sessionToken,
         });
         return;
@@ -5477,10 +5165,12 @@ async function startServer() {
           login: acc.name,
           accountId: acc.id,
         });
+        const uId = acc.user_id || `account:${acc.id}`;
         appendLog(
           'freqtrade.auth',
           'INFO',
-          `Вход по персональной ссылке инвестора: ${acc.name} (${String(acc.exchange).toUpperCase()}, код: ${acc.client_access_code})`
+          `Вход по персональному коду аккаунта: ${acc.name} (${String(acc.exchange).toUpperCase()}, код: ${acc.client_access_code})`,
+          { userId: uId }
         );
         res.json({
           require_login: true,
@@ -5490,6 +5180,7 @@ async function startServer() {
           role: 'client',
           login: acc.name,
           account_id: acc.id,
+          user_id: uId,
           client_code: acc.client_access_code,
           token: sessionToken,
         });
@@ -5507,6 +5198,7 @@ async function startServer() {
         owner_login: cfg.owner_login,
         authenticated: true,
         role: 'owner',
+        user_id: 'owner',
         login: cfg.owner_login,
       });
       return;
@@ -5514,9 +5206,15 @@ async function startServer() {
 
     if (verified.valid) {
       let clientCode: string | undefined;
-      if (verified.role === 'client' && verified.accountId) {
-        const acc = exchangeAccountsStore.find((a) => a.id === verified.accountId);
-        if (acc) clientCode = acc.client_access_code;
+      let userId = verified.role === 'owner' ? 'owner' : 'client:unknown';
+      if (verified.role === 'client') {
+        if (verified.inviteId) {
+          userId = `invite:${verified.inviteId}`;
+        } else if (verified.accountId) {
+          const acc = exchangeAccountsStore.find((a) => a.id === verified.accountId);
+          if (acc) clientCode = acc.client_access_code;
+          userId = acc?.user_id || `account:${verified.accountId}`;
+        }
       }
       res.json({
         require_login: true,
@@ -5525,6 +5223,7 @@ async function startServer() {
         owner_login: verified.role === 'owner' ? cfg.owner_login : undefined,
         authenticated: true,
         role: verified.role || 'owner',
+        user_id: userId,
         login: verified.login || cfg.owner_login,
         account_id: verified.accountId,
         client_code: clientCode,
@@ -5555,14 +5254,17 @@ async function startServer() {
         login: consumed.label,
         inviteId: consumed.id,
       });
+      const uId = consumed.role === 'owner' ? 'owner' : `invite:${consumed.id}`;
       appendLog(
         'freqtrade.auth',
         'INFO',
-        `Вход по персональной ссылке доступа: ${consumed.label} (${consumed.role})`
+        `Вход по персональной ссылке доступа: ${consumed.label} (${consumed.role})`,
+        { userId: uId }
       );
       res.json({
         authenticated: true,
         role: consumed.role,
+        user_id: uId,
         login: consumed.label,
         token,
       });
@@ -5577,17 +5279,20 @@ async function startServer() {
       }
       const token = sqliteDb.createAuthToken({
         role: 'client',
-        login: String(acc.name || 'Клиент'),
+        login: String(acc.name || 'Пользователь'),
         accountId: String(acc.id),
       });
+      const uId = acc.user_id || `account:${acc.id}`;
       appendLog(
         'freqtrade.auth',
         'INFO',
-        `Вход по коду доступа клиента: ${acc.name} (${String(acc.exchange).toUpperCase()})`
+        `Вход по коду доступа аккаунта: ${acc.name} (${String(acc.exchange).toUpperCase()})`,
+        { userId: uId }
       );
       res.json({
         authenticated: true,
         role: 'client',
+        user_id: uId,
         login: String(acc.name),
         account_id: String(acc.id),
         token,
@@ -5605,10 +5310,13 @@ async function startServer() {
       role: 'owner',
       login: cfg.owner_login,
     });
-    appendLog('freqtrade.auth', 'INFO', `Выполнен вход владельца терминала (${cfg.owner_login})`);
+    appendLog('freqtrade.auth', 'INFO', `Выполнен вход владельца терминала (${cfg.owner_login})`, {
+      userId: 'owner',
+    });
     res.json({
       authenticated: true,
       role: 'owner',
+      user_id: 'owner',
       login: cfg.owner_login,
       owner_login: cfg.owner_login,
       password_changed: cfg.password_changed,
@@ -5619,24 +5327,14 @@ async function startServer() {
   });
 
   app.get('/api/v1/auth/invites', (req, res) => {
-    const authHeader = String(req.headers.authorization || '');
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    const verified = sqliteDb.verifyAuthToken(token);
-    if (!verified.valid || verified.role !== 'owner') {
-      res.status(403).json({ error: 'Доступно только владельцу сайта' });
-      return;
-    }
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     res.json({ invites: sqliteDb.listInviteLinks() });
   });
 
   app.post('/api/v1/auth/invites', (req, res) => {
-    const authHeader = String(req.headers.authorization || '');
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    const verified = sqliteDb.verifyAuthToken(token);
-    if (!verified.valid || verified.role !== 'owner') {
-      res.status(403).json({ error: 'Доступно только владельцу сайта' });
-      return;
-    }
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     const { label = 'Гостевой доступ', role = 'client' } = req.body || {};
     const invite = sqliteDb.createInviteLink(
       String(label),
@@ -5645,35 +5343,28 @@ async function startServer() {
     appendLog(
       'freqtrade.auth',
       'INFO',
-      `Создана ссылка доступа для "${invite.label}" (роль: ${invite.role})`
+      `Создана ссылка доступа для "${invite.label}" (роль: ${invite.role})`,
+      { userId: 'owner' }
     );
     res.json({ invite, invites: sqliteDb.listInviteLinks() });
   });
 
   app.delete('/api/v1/auth/invites/:id', (req, res) => {
-    const authHeader = String(req.headers.authorization || '');
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    const verified = sqliteDb.verifyAuthToken(token);
-    if (!verified.valid || verified.role !== 'owner') {
-      res.status(403).json({ error: 'Доступно только владельцу сайта' });
-      return;
-    }
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     const id = String(req.params.id);
     sqliteDb.deleteInviteLink(id);
-    appendLog('freqtrade.auth', 'WARNING', `Отозвана и удалена ссылка доступа #${id}`);
+    appendLog('freqtrade.auth', 'WARNING', `Отозвана и удалена ссылка доступа #${id}`, {
+      userId: 'owner',
+    });
     res.json({ removed_id: id, invites: sqliteDb.listInviteLinks() });
   });
 
   app.patch('/api/v1/auth/settings', (req, res) => {
-    const authHeader = String(req.headers.authorization || '');
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
     const cfg = sqliteDb.getSiteAuthConfig();
     if (cfg.require_login) {
-      const verified = sqliteDb.verifyAuthToken(token);
-      if (!verified.valid || verified.role !== 'owner') {
-        res.status(403).json({ error: 'Доступно только владельцу терминала' });
-        return;
-      }
+      const auth = requireOwner(req, res);
+      if (!auth) return;
     }
 
     const { new_login, new_password, require_login } = req.body || {};
@@ -5689,7 +5380,8 @@ async function startServer() {
     appendLog(
       'freqtrade.auth',
       'INFO',
-      `Обновлены настройки безопасности сайта: логин=${updated.owner_login}, вход по паролю=${updated.require_login ? 'ВКЛ' : 'ВЫКЛ'}`
+      `Обновлены настройки безопасности сайта: логин=${updated.owner_login}, вход по паролю=${updated.require_login ? 'ВКЛ' : 'ВЫКЛ'}`,
+      { userId: 'owner' }
     );
     res.json({
       ...updated,
@@ -5697,21 +5389,25 @@ async function startServer() {
     });
   });
 
-  app.get('/api/v1/show_config', (_req, res) => {
-    const connected = hasConnectedExchangeAccount();
-    if (!connected) {
+  app.get('/api/v1/show_config', (req, res) => {
+    const auth = resolveRequestAuth(req);
+    const userAccs = auth.authenticated ? getAccountsForUser(auth) : [];
+    const activeUserAccs = userAccs.filter((a) => a.enabled);
+    const userConnected = activeUserAccs.length > 0;
+    const anyConnected = hasConnectedExchangeAccount();
+    const userBalance = Number(
+      activeUserAccs.reduce((s, a) => s + Number(a.wallet_balance_usdt ?? a.balance_usdt ?? 0), 0).toFixed(2)
+    );
+
+    if (!anyConnected) {
       botConfig.state = 'stopped';
-      botConfig.starting_balance = 0;
-    } else {
-      const ownerAcc =
-        exchangeAccountsStore.find((a) => a.enabled && a.is_owner) ||
-        exchangeAccountsStore.find((a) => a.enabled);
-      botConfig.starting_balance = Number(ownerAcc?.balance_usdt || 0);
     }
     res.json({
       ...botConfig,
-      exchange_connected: connected,
-      active_accounts_count: exchangeAccountsStore.filter((a) => a.enabled).length,
+      state: anyConnected && !ownerManuallyStoppedBot ? botConfig.state : 'stopped',
+      starting_balance: userConnected ? userBalance : 0,
+      exchange_connected: userConnected,
+      active_accounts_count: activeUserAccs.length,
       available_strategies: ['ScalpingStrategy', 'GlobalHedgeStrategy'],
       available_timeframes: ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '1w'],
     });
@@ -5805,7 +5501,9 @@ async function startServer() {
     });
   });
 
-  app.post('/api/v1/scan_cycle', async (_req, res) => {
+  app.post('/api/v1/scan_cycle', async (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     if (!hasConnectedExchangeAccount()) {
       botConfig.state = 'stopped';
       res.status(400).json({
@@ -5823,7 +5521,9 @@ async function startServer() {
   });
 
   // Полная симуляция сбоя/перезапуска памяти сервера с холодным восстановлением из trades.sqlite и доанализом открытых позиций
-  app.post('/api/v1/simulate_crash_recovery', async (_req, res) => {
+  app.post('/api/v1/simulate_crash_recovery', async (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     tradesStore = [];
     exchangeAccountsStore = [];
     botLevelsStore.clear();
@@ -5841,22 +5541,25 @@ async function startServer() {
       status: 'recovered_from_sqlite',
       state: botConfig.state,
       restored_trades_count: tradesStore.length,
-      open_master_trades: tradesStore.filter(
-        (t) => t.is_open && (!t.account_id || t.account_id === 'master')
-      ).length,
-      averaged_master_trades: tradesStore.filter(
-        (t) => t.is_open && (!t.account_id || t.account_id === 'master') && (t.dca_count || 0) > 0
+      open_owner_trades: tradesStore.filter((t) => t.is_open && resolveTradeUserId(t) === 'owner')
+        .length,
+      averaged_owner_trades: tradesStore.filter(
+        (t) => t.is_open && resolveTradeUserId(t) === 'owner' && (t.dca_count || 0) > 0
       ).length,
       accounts_count: exchangeAccountsStore.length,
     });
   });
 
-  app.get('/api/orders', (_req, res) => {
-    res.json(sqliteDb.getRecentOrders(150));
+  app.get('/api/orders', (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    res.json(sqliteDb.getRecentOrders(150, auth.userId));
   });
 
-  app.get('/api/analytics/pnl', (_req, res) => {
-    res.json(sqliteDb.getPnlAnalytics());
+  app.get('/api/analytics/pnl', (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    res.json(sqliteDb.getPnlAnalytics(auth.userId));
   });
 
   app.get('/api/signals', (req, res) => {
@@ -5864,118 +5567,16 @@ async function startServer() {
     res.json(sqliteDb.getRecentSignals(limit));
   });
 
-  function resolveRequestAccountScope(req: express.Request): {
-    accountId: string;
-    isClient: boolean;
-    baseDeposit: number;
-    account?: ExchangeAccountRecord;
-  } {
-    const authHeader = String(req.headers.authorization || '');
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    const verified = token ? sqliteDb.verifyAuthToken(token) : { valid: false };
-
-    const queryAccId = String(req.query.account_id || '').trim();
-    const queryCode = String(req.query.code || req.query.client || '').trim().toUpperCase();
-
-    if (queryCode) {
-      const byCode = exchangeAccountsStore.find(
-        (a) => a.client_access_code.toUpperCase() === queryCode
-      );
-      if (byCode) {
-        return {
-          accountId: byCode.id,
-          isClient: !byCode.is_owner,
-          baseDeposit: byCode.balance_usdt || 2000,
-          account: byCode,
-        };
-      }
-    }
-
-    if (queryAccId && queryAccId !== 'master') {
-      const byId = exchangeAccountsStore.find((a) => a.id === queryAccId);
-      if (byId) {
-        return {
-          accountId: byId.id,
-          isClient: !byId.is_owner,
-          baseDeposit: byId.balance_usdt || 2000,
-          account: byId,
-        };
-      }
-    }
-
-    if (verified.valid && verified.role === 'client' && verified.accountId) {
-      const clientAcc = exchangeAccountsStore.find((a) => a.id === verified.accountId);
-      return {
-        accountId: verified.accountId,
-        isClient: true,
-        baseDeposit: clientAcc?.balance_usdt || 2000,
-        account: clientAcc,
-      };
-    }
-
-    if (!hasConnectedExchangeAccount()) {
-      return {
-        accountId: 'master',
-        isClient: false,
-        baseDeposit: 0,
-        account: undefined,
-      };
-    }
-
-    const ownerAcc =
-      exchangeAccountsStore.find((a) => a.enabled && a.is_owner) ||
-      exchangeAccountsStore.find((a) => a.enabled);
-    return {
-      accountId: 'master',
-      isClient: false,
-      baseDeposit: Number(ownerAcc?.balance_usdt || 0),
-      account: ownerAcc,
-    };
-  }
-
-  function getScopeConnectedAt(scopeAccountId: string): number {
-    if (scopeAccountId === 'master') {
-      const ownerAccs = exchangeAccountsStore.filter((a) => a.is_owner && a.connected_at && a.connected_at > 0);
-      const pool = ownerAccs.length > 0
-        ? ownerAccs
-        : exchangeAccountsStore.filter((a) => a.enabled && a.connected_at && a.connected_at > 0);
-      return pool.reduce((minTs, a) => (minTs === 0 ? a.connected_at! : Math.min(minTs, a.connected_at!)), 0);
-    }
-    const targetAcc = exchangeAccountsStore.find((a) => a.id === scopeAccountId);
-    return targetAcc?.connected_at || 0;
-  }
-
-  function filterTradesForScope(scopeAccountId: string): FreqtradeTrade[] {
-    if (!hasConnectedExchangeAccount()) {
-      return [];
-    }
-    const connectedAt = getScopeConnectedAt(scopeAccountId);
-    const matchesScope = (t: FreqtradeTrade) =>
-      scopeAccountId === 'master'
-        ? !t.account_id || t.account_id === 'master'
-        : t.account_id === scopeAccountId;
-
-    return tradesStore.filter((t) => {
-      if (!matchesScope(t)) return false;
-      if (t.is_open) return true;
-      if (t.enter_tag === 'EXCHANGE_HISTORY' || t.exit_reason === 'exchange_closed_pnl') return false;
-      const closedTs = t.close_timestamp || 0;
-      if (connectedAt > 0 && closedTs > 0 && closedTs < connectedAt - 1000) {
-        return false;
-      }
-      return true;
-    });
-  }
-
   app.get('/api/v1/status', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     await initializeBotTrades();
     if (req.query.sync === 'true') {
       await syncRealExchangeBalancesIfNeeded(true);
     } else {
       triggerBackgroundExchangeSync(false);
     }
-    const scope = resolveRequestAccountScope(req);
-    const scopedTrades = filterTradesForScope(scope.accountId);
+    const scopedTrades = filterTradesForUserScope(auth);
     for (const t of scopedTrades) {
       if (t.is_open) {
         refreshTradeLivePriceFromWs(t);
@@ -5986,9 +5587,10 @@ async function startServer() {
   });
 
   app.get('/api/v1/trades/open', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     await initializeBotTrades();
-    const scope = resolveRequestAccountScope(req);
-    const scopedTrades = filterTradesForScope(scope.accountId);
+    const scopedTrades = filterTradesForUserScope(auth);
     for (const t of scopedTrades) {
       if (t.is_open) {
         refreshTradeLivePriceFromWs(t);
@@ -5999,14 +5601,15 @@ async function startServer() {
   });
 
   app.get('/api/v1/trades', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     await initializeBotTrades();
     if (req.query.sync === 'true') {
       await syncRealExchangeBalancesIfNeeded(true);
     } else {
       triggerBackgroundExchangeSync(false);
     }
-    const scope = resolveRequestAccountScope(req);
-    const scopedTrades = filterTradesForScope(scope.accountId);
+    const scopedTrades = filterTradesForUserScope(auth);
     const closed = scopedTrades.filter((t) => !t.is_open);
     res.json({
       trades: closed,
@@ -6016,26 +5619,23 @@ async function startServer() {
   });
 
   app.get('/api/v1/profit', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     await initializeBotTrades();
     if (req.query.sync === 'true') {
       await syncRealExchangeBalancesIfNeeded(true);
     } else {
       triggerBackgroundExchangeSync(false);
     }
-    const scope = resolveRequestAccountScope(req);
-    const scopedTrades = filterTradesForScope(scope.accountId);
+    const userAccs = getAccountsForUser(auth);
+    const scopedTrades = filterTradesForUserScope(auth);
     const open = scopedTrades.filter((t) => t.is_open);
     const closed = scopedTrades.filter((t) => !t.is_open);
     const closedProfitAbs = Number(
       closed.reduce((acc, t) => acc + (t.net_profit ?? t.profit_abs ?? 0), 0).toFixed(4)
     );
-    const isRealAcc = Boolean(
-      scope.account?.api_key_raw && !isSimulatedTestApiKey(scope.account.api_key_raw)
-    );
-    const openProfitAbs =
-      isRealAcc && typeof scope.account?.unrealized_pnl === 'number' && open.length > 0
-        ? Number(scope.account.unrealized_pnl.toFixed(4))
-        : Number(open.reduce((acc, t) => acc + t.profit_abs, 0).toFixed(4));
+    const metrics = getAggregatedMetricsForUser(userAccs, open, closed);
+    const openProfitAbs = metrics.openProfitAbs;
     const allProfitAbs = Number((closedProfitAbs + openProfitAbs).toFixed(4));
     const totalFeesUsdt = Number(
       scopedTrades
@@ -6051,12 +5651,9 @@ async function startServer() {
     const losses = closed.filter((t) => (t.net_profit ?? t.profit_abs) < 0).length;
     const winrate = closed.length > 0 ? Number(((wins / closed.length) * 100).toFixed(1)) : 0;
 
-    const compounded = getCompoundedAccountBalance(scope.accountId);
-    const baseDeposit = compounded.baseDeposit > 0 ? compounded.baseDeposit : scope.baseDeposit;
-    const exactWalletBalance = isRealAcc
-      ? Number((scope.account?.wallet_balance_usdt ?? scope.account?.balance_usdt ?? compounded.compoundedBalance).toFixed(4))
-      : Number(compounded.compoundedBalance.toFixed(2));
-    const exactEquity = Number((exactWalletBalance + openProfitAbs).toFixed(4));
+    const baseDeposit = metrics.baseDeposit;
+    const exactWalletBalance = metrics.totalBalance;
+    const exactEquity = metrics.equityBalance;
 
     res.json({
       profit_closed_coin: closedProfitAbs,
@@ -6089,11 +5686,13 @@ async function startServer() {
   });
 
   app.get('/api/v1/daily', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     await initializeBotTrades();
-    const scope = resolveRequestAccountScope(req);
-    const scopedTrades = filterTradesForScope(scope.accountId);
-    const compounded = getCompoundedAccountBalance(scope.accountId);
-    const baseDeposit = compounded.baseDeposit > 0 ? compounded.baseDeposit : Math.max(100, scope.baseDeposit || 1000);
+    const userAccs = getAccountsForUser(auth);
+    const scopedTrades = filterTradesForUserScope(auth);
+    const compounded = getCompoundedBalanceForUser(userAccs, scopedTrades);
+    const baseDeposit = compounded.baseDeposit > 0 ? compounded.baseDeposit : 0;
 
     // Агрегируем строго закрытые сделки по дате их закрытия (YYYY-MM-DD) с использованием чистого PnL (net_profit)
     const closedTrades = scopedTrades.filter((t) => !t.is_open);
@@ -6172,52 +5771,25 @@ async function startServer() {
   });
 
   app.get('/api/v1/balance', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     await initializeBotTrades();
     if (req.query.sync === 'true') {
       await syncRealExchangeBalancesIfNeeded(true);
     } else {
       triggerBackgroundExchangeSync(false);
     }
-    const scope = resolveRequestAccountScope(req);
-    const scopedTrades = filterTradesForScope(scope.accountId);
-    const isRealAcc = Boolean(
-      scope.account?.api_key_raw && !isSimulatedTestApiKey(scope.account.api_key_raw)
-    );
-    const localUsedStake = Number(
-      scopedTrades
-        .filter((t) => t.is_open)
-        .reduce((acc, t) => acc + t.stake_amount, 0)
-        .toFixed(2)
-    );
-    const compounded = getCompoundedAccountBalance(scope.accountId);
-    const baseStartingBalance = compounded.baseDeposit > 0 ? compounded.baseDeposit : scope.baseDeposit;
-    const totalBalance = isRealAcc
-      ? Number((scope.account?.wallet_balance_usdt ?? scope.account?.balance_usdt ?? compounded.compoundedBalance).toFixed(4))
-      : Number(compounded.compoundedBalance.toFixed(2));
-    const unrealizedPnl =
-      isRealAcc && typeof scope.account?.unrealized_pnl === 'number'
-        ? Number(scope.account.unrealized_pnl.toFixed(4))
-        : Number(
-            scopedTrades
-              .filter((t) => t.is_open)
-              .reduce((acc, t) => acc + t.profit_abs, 0)
-              .toFixed(4)
-          );
-    const equityBalance = Number((totalBalance + unrealizedPnl).toFixed(4));
-    const hasExchangeMargin =
-      isRealAcc &&
-      typeof scope.account?.used_margin_usdt === 'number' &&
-      Number.isFinite(scope.account.used_margin_usdt);
-    const usedStake = hasExchangeMargin
-      ? Number(scope.account!.used_margin_usdt!.toFixed(2))
-      : localUsedStake;
-    const hasExchangeAvailable =
-      isRealAcc &&
-      typeof scope.account?.available_balance_usdt === 'number' &&
-      Number.isFinite(scope.account.available_balance_usdt);
-    const freeBalance = hasExchangeAvailable
-      ? Number(scope.account!.available_balance_usdt!.toFixed(2))
-      : Number(Math.max(0, totalBalance - usedStake).toFixed(2));
+    const userAccs = getAccountsForUser(auth);
+    const scopedTrades = filterTradesForUserScope(auth);
+    const openTrades = scopedTrades.filter((t) => t.is_open);
+    const closedTrades = scopedTrades.filter((t) => !t.is_open);
+    const metrics = getAggregatedMetricsForUser(userAccs, openTrades, closedTrades);
+    const baseStartingBalance = metrics.baseDeposit;
+    const totalBalance = metrics.totalBalance;
+    const unrealizedPnl = metrics.openProfitAbs;
+    const equityBalance = metrics.equityBalance;
+    const usedStake = metrics.usedStake;
+    const freeBalance = metrics.freeBalance;
     res.json({
       currencies: [
         {
@@ -6244,9 +5816,10 @@ async function startServer() {
   });
 
   app.get('/api/v1/performance', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     await initializeBotTrades();
-    const scope = resolveRequestAccountScope(req);
-    const scopedTrades = filterTradesForScope(scope.accountId);
+    const scopedTrades = filterTradesForUserScope(auth);
     const map = new Map<string, { pair: string; profit_pct: number; profit_abs: number; count: number }>();
     for (const t of scopedTrades) {
       const curr = map.get(t.pair) || { pair: t.pair, profit_pct: 0, profit_abs: 0, count: 0 };
@@ -6285,6 +5858,8 @@ async function startServer() {
   });
 
   app.post('/api/v1/blacklist', (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     const { blacklist: newPairs } = req.body || {};
     if (Array.isArray(newPairs)) {
       for (const p of newPairs) {
@@ -6296,6 +5871,8 @@ async function startServer() {
   });
 
   app.delete('/api/v1/blacklist', (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     const p = String(req.query.pairs_to_delete || '').toUpperCase();
     if (p) blacklist = blacklist.filter((item) => item !== p);
     res.json({ blacklist, length: blacklist.length });
@@ -6306,6 +5883,8 @@ async function startServer() {
   });
 
   app.post('/api/v1/locks', (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     const { pair, until, reason = 'Manual Lock', side = '*' } = req.body || {};
     const lock = {
       id: Date.now(),
@@ -6321,6 +5900,8 @@ async function startServer() {
   });
 
   app.delete('/api/v1/locks/:id', (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     const id = Number(req.params.id);
     pairLocks = pairLocks.filter((l) => l.id !== id);
     res.json({ lock_count: pairLocks.length, locks: pairLocks });
@@ -6354,29 +5935,38 @@ async function startServer() {
     res.json(dataframe);
   });
 
-  app.get('/api/v1/logs', (_req, res) => {
-    res.json({ log_count: botLogs.length, logs: [...botLogs].reverse() });
+  app.get('/api/v1/logs', (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    const scopedLogs = botLogs.filter((l) => l.publicMarket || l.userId === auth.userId);
+    res.json({ log_count: scopedLogs.length, logs: [...scopedLogs].reverse() });
   });
 
-  app.post('/api/v1/start', (_req, res) => {
+  app.post('/api/v1/start', (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     if (!hasConnectedExchangeAccount()) {
       botConfig.state = 'stopped';
       appendLog(
         'freqtrade.rpc.rpc',
         'ERROR',
-        'Отказ запуска: не подключен ни один биржевой аккаунт (API). Подключите биржу во вкладке «API / Клиенты».'
+        'Отказ запуска: не подключен ни один биржевой аккаунт (API). Подключите биржу во вкладке «API-аккаунты».',
+        { userId: auth.userId }
       );
       res.status(400).json({
         error:
-          'Невозможно запустить бота без подключенной биржи. Добавьте API-ключ во вкладке «API / Клиенты».',
+          'Невозможно запустить бота без подключенной биржи. Добавьте API-ключ во вкладке «API-аккаунты».',
         status: 'stopped (no exchange connected)',
         state: 'stopped',
       });
       return;
     }
+    ownerManuallyStoppedBot = false;
     botConfig.state = 'running';
     botConfig.pause_new_entries = false;
-    appendLog('freqtrade.rpc.rpc', 'INFO', 'Changing state to: RUNNING (Новые входы разрешены)');
+    appendLog('freqtrade.rpc.rpc', 'INFO', 'Changing state to: RUNNING (Новые входы разрешены)', {
+      publicMarket: true,
+    });
     scheduleScopeStateSync();
     res.json({
       status: 'starting trader ...',
@@ -6385,9 +5975,14 @@ async function startServer() {
     });
   });
 
-  app.post('/api/v1/stop', (_req, res) => {
+  app.post('/api/v1/stop', (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
+    ownerManuallyStoppedBot = true;
     botConfig.state = 'stopped';
-    appendLog('freqtrade.rpc.rpc', 'WARNING', 'Changing state to: STOPPED');
+    appendLog('freqtrade.rpc.rpc', 'WARNING', 'Changing state to: STOPPED', {
+      publicMarket: true,
+    });
     scheduleScopeStateSync();
     res.json({
       status: 'stopping trader ...',
@@ -6396,9 +5991,11 @@ async function startServer() {
     });
   });
 
-  app.post('/api/v1/stopbuy', (_req, res) => {
+  app.post('/api/v1/stopbuy', (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     botConfig.pause_new_entries = !botConfig.pause_new_entries;
-    if (hasConnectedExchangeAccount() && botConfig.state === 'paused') {
+    if (hasConnectedExchangeAccount() && !ownerManuallyStoppedBot && botConfig.state === 'paused') {
       botConfig.state = 'running';
     }
     appendLog(
@@ -6406,7 +6003,8 @@ async function startServer() {
       'INFO',
       botConfig.pause_new_entries
         ? '⏸️ Владелец включил «Остановить открытие новых сделок»: бот прекратил новые входы, но продолжает усреднять (DCA) и закрывать в плюс текущие позиции.'
-        : '▶️ Владелец отключил паузу новых входов: бот снова ищет точки входа по стратегиям ScalpingStrategy и GlobalHedgeStrategy.'
+        : '▶️ Владелец отключил паузу новых входов: бот снова ищет точки входа по стратегиям ScalpingStrategy и GlobalHedgeStrategy.',
+      { publicMarket: true }
     );
     scheduleScopeStateSync();
     res.json({
@@ -6417,10 +6015,12 @@ async function startServer() {
   });
 
   app.post('/api/v1/bot/pause_entries', (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     const explicitVal = req.body?.pause_new_entries;
     botConfig.pause_new_entries =
       typeof explicitVal === 'boolean' ? explicitVal : !botConfig.pause_new_entries;
-    if (hasConnectedExchangeAccount() && botConfig.state !== 'stopped') {
+    if (hasConnectedExchangeAccount() && !ownerManuallyStoppedBot && botConfig.state !== 'stopped') {
       botConfig.state = 'running';
     }
     appendLog(
@@ -6428,7 +6028,8 @@ async function startServer() {
       'INFO',
       botConfig.pause_new_entries
         ? '⏸️ Владелец включил режим «Без новых сделок»: бот НЕ открывает новые позиции, продолжая вести, усреднять (DCA) и закрывать в плюс уже открытые сделки.'
-        : '▶️ Владелец разрешил открытие новых сделок: сканер рынка и входы по стратегиям активны.'
+        : '▶️ Владелец разрешил открытие новых сделок: сканер рынка и входы по стратегиям активны.',
+      { publicMarket: true }
     );
     scheduleScopeStateSync();
     res.json({
@@ -6438,14 +6039,18 @@ async function startServer() {
     });
   });
 
-  app.post('/api/v1/reload_config', (_req, res) => {
+  app.post('/api/v1/reload_config', (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     candleCache.clear();
-    appendLog('freqtrade.rpc.rpc', 'INFO', 'Reloading config ...');
+    appendLog('freqtrade.rpc.rpc', 'INFO', 'Reloading config ...', { publicMarket: true });
     scheduleScopeStateSync();
     res.json({ status: 'Reloading config ...', state: botConfig.state });
   });
 
   app.patch('/api/v1/config', (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     const { strategy, timeframe } = req.body || {};
     if (strategy) botConfig.strategy = String(strategy);
     if (timeframe) botConfig.timeframe = String(timeframe);
@@ -6453,12 +6058,14 @@ async function startServer() {
   });
 
   app.post('/api/v1/forceenter', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     await initializeBotTrades();
-    if (!hasConnectedExchangeAccount()) {
-      botConfig.state = 'stopped';
+    const userAccs = getAccountsForUser(auth).filter((a) => a.enabled);
+    if (userAccs.length === 0) {
       res.status(400).json({
         error:
-          'Бот не может открывать сделки без подключенной биржи. Сначала подключите биржевой аккаунт во вкладке «API / Клиенты».',
+          'Бот не может открывать сделки без подключенного API-аккаунта. Сначала подключите ваш биржевой аккаунт во вкладке «API-аккаунты».',
       });
       return;
     }
@@ -6470,8 +6077,27 @@ async function startServer() {
       leverage: customLeverage,
       take_profit_abs: customTp,
       stop_loss_abs: customSl,
-      skip_client_sync: skipClientSync,
+      account_id: requestedAccountId,
     } = req.body || {};
+
+    let targetAcc: ExchangeAccountRecord | undefined;
+    if (requestedAccountId) {
+      const reqAccStr = String(requestedAccountId).trim();
+      targetAcc = userAccs.find(
+        (a) =>
+          a.id === reqAccStr ||
+          (reqAccStr === 'master' && auth.role === 'owner' && (a.user_id || 'owner') === 'owner')
+      );
+      if (!targetAcc) {
+        res.status(403).json({
+          error: 'Указанный биржевой аккаунт не принадлежит вашему профилю или отключен.',
+        });
+        return;
+      }
+    } else {
+      targetAcc = userAccs[0];
+    }
+
     const cleanPair = String(pair).toUpperCase();
     const [{ candles: c1w }, { candles: c1d }, { candles: c4h }, { candles: c1h }] =
       await Promise.all([
@@ -6498,7 +6124,8 @@ async function startServer() {
             stake: stakeamount && Number(stakeamount) > 0 ? Number(stakeamount) : undefined,
             leverage:
               customLeverage && Number(customLeverage) >= 1 ? Number(customLeverage) : undefined,
-            skipClientSync: Boolean(skipClientSync),
+            accountId: targetAcc.id,
+            accountName: targetAcc.name,
             candles1w: c1w,
           }
         );
@@ -6535,7 +6162,8 @@ async function startServer() {
           leverage: customLeverage && Number(customLeverage) >= 1 ? Number(customLeverage) : undefined,
           customTp: customTp && Number(customTp) > 0 ? Number(customTp) : undefined,
           customSl: customSl && Number(customSl) > 0 ? Number(customSl) : undefined,
-          skipClientSync: Boolean(skipClientSync),
+          accountId: targetAcc.id,
+          accountName: targetAcc.name,
           preloadedPairLevels,
           candles1w: c1w,
         }
@@ -6550,10 +6178,12 @@ async function startServer() {
     res.json(newTrade);
   });
 
-  // Bot Averaging (DCA) endpoint — uses MTF 4H/1D strongest level & shifts weighted average entry price atomically across master and linked clients
+  // Bot Averaging (DCA) endpoint — operates strictly on the user's own trade
   app.post('/api/v1/dca', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     await initializeBotTrades();
-    if (!hasConnectedExchangeAccount()) {
+    if (!hasConnectedExchangeAccount(auth.userId)) {
       res.status(400).json({
         error: 'Бот не может выполнять усреднение (DCA) без подключенной биржи.',
       });
@@ -6564,6 +6194,13 @@ async function startServer() {
     const trade = tradesStore.find((t) => t.trade_id === id && t.is_open);
     if (!trade) {
       res.status(404).json({ error: `Открытая сделка #${id} не найдена` });
+      return;
+    }
+    if (
+      resolveTradeUserId(trade) !== auth.userId ||
+      (auth.role === 'client' && auth.accountId && trade.account_id !== auth.accountId)
+    ) {
+      res.status(403).json({ error: 'Нет доступа к чужой сделке' });
       return;
     }
 
@@ -6601,8 +6238,6 @@ async function startServer() {
     const targetAccId = trade.account_id || 'master';
     const dcaLockKey = getPosLockKey(targetAccId, trade.pair, trade.is_short);
     activePositionKeys.add(dcaLockKey);
-    const clientDcaDispatches = new Map<number, PlacedOrderResult | null>();
-    const acquiredClientDcaLocks: string[] = [];
 
     let dcaOrderRes: PlacedOrderResult | null = null;
     let addAmount = rawAddAmount;
@@ -6610,7 +6245,6 @@ async function startServer() {
     let newTotalAmount = trade.amount;
     let newTotalStake = trade.stake_amount;
     let newAvgOpenRate = trade.open_rate;
-    let dcaMultiplierRatio = addStake / Math.max(1, trade.stake_amount);
     let nextStrongDca: ReturnType<typeof findStrongestDcaLevel>;
 
     try {
@@ -6645,7 +6279,6 @@ async function startServer() {
       prevOpenRate = trade.open_rate;
       const prevAmount = trade.amount;
       const prevStake = trade.stake_amount;
-      dcaMultiplierRatio = addStake / Math.max(1, prevStake);
 
       newTotalAmount = Number((prevAmount + addAmount).toFixed(4));
       newTotalStake = Number((prevStake + addStake).toFixed(3));
@@ -6667,39 +6300,6 @@ async function startServer() {
         95.0,
         c1w
       );
-
-      // Pre-dispatch client DCA orders if master trade is averaged
-      if (!trade.account_id || trade.account_id === 'master') {
-        const clientCopies = tradesStore.filter(
-          (ct) =>
-            ct.is_open &&
-            ct.account_id &&
-            ct.account_id !== 'master' &&
-            (ct.parent_trade_id === trade.trade_id ||
-              (ct.pair === trade.pair && ct.is_short === trade.is_short))
-        );
-        for (const ct of clientCopies) {
-          const cLockKey = getPosLockKey(ct.account_id!, ct.pair, ct.is_short);
-          if (!activePositionKeys.has(cLockKey)) {
-            activePositionKeys.add(cLockKey);
-            acquiredClientDcaLocks.push(cLockKey);
-          }
-          const clientAddStake = Number((ct.stake_amount * dcaMultiplierRatio).toFixed(2));
-          const clientLev = ct.leverage || 25;
-          const clientRawAddAmount = Number(
-            ((clientAddStake * clientLev) / Math.max(1e-8, fillPrice)).toFixed(4)
-          );
-          const cRes = await dispatchOrderToExchangeAccount(ct.account_id!, {
-            pair: ct.pair,
-            isShort: ct.is_short,
-            action: 'DCA',
-            quantity: clientRawAddAmount,
-            leverage: clientLev,
-            referencePrice: fillPrice,
-          });
-          clientDcaDispatches.set(ct.trade_id, cRes);
-        }
-      }
 
       const postDcaMtf =
         c4h.length >= 20
@@ -6822,130 +6422,20 @@ async function startServer() {
           action_type: `DCA_${nextStep}`,
           notes: `DCA #${nextStep} @ ${fillPrice} | Avg: ${prevOpenRate} -> ${newAvgOpenRate} | Breakeven: ${trade.breakeven_price} | TP: ${trade.take_profit_abs} | Next DCA: ${trade.next_dca_price}${dcaOrderRes?.order_id ? ` | ExOrderId: ${dcaOrderRes.order_id}` : ''}`,
         });
-
-        // Synchronously average all linked client trades in the same SQLite transaction
-        if (!trade.account_id || trade.account_id === 'master') {
-          const clientCopies = tradesStore.filter(
-            (ct) =>
-              ct.is_open &&
-              ct.account_id &&
-              ct.account_id !== 'master' &&
-              (ct.parent_trade_id === trade.trade_id ||
-                (ct.pair === trade.pair && ct.is_short === trade.is_short))
-          );
-          for (const ct of clientCopies) {
-            const cRes = clientDcaDispatches.get(ct.trade_id);
-            const cCreds = getAccountCredentialsFromStore(ct.account_id!);
-            if (cCreds && !isSimulatedTestApiKey(cCreds.apiKey) && (!cRes || !cRes.success)) {
-              continue;
-            }
-            const clientAddStake = Number((ct.stake_amount * dcaMultiplierRatio).toFixed(2));
-            const clientLev = ct.leverage || 25;
-            const rawClientAddAmount = Number(
-              ((clientAddStake * clientLev) / Math.max(1e-8, fillPrice)).toFixed(4)
-            );
-            const clientAddAmount =
-              cRes?.success && cRes.qty > 0 ? cRes.qty : rawClientAddAmount;
-            const clientPrevRate = ct.open_rate;
-            const clientNewTotalAmount = Number((ct.amount + clientAddAmount).toFixed(4));
-            const clientNewAvgRate = roundPrice(
-              (clientPrevRate * ct.amount + fillPrice * clientAddAmount) /
-                Math.max(1e-8, clientNewTotalAmount)
-            );
-            ct.open_rate = clientNewAvgRate;
-            ct.amount = clientNewTotalAmount;
-            ct.stake_amount = Number((ct.stake_amount + clientAddStake).toFixed(2));
-            ct.dca_count = nextStep;
-            ct.last_dca_date = nowStr;
-            ct.trade_state = 'AVERAGED';
-            ct.enter_tag = trade.enter_tag;
-            ct.next_dca_price = trade.next_dca_price;
-            ct.planned_dca_levels = (trade.planned_dca_levels || []).map((lvl) => ({
-              ...lvl,
-              stake_amount: clientAddStake,
-              amount: Number(((clientAddStake * clientLev) / Math.max(1e-8, lvl.price)).toFixed(4)),
-              distance_pct: Number(
-                (((lvl.price - clientNewAvgRate) / Math.max(1e-8, clientNewAvgRate)) * 100).toFixed(2)
-              ),
-            }));
-            ct.dca_manual_override = Boolean(trade.dca_manual_override);
-            const clientOrderEntry: TradeOrderEntry & { commission_usdt?: number } = {
-              id: cRes?.order_id || `ord-${ct.trade_id}-${nextStep}`,
-              step: nextStep,
-              label: `Усреднение #${nextStep} (${nextStrongDca.source})`,
-              side: ct.is_short ? 'short' : 'long',
-              price: fillPrice,
-              amount: clientAddAmount,
-              stake_amount: clientAddStake,
-              timestamp: now,
-              date: nowStr,
-            };
-            if (cRes?.commission_usdt && cRes.commission_usdt > 0) {
-              clientOrderEntry.commission_usdt = Number(cRes.commission_usdt.toFixed(4));
-            }
-            ct.orders.push(clientOrderEntry);
-
-            recalculateTradeMetrics(ct, false);
-            if (!ct.tp_manual_override) {
-              ct.take_profit_abs = resolvePostDcaTakeProfit(
-                clientNewAvgRate,
-                ct.is_short,
-                postDcaMtf,
-                ct.min_profitable_tp
-              );
-              ct.tp_horizon = 'POST_DCA';
-              ct.tp_reason = `Пост-DCA цель: ближайшая зона отката выше безубытка (${ct.min_profitable_tp}$)`;
-              recalculateTradeMetrics(ct, false);
-            }
-            sqliteDb.upsertTrade(ct);
-            if (cCreds && !isSimulatedTestApiKey(cCreds.apiKey) && ct.take_profit_abs > 0) {
-              const safeClientTp =
-                !ct.tp_manual_override && ct.min_profitable_tp
-                  ? ct.is_short
-                    ? Math.min(ct.take_profit_abs, ct.min_profitable_tp)
-                    : Math.max(ct.take_profit_abs, ct.min_profitable_tp)
-                  : ct.take_profit_abs;
-              placeOrUpdateExchangeTakeProfitOrder(cCreds, {
-                pair: ct.pair,
-                isShort: ct.is_short,
-                quantity: ct.amount,
-                takeProfitPrice: safeClientTp,
-              }).catch(() => {});
-            }
-            sqliteDb.recordOrder({
-              trade_id: ct.trade_id,
-              pair: ct.pair,
-              order_type: 'market',
-              side: ct.is_short ? 'sell' : 'buy',
-              price: fillPrice,
-              amount: clientAddAmount,
-              cost: clientAddStake,
-              fee:
-                cRes?.commission_usdt && cRes.commission_usdt > 0
-                  ? Number(cRes.commission_usdt.toFixed(4))
-                  : Number((fillPrice * clientAddAmount * TAKER_FEE_RATE).toFixed(4)),
-              realized_pnl: 0,
-              action_type: `CLIENT_DCA_${nextStep}`,
-              notes: `Client DCA #${nextStep} @ ${fillPrice} | Avg: ${clientPrevRate} -> ${clientNewAvgRate}`,
-            });
-          }
-        }
       });
     } finally {
       activePositionKeys.delete(dcaLockKey);
-      for (const ck of acquiredClientDcaLocks) {
-        activePositionKeys.delete(ck);
-      }
     }
 
     appendLog(
       'freqtrade.bot.dca',
       'INFO',
-      `🔄 Усреднение #${nextStep} [${trade.pair}]: +${addStake}$ @ ${fillPrice}$. Средняя цена: ${prevOpenRate}$ ➔ ${newAvgOpenRate}$ | Безубыток (с комиссией 0.06%): ${trade.breakeven_price}$ | Новый TP: ${trade.take_profit_abs}$ | След. DCA: ${trade.next_dca_price}$`
+      `🔄 Усреднение #${nextStep} [${trade.pair}]: +${addStake}$ @ ${fillPrice}$. Средняя цена: ${prevOpenRate}$ ➔ ${newAvgOpenRate}$ | Безубыток (с комиссией 0.06%): ${trade.breakeven_price}$ | Новый TP: ${trade.take_profit_abs}$ | След. DCA: ${trade.next_dca_price}$`,
+      { userId: auth.userId }
     );
 
     broadcastTradeLifecycleEvent('trade:updated', trade);
-    scheduleScopeStateSync();
+    scheduleScopeStateSync(auth.userId);
 
     res.json({
       result: `Trade #${id} averaged (DCA ×${nextStep})`,
@@ -6957,6 +6447,8 @@ async function startServer() {
 
   // Update trade levels (TP, SL, Support, Resistance, or Planned DCA levels) when dragged by the user on the chart
   app.patch('/api/v1/trade_levels', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     await initializeBotTrades();
     const { tradeid, level_type, step, price } = req.body || {};
     const id = Number(tradeid);
@@ -6971,11 +6463,18 @@ async function startServer() {
       res.status(404).json({ error: `Open trade #${id} not found` });
       return;
     }
+    if (
+      resolveTradeUserId(trade) !== auth.userId ||
+      (auth.role === 'client' && auth.accountId && trade.account_id !== auth.accountId)
+    ) {
+      res.status(403).json({ error: 'Нет доступа к чужой сделке' });
+      return;
+    }
 
     recalculateTradeMetrics(trade, false);
     let prevPrice = 0;
     let effectivePrice = requestedPrice;
-    let clampedToBreakeven = false;
+    const clampedToBreakeven = false;
     let clampWarning: string | undefined;
 
     sqliteDb.runInTransaction(() => {
@@ -7006,7 +6505,8 @@ async function startServer() {
         appendLog(
           'freqtrade.bot.levels',
           wouldCloseInLossOrFeeMinus ? 'WARNING' : 'INFO',
-          `[${trade.pair}] TP изменен вручную на графике: ${prevPrice}$ ➔ ${trade.take_profit_abs}$ (ROI: ${trade.take_profit_pct}%). Синхронизировано с биржей и trades.sqlite.`
+          `[${trade.pair}] TP изменен вручную на графике: ${prevPrice}$ ➔ ${trade.take_profit_abs}$ (ROI: ${trade.take_profit_pct}%). Синхронизировано с биржей и trades.sqlite.`,
+          { userId: auth.userId }
         );
       } else if (level_type === 'sl') {
         prevPrice = trade.stop_loss_abs;
@@ -7016,7 +6516,8 @@ async function startServer() {
         appendLog(
           'freqtrade.bot.levels',
           'INFO',
-          `[${trade.pair}] SL изменен вручную на графике: ${prevPrice}$ ➔ ${effectivePrice}$ (${trade.stop_loss_pct}%). Сохранено в trades.sqlite.`
+          `[${trade.pair}] SL изменен вручную на графике: ${prevPrice}$ ➔ ${effectivePrice}$ (${trade.stop_loss_pct}%). Сохранено в trades.sqlite.`,
+          { userId: auth.userId }
         );
       } else if (level_type === 'dca') {
         const targetStep = Number(step) || (trade.dca_count || 0) + 1;
@@ -7033,7 +6534,8 @@ async function startServer() {
           appendLog(
             'freqtrade.bot.levels',
             'INFO',
-            `[${trade.pair}] Уровень DCA #${targetStep} перенесен на графике: ${prevPrice}$ ➔ ${effectivePrice}$ (дистанция: ${dcaItem.distance_pct}%, объем: ${dcaItem.amount}). Бот синхронизирован.`
+            `[${trade.pair}] Уровень DCA #${targetStep} перенесен на графике: ${prevPrice}$ ➔ ${effectivePrice}$ (дистанция: ${dcaItem.distance_pct}%, объем: ${dcaItem.amount}). Бот синхронизирован.`,
+            { userId: auth.userId }
           );
         } else {
           prevPrice = trade.next_dca_price || 0;
@@ -7069,60 +6571,10 @@ async function startServer() {
       }
 
       sqliteDb.upsertTrade(trade);
-
-      // Synchronously update linked client trades if master level was dragged
-      if (!trade.account_id || trade.account_id === 'master') {
-        const linkedClientTrades = tradesStore.filter(
-          (ct) =>
-            ct.is_open &&
-            ct.account_id &&
-            ct.account_id !== 'master' &&
-            ct.parent_trade_id === trade.trade_id
-        );
-        for (const ct of linkedClientTrades) {
-          if (level_type === 'tp') {
-            ct.take_profit_abs = effectivePrice;
-            ct.tp_manual_override = true;
-          } else if (level_type === 'sl') {
-            ct.stop_loss_abs = effectivePrice;
-            ct.sl_manual_override = true;
-          } else if (level_type === 'dca') {
-            const targetStep = Number(step) || (ct.dca_count || 0) + 1;
-            ct.dca_manual_override = true;
-            const dcaItem = ct.planned_dca_levels?.find((l) => l.step === targetStep);
-            if (dcaItem) {
-              dcaItem.price = effectivePrice;
-              dcaItem.manual_override = true;
-            }
-            if (targetStep === (ct.dca_count || 0) + 1) {
-              ct.next_dca_price = effectivePrice;
-            }
-          } else if (level_type === 'support') {
-            ct.support_level = effectivePrice;
-            const ctDca1 = ct.planned_dca_levels?.[0];
-            if (!ct.is_short && !ctDca1?.manual_override) {
-              ct.next_dca_price = effectivePrice;
-              if (ctDca1) {
-                ctDca1.price = effectivePrice;
-              }
-            }
-          } else if (level_type === 'resistance') {
-            ct.resistance_level = effectivePrice;
-            const ctDca1 = ct.planned_dca_levels?.[0];
-            if (ct.is_short && !ctDca1?.manual_override) {
-              ct.next_dca_price = effectivePrice;
-              if (ctDca1) {
-                ctDca1.price = effectivePrice;
-              }
-            }
-          }
-          recalculateTradeMetrics(ct, false);
-          sqliteDb.upsertTrade(ct);
-        }
-      }
     });
 
     broadcastTradeLifecycleEvent('trade:updated', trade);
+    scheduleScopeStateSync(auth.userId);
 
     res.json({
       result: 'Level updated and synced with bot SQLite database',
@@ -7137,6 +6589,8 @@ async function startServer() {
 
   // Get MTF & Timeframe Bot Levels (Support & Resistance with touches/bounces/strength_score) for a pair & timeframe
   app.get('/api/v1/pair_levels', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     await initializeBotTrades();
     const pair = String(req.query.pair || 'ETH/USDT:USDT').toUpperCase();
     const timeframe = String(req.query.timeframe || botConfig.timeframe || '1h').toLowerCase();
@@ -7146,6 +6600,8 @@ async function startServer() {
 
   // Add a new Bot Level on a pair (persisted in trades.sqlite)
   app.post('/api/v1/pair_levels', async (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     await initializeBotTrades();
     const { pair = 'ETH/USDT:USDT', timeframe = botConfig.timeframe, price, role, label } = req.body || {};
     const cleanPair = String(pair).toUpperCase();
@@ -7200,13 +6656,16 @@ async function startServer() {
     appendLog(
       'freqtrade.bot.levels',
       'INFO',
-      `[${cleanPair}] Добавлен уровень бота ${newLevel.label} @ ${cleanPrice}$`
+      `[${cleanPair}] Добавлен уровень бота ${newLevel.label} @ ${cleanPrice}$`,
+      { userId: 'owner' }
     );
     res.json({ pair: cleanPair, level: newLevel, levels: refreshed });
   });
 
-  // Update a Bot Level price when dragged on the chart (persisted in trades.sqlite & synced to open trades)
+  // Update a Bot Level price when dragged on the chart (persisted in trades.sqlite & synced to owner open trades)
   app.patch('/api/v1/pair_levels', async (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     await initializeBotTrades();
     const { pair = 'ETH/USDT:USDT', timeframe = botConfig.timeframe, id, price, role } = req.body || {};
     const cleanPair = String(pair).toUpperCase();
@@ -7264,13 +6723,13 @@ async function startServer() {
         updated_at: target.updated_at,
       });
 
-      // Only clean up sibling auto-levels and bind global trade S/R when user drags a global SUP/RES line itself
+      // Only clean up sibling auto-levels and bind global trade S/R when owner drags a global SUP/RES line itself
       if (isGlobalSupRes) {
         sqliteDb.replaceAutoBotLevelsWithManual(cleanPair, target.role, target.id);
 
-        // Привязываем DCA 1 (если его ещё не трогали вручную) к перетащенному глобальному SUP/RES; TP оставляем независимым
+        // Привязываем DCA 1 (только для сделок владельца, если его ещё не трогали вручную) к перетащенному глобальному SUP/RES
         for (const t of tradesStore) {
-          if (t.is_open && t.pair === cleanPair) {
+          if (t.is_open && t.pair === cleanPair && isTradeInMasterScope(t)) {
             recalculateTradeMetrics(t, false);
             const dca1 = t.planned_dca_levels?.[0];
             if (target.role === 'support') {
@@ -7304,13 +6763,14 @@ async function startServer() {
     }
     const refreshedLevels = await getOrComputeMtfBotLevels(cleanPair, normTf);
     const updatedPairTrades = tradesStore.filter(
-      (t) => t.is_open && t.pair === cleanPair && (!t.account_id || t.account_id === 'master')
+      (t) => t.is_open && t.pair === cleanPair && isTradeInMasterScope(t)
     );
 
     appendLog(
       'freqtrade.bot.levels',
       'INFO',
-      `[${cleanPair}] Уровень ${target.label} (${target.role.toUpperCase()}) перенесен на графике: ${prevPrice}$ ➔ ${newPrice}$.`
+      `[${cleanPair}] Уровень ${target.label} (${target.role.toUpperCase()}) перенесен на графике: ${prevPrice}$ ➔ ${newPrice}$.`,
+      { userId: 'owner' }
     );
     res.json({
       pair: cleanPair,
@@ -7323,6 +6783,8 @@ async function startServer() {
 
   // Delete a single Bot Level (marks deleted in trades.sqlite so auto-MTF won't recreate it)
   app.delete('/api/v1/pair_levels/:id', async (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     await initializeBotTrades();
     const id = String(req.params.id);
     const pair = String(req.query.pair || 'ETH/USDT:USDT').toUpperCase();
@@ -7340,13 +6802,16 @@ async function startServer() {
     appendLog(
       'freqtrade.bot.levels',
       'INFO',
-      `[${pair}] Удален уровень бота ${removed ? `${removed.label} @ ${removed.price}$` : id}. Триггер уровня отменен.`
+      `[${pair}] Удален уровень бота ${removed ? `${removed.label} @ ${removed.price}$` : id}. Триггер уровня отменен.`,
+      { userId: 'owner' }
     );
     res.json({ pair, removed_id: id, levels: next });
   });
 
   // Clear all Bot Levels for a pair
   app.delete('/api/v1/pair_levels', async (req, res) => {
+    const auth = requireOwner(req, res);
+    if (!auth) return;
     await initializeBotTrades();
     const pair = String(req.query.pair || 'ETH/USDT:USDT').toUpperCase();
     for (const k of Array.from(botLevelsStore.keys())) {
@@ -7355,23 +6820,30 @@ async function startServer() {
       }
     }
     sqliteDb.clearBotLevelsForPair(pair);
-    appendLog('freqtrade.bot.levels', 'INFO', `[${pair}] Очищены все уровни бота на графике`);
+    appendLog('freqtrade.bot.levels', 'INFO', `[${pair}] Очищены все уровни бота на графике`, {
+      userId: 'owner',
+    });
     res.json({ pair, levels: [] });
   });
 
   // ============================================================================
-  // TRADINGVIEW CHART DRAWINGS & PINNED MEASURE RULERS API (Persisted in trades.sqlite)
+  // TRADINGVIEW CHART DRAWINGS & PINNED MEASURE RULERS API (Persisted per user in trades.sqlite)
   // ============================================================================
   app.get('/api/v1/chart_drawings', (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     const pair = String(req.query.pair || 'ETH/USDT:USDT').toUpperCase();
-    if (!chartDrawingsStore.has(pair)) {
-      chartDrawingsStore.set(pair, sqliteDb.getChartDrawingsForPair(pair));
+    const cacheKey = `${auth.userId}::${pair}`;
+    if (!chartDrawingsStore.has(cacheKey)) {
+      chartDrawingsStore.set(cacheKey, sqliteDb.getChartDrawingsForPair(pair, auth.userId));
     }
-    const drawings = chartDrawingsStore.get(pair) || [];
+    const drawings = chartDrawingsStore.get(cacheKey) || [];
     res.json({ pair, drawings });
   });
 
   app.post('/api/v1/chart_drawings', (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     const { pair = 'ETH/USDT:USDT', tool, points, color = '#2962ff', text, locked = false } =
       req.body || {};
     const cleanPair = String(pair).toUpperCase();
@@ -7379,10 +6851,11 @@ async function startServer() {
       res.status(400).json({ error: 'Invalid drawing payload' });
       return;
     }
-    if (!chartDrawingsStore.has(cleanPair)) {
-      chartDrawingsStore.set(cleanPair, sqliteDb.getChartDrawingsForPair(cleanPair));
+    const cacheKey = `${auth.userId}::${cleanPair}`;
+    if (!chartDrawingsStore.has(cacheKey)) {
+      chartDrawingsStore.set(cacheKey, sqliteDb.getChartDrawingsForPair(cleanPair, auth.userId));
     }
-    const existing = chartDrawingsStore.get(cleanPair) || [];
+    const existing = chartDrawingsStore.get(cacheKey) || [];
     const newDrawing: ChartDrawingObject = {
       id: `drw-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       pair: cleanPair,
@@ -7394,22 +6867,26 @@ async function startServer() {
       color: String(color),
       text: text ? String(text) : undefined,
       locked: Boolean(locked),
+      user_id: auth.userId,
       created_at: new Date().toISOString().replace('T', ' ').slice(0, 19),
     };
     existing.push(newDrawing);
-    chartDrawingsStore.set(cleanPair, existing);
+    chartDrawingsStore.set(cacheKey, existing);
     sqliteDb.upsertChartDrawing(newDrawing);
     res.json({ pair: cleanPair, drawing: newDrawing, drawings: existing });
   });
 
   app.patch('/api/v1/chart_drawings/:id', (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     const id = String(req.params.id);
     const { pair = 'ETH/USDT:USDT', points, color, text, locked } = req.body || {};
     const cleanPair = String(pair).toUpperCase();
-    if (!chartDrawingsStore.has(cleanPair)) {
-      chartDrawingsStore.set(cleanPair, sqliteDb.getChartDrawingsForPair(cleanPair));
+    const cacheKey = `${auth.userId}::${cleanPair}`;
+    if (!chartDrawingsStore.has(cacheKey)) {
+      chartDrawingsStore.set(cacheKey, sqliteDb.getChartDrawingsForPair(cleanPair, auth.userId));
     }
-    const existing = chartDrawingsStore.get(cleanPair) || [];
+    const existing = chartDrawingsStore.get(cacheKey) || [];
     const target = existing.find((d) => d.id === id);
     if (!target) {
       res.status(404).json({ error: 'Drawing not found' });
@@ -7424,27 +6901,34 @@ async function startServer() {
     if (color !== undefined) target.color = String(color);
     if (text !== undefined) target.text = String(text);
     if (locked !== undefined) target.locked = Boolean(locked);
+    target.user_id = auth.userId;
     sqliteDb.upsertChartDrawing(target);
     res.json({ pair: cleanPair, drawing: target, drawings: existing });
   });
 
   app.delete('/api/v1/chart_drawings/:id', (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     const id = String(req.params.id);
     const pair = String(req.query.pair || 'ETH/USDT:USDT').toUpperCase();
-    if (!chartDrawingsStore.has(pair)) {
-      chartDrawingsStore.set(pair, sqliteDb.getChartDrawingsForPair(pair));
+    const cacheKey = `${auth.userId}::${pair}`;
+    if (!chartDrawingsStore.has(cacheKey)) {
+      chartDrawingsStore.set(cacheKey, sqliteDb.getChartDrawingsForPair(pair, auth.userId));
     }
-    const existing = chartDrawingsStore.get(pair) || [];
+    const existing = chartDrawingsStore.get(cacheKey) || [];
     const next = existing.filter((d) => d.id !== id);
-    chartDrawingsStore.set(pair, next);
-    sqliteDb.deleteChartDrawing(id);
+    chartDrawingsStore.set(cacheKey, next);
+    sqliteDb.deleteChartDrawing(id, auth.userId);
     res.json({ pair, removed_id: id, drawings: next });
   });
 
   app.delete('/api/v1/chart_drawings', (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     const pair = String(req.query.pair || 'ETH/USDT:USDT').toUpperCase();
-    chartDrawingsStore.set(pair, []);
-    sqliteDb.clearChartDrawingsForPair(pair);
+    const cacheKey = `${auth.userId}::${pair}`;
+    chartDrawingsStore.set(cacheKey, []);
+    sqliteDb.clearChartDrawingsForPair(pair, auth.userId);
     res.json({ pair, drawings: [] });
   });
 
@@ -7452,86 +6936,65 @@ async function startServer() {
   // MULTI-EXCHANGE API ACCOUNTS & CLIENT ACCESS MANAGEMENT
   // Supported Exchanges: Binance, Bybit, OKX, Bitget, BingX
   // ============================================================================
+  function buildAccountPayload(acc: ExchangeAccountRecord) {
+    if (!acc.enabled) {
+      return serializeAccountForClient({
+        ...acc,
+        open_trades_count: 0,
+        unrealized_pnl: 0,
+        used_margin_usdt: 0,
+        available_balance_usdt: Number((acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2)),
+        status: 'paused' as const,
+      });
+    }
+    const targetId = getTargetAccountIdForRecord(acc);
+    const accOpen = tradesStore.filter(
+      (t) => t.is_open && tradeMatchesAccount(t, acc, targetId)
+    );
+    const accOpenPnl = accOpen.reduce((sum, t) => sum + t.profit_abs, 0);
+    const accLocalUsed = Number(
+      accOpen.reduce((sum, t) => sum + t.stake_amount, 0).toFixed(2)
+    );
+    const liveUnrealized =
+      typeof acc.unrealized_pnl === 'number' && Number.isFinite(acc.unrealized_pnl) && acc.unrealized_pnl !== 0
+        ? acc.unrealized_pnl
+        : accOpenPnl;
+    const usedMargin =
+      typeof acc.used_margin_usdt === 'number' && Number.isFinite(acc.used_margin_usdt)
+        ? Number(acc.used_margin_usdt.toFixed(2))
+        : accLocalUsed;
+    const walletBal = Number((acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2));
+    const availBal =
+      typeof acc.available_balance_usdt === 'number' && Number.isFinite(acc.available_balance_usdt)
+        ? Number(acc.available_balance_usdt.toFixed(2))
+        : Number(Math.max(0, walletBal - usedMargin).toFixed(2));
+    return serializeAccountForClient({
+      ...acc,
+      open_trades_count: accOpen.length,
+      unrealized_pnl: Number(liveUnrealized.toFixed(4)),
+      used_margin_usdt: usedMargin,
+      available_balance_usdt: availBal,
+      status: 'connected' as const,
+    });
+  }
+
   app.get('/api/v1/accounts', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     await initializeBotTrades();
     if (req.query.sync === 'true') {
       await syncRealExchangeBalancesIfNeeded(true);
     } else {
       triggerBackgroundExchangeSync(false);
     }
-    const masterOpen = tradesStore.filter(
-      (t) => t.is_open && (!t.account_id || t.account_id === 'master')
-    );
-    const masterOpenPnl = masterOpen.reduce((acc, t) => acc + t.profit_abs, 0);
-    const masterLocalUsedMargin = Number(
-      masterOpen.reduce((acc, t) => acc + t.stake_amount, 0).toFixed(2)
-    );
-
-    const synced = exchangeAccountsStore.map((acc) => {
-      if (!acc.enabled) {
-        return {
-          ...acc,
-          open_trades_count: 0,
-          unrealized_pnl: 0,
-          used_margin_usdt: 0,
-          available_balance_usdt: Number((acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2)),
-          status: 'paused' as const,
-        };
-      }
-      if (acc.is_owner) {
-        const liveUnrealized =
-          typeof acc.unrealized_pnl === 'number' && Number.isFinite(acc.unrealized_pnl) && acc.unrealized_pnl !== 0
-            ? acc.unrealized_pnl
-            : masterOpenPnl;
-        const usedMargin =
-          typeof acc.used_margin_usdt === 'number' && Number.isFinite(acc.used_margin_usdt)
-            ? Number(acc.used_margin_usdt.toFixed(2))
-            : masterLocalUsedMargin;
-        const walletBal = Number((acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2));
-        const availBal =
-          typeof acc.available_balance_usdt === 'number' && Number.isFinite(acc.available_balance_usdt)
-            ? Number(acc.available_balance_usdt.toFixed(2))
-            : Number(Math.max(0, walletBal - usedMargin).toFixed(2));
-        return {
-          ...acc,
-          open_trades_count: masterOpen.length,
-          unrealized_pnl: Number(liveUnrealized.toFixed(4)),
-          used_margin_usdt: usedMargin,
-          available_balance_usdt: availBal,
-          status: 'connected' as const,
-        };
-      }
-      const clientOpen = tradesStore.filter((t) => t.is_open && t.account_id === acc.id);
-      const clientPnl = clientOpen.reduce((sum, t) => sum + t.profit_abs, 0);
-      const clientLocalUsed = Number(
-        clientOpen.reduce((sum, t) => sum + t.stake_amount, 0).toFixed(2)
-      );
-      const liveClientUnrealized =
-        typeof acc.unrealized_pnl === 'number' && Number.isFinite(acc.unrealized_pnl) && acc.unrealized_pnl !== 0
-          ? acc.unrealized_pnl
-          : clientPnl;
-      const clientUsedMargin =
-        typeof acc.used_margin_usdt === 'number' && Number.isFinite(acc.used_margin_usdt)
-          ? Number(acc.used_margin_usdt.toFixed(2))
-          : clientLocalUsed;
-      const clientWalletBal = Number((acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2));
-      const clientAvailBal =
-        typeof acc.available_balance_usdt === 'number' && Number.isFinite(acc.available_balance_usdt)
-          ? Number(acc.available_balance_usdt.toFixed(2))
-          : Number(Math.max(0, clientWalletBal - clientUsedMargin).toFixed(2));
-      return {
-        ...acc,
-        open_trades_count: clientOpen.length,
-        unrealized_pnl: Number(liveClientUnrealized.toFixed(4)),
-        used_margin_usdt: clientUsedMargin,
-        available_balance_usdt: clientAvailBal,
-        status: 'connected' as const,
-      };
-    });
+    const synced = getAccountsForUser(auth).map(buildAccountPayload);
     res.json({ accounts: synced });
   });
 
   app.post('/api/v1/accounts', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    await initializeBotTrades();
     const {
       name,
       owner_label,
@@ -7540,9 +7003,6 @@ async function startServer() {
       api_key,
       api_secret,
       passphrase,
-      is_owner = false,
-      copy_trading = true,
-      copy_multiplier = 1.0,
       max_leverage = 25,
       balance_usdt,
       client_access_code,
@@ -7600,7 +7060,8 @@ async function startServer() {
           liveCheck.success ? 'INFO' : 'WARNING',
           liveCheck.success
             ? `🔗 Успешное подключение к ${resolvedNetworkLabel || cleanExchange.toUpperCase()} (${String(name).trim()}): реальный баланс = ${resolvedBalanceUsdt > 0 ? resolvedBalanceUsdt.toFixed(2) : '0.00'} USDT | Пинг: ${liveCheck.latency_ms} мс`
-            : `⚠️ Подключение API ${cleanExchange.toUpperCase()} (${String(name).trim()}): ${liveCheck.message}`
+            : `⚠️ Подключение API ${cleanExchange.toUpperCase()} (${String(name).trim()}): ${liveCheck.message}`,
+          { userId: auth.userId }
         );
       } catch (connErr: any) {
         liveCheckResult = {
@@ -7630,18 +7091,15 @@ async function startServer() {
         ? String(client_access_code).trim().toUpperCase()
         : `${cleanExchange.toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 
-    // Защита от дублирования: если аккаунт с тем же кодом доступа или тем же именем и биржей уже существует — обновляем его
-    const existingAcc = exchangeAccountsStore.find(
+    // Защита от дублирования строго в рамках аккаунтов текущего пользователя
+    const userOwnedAccs = getAccountsForUser(auth);
+    const existingAcc = userOwnedAccs.find(
       (a) =>
         (client_access_code && a.client_access_code.toUpperCase() === generatedCode) ||
         (a.name.toLowerCase() === cleanName.toLowerCase() && a.exchange === cleanExchange)
     );
 
-    // Если это первый подключенный аккаунт в системе и флаг is_owner не передан явно — назначаем его основным
-    const effectiveIsOwner =
-      req.body?.is_owner !== undefined
-        ? Boolean(is_owner)
-        : exchangeAccountsStore.length === 0;
+    const effectiveIsOwner = auth.role === 'owner';
 
     if (existingAcc) {
       const apiKeyChanged = existingAcc.api_key_raw !== cleanKeyInput;
@@ -7655,10 +7113,11 @@ async function startServer() {
       existingAcc.passphrase_raw = cleanPassInput;
       existingAcc.has_passphrase = Boolean(cleanPassInput.length > 0);
       existingAcc.is_owner = effectiveIsOwner;
+      existingAcc.user_id = auth.userId;
       existingAcc.client_access_code = generatedCode;
       existingAcc.enabled = true;
-      existingAcc.copy_trading = Boolean(copy_trading);
-      existingAcc.copy_multiplier = Math.max(0.05, Math.min(20, Number(copy_multiplier) || 1.0));
+      existingAcc.copy_trading = false;
+      existingAcc.copy_multiplier = 1.0;
       existingAcc.max_leverage = Math.max(1, Math.min(50, Math.round(Number(max_leverage) || 25)));
       if (resolvedBalanceUsdt > 0) {
         existingAcc.balance_usdt = resolvedBalanceUsdt;
@@ -7697,15 +7156,15 @@ async function startServer() {
           prewarmExchangeAccountCaches(existingCreds).catch(() => {});
         }
       }
-      botConfig.state = 'running';
-      if (!isSimulatedTestApiKey(cleanKeyInput)) {
+      botConfig.state = hasConnectedExchangeAccount() && !ownerManuallyStoppedBot ? 'running' : 'stopped';
+      if (!isSimulatedTestApiKey(cleanKeyInput) && !ownerManuallyStoppedBot) {
         runScalpBotCycle(false).catch(() => {});
       }
-      scheduleScopeStateSync();
+      scheduleScopeStateSync(auth.userId);
 
       res.json({
-        account: existingAcc,
-        accounts: exchangeAccountsStore,
+        account: buildAccountPayload(existingAcc),
+        accounts: getAccountsForUser(auth).map(buildAccountPayload),
         connection_check: liveCheckResult,
       });
       return;
@@ -7724,10 +7183,11 @@ async function startServer() {
       passphrase_raw: cleanPassInput,
       has_passphrase: Boolean(cleanPassInput.length > 0),
       is_owner: effectiveIsOwner,
+      user_id: auth.userId,
       client_access_code: generatedCode,
       enabled: true,
-      copy_trading: Boolean(copy_trading),
-      copy_multiplier: Math.max(0.05, Math.min(20, Number(copy_multiplier) || 1.0)),
+      copy_trading: false,
+      copy_multiplier: 1.0,
       max_leverage: Math.max(1, Math.min(50, Math.round(Number(max_leverage) || 25))),
       balance_usdt: resolvedBalanceUsdt,
       wallet_balance_usdt:
@@ -7764,7 +7224,8 @@ async function startServer() {
     appendLog(
       'freqtrade.exchange.accounts',
       'INFO',
-      `Подключен новый API-аккаунт: ${newAcc.name} (${resolvedNetworkLabel || `${cleanExchange.toUpperCase()} ${newAcc.market_type.toUpperCase()}`}) | Баланс: ${newAcc.balance_usdt.toFixed(2)} USDT | Ключ: ${newAcc.api_key_masked}`
+      `Подключен новый API-аккаунт: ${newAcc.name} (${resolvedNetworkLabel || `${cleanExchange.toUpperCase()} ${newAcc.market_type.toUpperCase()}`}) | Баланс: ${newAcc.balance_usdt.toFixed(2)} USDT | Ключ: ${newAcc.api_key_masked}`,
+      { userId: auth.userId }
     );
 
     if (!isSimulatedTestApiKey(cleanKeyInput)) {
@@ -7774,37 +7235,48 @@ async function startServer() {
         prewarmExchangeAccountCaches(newCreds).catch(() => {});
       }
     }
-    botConfig.state = 'running';
-    if (!isSimulatedTestApiKey(cleanKeyInput)) {
+    botConfig.state = hasConnectedExchangeAccount() && !ownerManuallyStoppedBot ? 'running' : 'stopped';
+    if (!isSimulatedTestApiKey(cleanKeyInput) && !ownerManuallyStoppedBot) {
       runScalpBotCycle(false).catch(() => {});
     }
-    scheduleScopeStateSync();
+    scheduleScopeStateSync(auth.userId);
 
     res.json({
-      account: newAcc,
-      accounts: exchangeAccountsStore,
+      account: buildAccountPayload(newAcc),
+      accounts: getAccountsForUser(auth).map(buildAccountPayload),
       connection_check: liveCheckResult,
     });
   });
 
   app.patch('/api/v1/accounts/:id', (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     const id = String(req.params.id);
     const target = exchangeAccountsStore.find((a) => a.id === id);
     if (!target) {
       res.status(404).json({ error: 'Аккаунт не найден' });
       return;
     }
+    if (
+      (target.user_id || 'owner') !== auth.userId ||
+      (auth.role === 'client' && auth.accountId && target.id !== auth.accountId)
+    ) {
+      res.status(403).json({ error: 'Нет доступа к чужому аккаунту' });
+      return;
+    }
     const {
       name,
       enabled,
-      copy_trading,
-      copy_multiplier,
       max_leverage,
       balance_usdt,
       client_access_code,
     } = req.body || {};
 
     if (name !== undefined) target.name = String(name).trim();
+    target.is_owner = auth.role === 'owner';
+    target.copy_trading = false;
+    target.copy_multiplier = 1.0;
+
     if (enabled !== undefined) {
       target.enabled = Boolean(enabled);
       target.status = target.enabled ? 'connected' : 'paused';
@@ -7817,12 +7289,8 @@ async function startServer() {
         if (tCreds) prewarmExchangeAccountCaches(tCreds).catch(() => {});
       }
     }
-    if (copy_trading !== undefined) target.copy_trading = Boolean(copy_trading);
-    if (copy_multiplier !== undefined) {
-      target.copy_multiplier = Math.max(0.05, Math.min(20, Number(copy_multiplier) || 1));
-    }
     if (max_leverage !== undefined) {
-      target.max_leverage = Math.max(1, Math.min(50, Math.round(Number(max_leverage) || 3)));
+      target.max_leverage = Math.max(1, Math.min(50, Math.round(Number(max_leverage) || 25)));
     }
     if (balance_usdt !== undefined && Number(balance_usdt) >= 0) {
       target.balance_usdt = Number(balance_usdt);
@@ -7833,76 +7301,118 @@ async function startServer() {
     target.last_sync = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
     sqliteDb.upsertExchangeAccount(target);
-    botConfig.state = hasConnectedExchangeAccount() ? 'running' : 'stopped';
+    botConfig.state = hasConnectedExchangeAccount() && !ownerManuallyStoppedBot ? 'running' : 'stopped';
+
+    if (enabled === true && target.enabled && !isSimulatedTestApiKey(target.api_key_raw)) {
+      syncPositionsAndHistoryFromExchanges(target, true, true).catch(() => {});
+    }
 
     appendLog(
       'freqtrade.exchange.accounts',
       'INFO',
-      `Обновлены параметры аккаунта ${target.name} (${target.exchange.toUpperCase()}): Активен=${target.enabled}, Копирование=${target.copy_trading} (×${target.copy_multiplier})`
+      `Обновлены параметры аккаунта ${target.name} (${target.exchange.toUpperCase()}): Активен=${target.enabled}, Плечо=x${target.max_leverage}`,
+      { userId: auth.userId }
     );
-    scheduleScopeStateSync();
-    res.json({ account: target, accounts: exchangeAccountsStore });
+    scheduleScopeStateSync(auth.userId);
+    res.json({
+      account: buildAccountPayload(target),
+      accounts: getAccountsForUser(auth).map(buildAccountPayload),
+    });
   });
 
   app.delete('/api/v1/accounts/:id', (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     const id = String(req.params.id);
     const target = exchangeAccountsStore.find((a) => a.id === id);
-    if (target && target.api_key_raw) {
+    if (!target) {
+      res.status(404).json({ error: 'Аккаунт не найден' });
+      return;
+    }
+    if (
+      (target.user_id || 'owner') !== auth.userId ||
+      (auth.role === 'client' && auth.accountId && target.id !== auth.accountId)
+    ) {
+      res.status(403).json({ error: 'Нет доступа к чужому аккаунту' });
+      return;
+    }
+    if (target.api_key_raw) {
       stopExchangePrivateStream(target.exchange, target.api_key_raw);
     }
+    const targetScopeId = getTargetAccountIdForRecord(target);
     exchangeAccountsStore = exchangeAccountsStore.filter((a) => a.id !== id);
     sqliteDb.deleteExchangeAccount(id);
-    // Также удаляем открытые копии сделок удаленного клиентского аккаунта
-    const clientTrades = tradesStore.filter((t) => t.account_id === id);
-    for (const ct of clientTrades) {
+
+    // Удаляем только сделки удалённого аккаунта
+    const accountTrades = tradesStore.filter(
+      (t) => resolveTradeUserId(t) === auth.userId && tradeMatchesAccount(t, target, targetScopeId)
+    );
+    for (const ct of accountTrades) {
       sqliteDb.deleteTrade(ct.trade_id);
     }
-    tradesStore = tradesStore.filter((t) => t.account_id !== id);
+    const removedIds = new Set(accountTrades.map((t) => t.trade_id));
+    tradesStore = tradesStore.filter((t) => !removedIds.has(t.trade_id));
 
-    // Если больше нет ни одного активного аккаунта — останавливаем бота и очищаем незакрытые позиции
+    // Если больше нет ни одного активного аккаунта в системе — останавливаем движок
     if (!hasConnectedExchangeAccount()) {
       botConfig.state = 'stopped';
-      for (const t of tradesStore) {
-        if (t.is_open) sqliteDb.deleteTrade(t.trade_id);
-      }
-      tradesStore = tradesStore.filter((t) => !t.is_open);
     }
 
-    if (target) {
-      appendLog(
-        'freqtrade.exchange.accounts',
-        'WARNING',
-        `Отключен и удален API-аккаунт: ${target.name} (${target.exchange.toUpperCase()})`
-      );
-    }
-    scheduleScopeStateSync();
-    res.json({ removed_id: id, accounts: exchangeAccountsStore });
+    appendLog(
+      'freqtrade.exchange.accounts',
+      'WARNING',
+      `Отключен и удален API-аккаунт: ${target.name} (${target.exchange.toUpperCase()})`,
+      { userId: auth.userId }
+    );
+    scheduleScopeStateSync(auth.userId);
+    res.json({ removed_id: id, accounts: getAccountsForUser(auth).map(buildAccountPayload) });
   });
 
   app.delete('/api/v1/accounts', (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     const explicitUserClear = req.query.confirm === 'true';
-    for (const acc of exchangeAccountsStore) {
+    const userAccs = getAccountsForUser(auth);
+    const userAccIds = new Set(userAccs.map((a) => a.id));
+    for (const acc of userAccs) {
       if (acc.api_key_raw) {
         stopExchangePrivateStream(acc.exchange, acc.api_key_raw);
       }
     }
-    exchangeAccountsStore = [];
-    sqliteDb.clearAllExchangeAccounts(explicitUserClear);
-    botConfig.state = 'stopped';
-    for (const t of tradesStore) {
+    exchangeAccountsStore = exchangeAccountsStore.filter((a) => !userAccIds.has(a.id));
+    if (auth.role === 'client' && auth.accountId) {
+      sqliteDb.deleteExchangeAccount(auth.accountId);
+    } else {
+      sqliteDb.clearExchangeAccountsForUser(auth.userId, explicitUserClear);
+    }
+
+    const userTrades = tradesStore.filter(
+      (t) =>
+        resolveTradeUserId(t) === auth.userId &&
+        (!auth.accountId || t.account_id === auth.accountId)
+    );
+    for (const t of userTrades) {
       sqliteDb.deleteTrade(t.trade_id);
     }
-    tradesStore = [];
+    const removedTradeIds = new Set(userTrades.map((t) => t.trade_id));
+    tradesStore = tradesStore.filter((t) => !removedTradeIds.has(t.trade_id));
+
+    if (!hasConnectedExchangeAccount()) {
+      botConfig.state = 'stopped';
+    }
     appendLog(
       'freqtrade.exchange.accounts',
       'WARNING',
-      `База API-аккаунтов полностью очищена владельцем. Бот переведен в статус STOPPED.`
+      `API-аккаунты профиля очищены пользователем (${auth.login || auth.userId}).`,
+      { userId: auth.userId }
     );
-    scheduleScopeStateSync();
+    scheduleScopeStateSync(auth.userId);
     res.json({ accounts: [] });
   });
 
   app.post('/api/v1/accounts/test-connection', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     const { account_id, exchange, api_key, api_secret, passphrase, is_testnet } = req.body || {};
     let credsExchange = exchange;
     let credsKey = api_key;
@@ -7914,6 +7424,17 @@ async function startServer() {
     if (account_id) {
       const allAccs = sqliteDb.loadExchangeAccounts();
       const acc = allAccs.find((a) => a.id === account_id);
+      if (acc && (acc.user_id || 'owner') !== auth.userId) {
+        res.status(403).json({
+          success: false,
+          exchange: String(credsExchange || 'bybit'),
+          latency_ms: 0,
+          permissions: [],
+          message: 'Нет доступа к чужому аккаунту',
+          live_verified: false,
+        });
+        return;
+      }
       targetAcc = exchangeAccountsStore.find((a) => a.id === account_id);
       if (acc) {
         credsExchange = acc.exchange;
@@ -7976,13 +7497,17 @@ async function startServer() {
       if (!isSimulatedTestApiKey(String(credsKey))) {
         await syncPositionsAndHistoryFromExchanges(targetAcc, true);
       }
-      runScalpBotCycle(false).catch(() => {});
+      if (!ownerManuallyStoppedBot) {
+        runScalpBotCycle(false).catch(() => {});
+      }
+      scheduleScopeStateSync(auth.userId);
     }
 
     appendLog(
       'freqtrade.exchange.test',
       testRes.success ? 'INFO' : 'WARNING',
-      `Тестирование API ${String(credsExchange).toUpperCase()}${targetAcc ? ` (${targetAcc.name})` : ''}: ${testRes.message}`
+      `Тестирование API ${String(credsExchange).toUpperCase()}${targetAcc ? ` (${targetAcc.name})` : ''}: ${testRes.message}`,
+      { userId: auth.userId }
     );
 
     res.json(testRes);
@@ -7995,28 +7520,41 @@ async function startServer() {
     const verified = token ? sqliteDb.verifyAuthToken(token) : { valid: false };
 
     const codeParam = String(req.query.code || req.query.client || '').trim().toUpperCase();
-    let acc = codeParam ? sqliteDb.verifyClientAccessCode(codeParam) : null;
-    if (!acc && verified.valid && verified.accountId) {
-      acc = exchangeAccountsStore.find((a) => a.id === verified.accountId) || null;
+    let acc: ExchangeAccountRecord | null = null;
+    if (codeParam) {
+      const matched = sqliteDb.verifyClientAccessCode(codeParam);
+      if (matched) {
+        acc = exchangeAccountsStore.find((a) => a.id === matched.id) || matched;
+      }
     }
-    if (!acc && exchangeAccountsStore.length > 0) {
-      acc = exchangeAccountsStore.find((a) => !a.is_owner) || exchangeAccountsStore[0];
+    if (!acc && verified.valid) {
+      if (verified.accountId) {
+        acc = exchangeAccountsStore.find((a) => a.id === verified.accountId) || null;
+      } else if (verified.inviteId) {
+        const uId = `invite:${verified.inviteId}`;
+        acc = exchangeAccountsStore.find((a) => (a.user_id || 'owner') === uId) || null;
+      } else if (verified.role === 'owner') {
+        acc = exchangeAccountsStore.find((a) => (a.user_id || 'owner') === 'owner') || null;
+      }
     }
 
     if (!acc) {
-      res.status(404).json({ error: 'Аккаунт клиента не найден по указанному коду доступа' });
+      res.status(401).json({ error: 'Аккаунт не найден или требуется авторизация' });
       return;
     }
 
+    const accUserId = acc.user_id || 'owner';
+    const accScopeId = getTargetAccountIdForRecord(acc);
     const clientConnectedAt = acc.connected_at || 0;
-    // Изолированные сделки клиента: строго принадлежащие этому аккаунту и закрытые после подключения API
+    // Изолированные сделки этого аккаунта
     const clientOpenTrades = tradesStore.filter(
-      (t) => t.is_open && t.account_id === acc.id
+      (t) => t.is_open && resolveTradeUserId(t) === accUserId && tradeMatchesAccount(t, acc!, accScopeId)
     );
     const clientClosedTrades = tradesStore.filter(
       (t) =>
         !t.is_open &&
-        t.account_id === acc.id &&
+        resolveTradeUserId(t) === accUserId &&
+        tradeMatchesAccount(t, acc!, accScopeId) &&
         t.enter_tag !== 'EXCHANGE_HISTORY' &&
         t.exit_reason !== 'exchange_closed_pnl' &&
         !(clientConnectedAt > 0 && (t.close_timestamp || 0) > 0 && (t.close_timestamp || 0) < clientConnectedAt - 1000)
@@ -8055,7 +7593,7 @@ async function startServer() {
         used_margin_usdt: acc.used_margin_usdt,
         open_trades_count: clientOpenTrades.length,
         unrealized_pnl: clientUnrealizedPnl,
-        copy_trading: Boolean(acc.copy_trading),
+        copy_trading: false,
         stake_pct: 0.5,
         leverage: acc.max_leverage || 25,
         last_sync: acc.last_sync,
@@ -8064,17 +7602,19 @@ async function startServer() {
       closed_trades: clientClosedTrades,
       total_profit_usdt: clientTotalProfit,
       winrate,
-      current_pair: clientOpenTrades[0]?.pair || tradesStore[0]?.pair || 'ETH/USDT:USDT',
+      current_pair: clientOpenTrades[0]?.pair || 'ETH/USDT:USDT',
     });
   });
 
   app.post('/api/v1/forceexit', async (req, res) => {
-    const scope = resolveRequestAccountScope(req);
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    await initializeBotTrades();
     const { tradeid } = req.body || {};
     if (tradeid === 'all') {
       const now = Date.now();
       const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
-      const targetTrades = filterTradesForScope(scope.accountId);
+      const targetTrades = filterTradesForUserScope(auth);
       let closedCount = 0;
       let skippedNegativeCount = 0;
       const tradesToClose: Array<{ trade: FreqtradeTrade; closeRes: PlacedOrderResult | null }> = [];
@@ -8148,21 +7688,27 @@ async function startServer() {
         }
       });
       for (const { trade: t } of tradesToClose) {
-        if (!t.account_id || t.account_id === 'master') {
-          await closeClientCopiesForMasterTrade(t, t.close_rate || t.current_rate, now, nowStr, 'force_exit');
-        }
         broadcastTradeLifecycleEvent('trade:closed', t);
       }
       if (closedCount > 0) {
-        const targetAcc = resolveExchangeAccountRecord(scope.accountId);
-        if (targetAcc) {
-          const remainingOpen = filterTradesForScope(scope.accountId).filter((x) => x.is_open);
-          targetAcc.open_trades_count = remainingOpen.length;
-          targetAcc.used_margin_usdt = Number(remainingOpen.reduce((s, x) => s + x.stake_amount, 0).toFixed(2));
-          targetAcc.unrealized_pnl = Number(remainingOpen.reduce((s, x) => s + (x.profit_abs || 0), 0).toFixed(4));
+        for (const userAcc of getAccountsForUser(auth)) {
+          const accScopeId = getTargetAccountIdForRecord(userAcc);
+          const remainingOpen = tradesStore.filter(
+            (x) =>
+              x.is_open &&
+              resolveTradeUserId(x) === auth.userId &&
+              tradeMatchesAccount(x, userAcc, accScopeId)
+          );
+          userAcc.open_trades_count = remainingOpen.length;
+          userAcc.used_margin_usdt = Number(
+            remainingOpen.reduce((s, x) => s + x.stake_amount, 0).toFixed(2)
+          );
+          userAcc.unrealized_pnl = Number(
+            remainingOpen.reduce((s, x) => s + (x.profit_abs || 0), 0).toFixed(4)
+          );
         }
         syncRealExchangeBalancesIfNeeded(true).catch(() => {});
-        scheduleScopeStateSync(scope.accountId);
+        scheduleScopeStateSync(auth.userId);
       }
       if (closedCount === 0 && skippedNegativeCount > 0) {
         res.status(400).json({
@@ -8186,6 +7732,13 @@ async function startServer() {
       res.status(404).json({ error: `Open trade #${id} not found` });
       return;
     }
+    if (
+      resolveTradeUserId(trade) !== auth.userId ||
+      (auth.role === 'client' && auth.accountId && trade.account_id !== auth.accountId)
+    ) {
+      res.status(403).json({ error: 'Нет доступа к чужой сделке' });
+      return;
+    }
 
     const liveTicker = tickerCache.get(trade.pair);
     const livePrice =
@@ -8201,7 +7754,8 @@ async function startServer() {
       appendLog(
         'freqtrade.bot.guard',
         'WARNING',
-        `🛡️ Заблокировано закрытие сделки #${id} [${trade.pair}] в минус/на грани комиссий: ${closeGuard.reason}. Точка безубытка: ${trade.breakeven_price}$, мин. плюсовой TP: ${trade.min_profitable_tp}$.`
+        `🛡️ Заблокировано закрытие сделки #${id} [${trade.pair}] в минус/на грани комиссий: ${closeGuard.reason}. Точка безубытка: ${trade.breakeven_price}$, мин. плюсовой TP: ${trade.min_profitable_tp}$.`,
+        { userId: auth.userId }
       );
       res.status(400).json({
         error: `Запрещено закрывать сделку #${id} (${trade.pair})! ${closeGuard.reason}. Чистый PnL с учётом всех комиссий ($${trade.fee_total}): ${netProfitUsdt}$ (${trade.net_profit_percent}%). Точка безубытка: ${trade.breakeven_price}$, мин. безопасный TP: ${trade.min_profitable_tp}$. Используйте усреднение (DCA) или дождитесь выхода в уверенный чистый плюс.`,
@@ -8278,17 +7832,14 @@ async function startServer() {
         notes: `Manual force exit in net profit (+${trade.profit_abs} USDT after ${trade.fee_total} USDT fees)${closeOrderRes?.order_id ? ` | ExOrderId: ${closeOrderRes.order_id}` : ''}`,
       });
     });
-    if (!trade.account_id || trade.account_id === 'master') {
-      await closeClientCopiesForMasterTrade(trade, trade.close_rate || trade.current_rate, closeTs, closeDateStr, 'force_exit');
-    }
     const closedAcc = resolveExchangeAccountRecord(targetAccId);
     if (closedAcc) {
+      const closedAccScopeId = getTargetAccountIdForRecord(closedAcc);
       const remainingAccOpen = tradesStore.filter(
         (x) =>
           x.is_open &&
-          (targetAccId === 'master'
-            ? !x.account_id || x.account_id === 'master'
-            : x.account_id === targetAccId)
+          resolveTradeUserId(x) === auth.userId &&
+          tradeMatchesAccount(x, closedAcc, closedAccScopeId)
       );
       closedAcc.open_trades_count = remainingAccOpen.length;
       closedAcc.used_margin_usdt = Number(remainingAccOpen.reduce((s, x) => s + x.stake_amount, 0).toFixed(2));
@@ -8298,37 +7849,41 @@ async function startServer() {
     appendLog(
       'freqtrade.rpc.rpc',
       'INFO',
-      `Закрыта сделка #${id} (${trade.pair}) @ ${trade.close_rate} $ | Чистый итог: +${trade.profit_abs} $ (комиссия: ${trade.fee_total}$)`
+      `Закрыта сделка #${id} (${trade.pair}) @ ${trade.close_rate} $ | Чистый итог: +${trade.profit_abs} $ (комиссия: ${trade.fee_total}$)`,
+      { userId: auth.userId }
     );
     broadcastTradeLifecycleEvent('trade:closed', trade);
-    scheduleScopeStateSync(targetAccId);
+    scheduleScopeStateSync(auth.userId);
     res.json({ result: `Closed trade #${id}`, trade });
   });
 
   app.delete('/api/v1/trades/:id', (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
     const id = Number(req.params.id);
     const targetTrade = tradesStore.find((t) => t.trade_id === id);
-    if (targetTrade) {
-      const accId = targetTrade.account_id || 'master';
-      dismissedExchangeSyncKeys.add(
-        `open:${accId}:${targetTrade.pair}:${targetTrade.is_short ? 'S' : 'L'}:${targetTrade.open_rate}`
-      );
-      if (targetTrade.close_timestamp) {
-        dismissedExchangeSyncKeys.add(`closed:${accId}:${targetTrade.pair}:${targetTrade.close_timestamp}`);
-      }
+    if (!targetTrade) {
+      res.status(404).json({ error: `Сделка #${id} не найдена` });
+      return;
     }
-    const toRemoveIds = tradesStore
-      .filter((t) => t.trade_id === id || t.parent_trade_id === id)
-      .map((t) => t.trade_id);
-    if (!toRemoveIds.includes(id)) {
-      toRemoveIds.push(id);
+    if (
+      resolveTradeUserId(targetTrade) !== auth.userId ||
+      (auth.role === 'client' && auth.accountId && targetTrade.account_id !== auth.accountId)
+    ) {
+      res.status(403).json({ error: 'Нет доступа к чужой сделке' });
+      return;
     }
-    tradesStore = tradesStore.filter((t) => !toRemoveIds.includes(t.trade_id));
-    for (const remId of toRemoveIds) {
-      sqliteDb.deleteTrade(remId);
+    const accId = targetTrade.account_id || 'master';
+    dismissedExchangeSyncKeys.add(
+      `open:${accId}:${targetTrade.pair}:${targetTrade.is_short ? 'S' : 'L'}:${targetTrade.open_rate}`
+    );
+    if (targetTrade.close_timestamp) {
+      dismissedExchangeSyncKeys.add(`closed:${accId}:${targetTrade.pair}:${targetTrade.close_timestamp}`);
     }
-    scheduleScopeStateSync();
-    res.json({ result_msg: `Deleted trade #${id}`, deleted_ids: toRemoveIds });
+    tradesStore = tradesStore.filter((t) => t.trade_id !== id);
+    sqliteDb.deleteTrade(id);
+    scheduleScopeStateSync(auth.userId);
+    res.json({ result_msg: `Deleted trade #${id}`, deleted_ids: [id] });
   });
 
   app.get('/api/v1/ws_status', (_req, res) => {
@@ -8361,19 +7916,13 @@ async function startServer() {
     );
     if (!matchedAcc) return;
 
-    const masterOwnerAcc = resolveExchangeAccountRecord('master');
-    const isEffectiveMaster = Boolean(
-      matchedAcc.is_owner || (masterOwnerAcc && matchedAcc.id === masterOwnerAcc.id)
-    );
-    const targetAccountId = isEffectiveMaster ? 'master' : matchedAcc.id;
+    const targetAccountId = getTargetAccountIdForRecord(matchedAcc);
 
     // Если это событие срабатывания ордера, убедимся что закрыта вся или >= 90% позиции
     const preMatch = tradesStore.find(
       (t) =>
         t.is_open &&
-        (targetAccountId === 'master'
-          ? !t.account_id || t.account_id === 'master'
-          : t.account_id === targetAccountId) &&
+        tradeMatchesAccount(t, matchedAcc, targetAccountId) &&
         t.pair === params.pair &&
         t.is_short === params.isShort
     );
@@ -8464,11 +8013,7 @@ async function startServer() {
         });
 
         const remOpen = tradesStore.filter(
-          (x) =>
-            x.is_open &&
-            (targetAccountId === 'master'
-              ? !x.account_id || x.account_id === 'master'
-              : x.account_id === targetAccountId)
+          (x) => x.is_open && tradeMatchesAccount(x, matchedAcc, targetAccountId)
         );
         matchedAcc.open_trades_count = remOpen.length;
         matchedAcc.used_margin_usdt = Number(
@@ -8479,24 +8024,16 @@ async function startServer() {
         );
       });
 
-      if (targetAccountId === 'master') {
-        await closeClientCopiesForMasterTrade(
-          trade,
-          closePrice,
-          closeTs,
-          closeDateStr,
-          'exchange_ws_tp_sync'
-        );
-      }
-
-      cooldownPairs.set(trade.pair, Date.now());
+      const accUserId = matchedAcc.user_id || 'owner';
+      cooldownPairs.set(`${matchedAcc.id}:${trade.pair}`, Date.now());
       appendLog(
         `freqtrade.exchange.${matchedAcc.exchange}`,
         'INFO',
-        `⚡ [WS EXCHANGE CLOSE 1:1] Сделка #${trade.trade_id} [${trade.pair}] мгновенно синхронизирована после закрытия на бирже @ ${closePrice}$ | Чистый PnL: ${trade.profit_abs >= 0 ? '+' : ''}${trade.profit_abs}$ (Комиссия: ${trade.fee_total}$)`
+        `⚡ [WS EXCHANGE CLOSE 1:1] Сделка #${trade.trade_id} [${trade.pair}] мгновенно синхронизирована после закрытия на бирже @ ${closePrice}$ | Чистый PnL: ${trade.profit_abs >= 0 ? '+' : ''}${trade.profit_abs}$ (Комиссия: ${trade.fee_total}$)`,
+        { userId: accUserId }
       );
       broadcastTradeLifecycleEvent('trade:closed', trade);
-      scheduleScopeStateSync(targetAccountId);
+      scheduleScopeStateSync(accUserId);
     });
   };
 
@@ -8535,7 +8072,7 @@ async function startServer() {
     subscribePairKlineStream(p, '4h');
   }
   onWsAccountUpdate((wsState) => {
-    let targetScopeId: string | undefined;
+    const updatedUserIds = new Set<string>();
     for (const acc of exchangeAccountsStore) {
       if (acc.enabled && sanitizeCredentialString(acc.api_key_raw) === wsState.apiKey) {
         acc.balance_usdt = Number(wsState.walletBalanceUsdt.toFixed(4));
@@ -8546,51 +8083,32 @@ async function startServer() {
         acc.used_margin_usdt = Number(wsState.usedMarginUsdt.toFixed(2));
         acc.open_trades_count = wsState.positions.length;
         acc.status = 'connected';
-        targetScopeId = acc.is_owner ? 'master' : acc.id;
+        updatedUserIds.add(acc.user_id || 'owner');
       }
     }
-    if (targetScopeId) {
-      scheduleScopeStateSync(targetScopeId);
+    for (const userId of updatedUserIds) {
+      scheduleScopeStateSync(userId);
     }
   });
 
   // Подключаем реальный WebSocket-хаб /ws/live для мгновенного push-обновления сайта (цены, свечи, PnL, закрытия, баланс)
   attachLiveWebSocketHub(httpServer, {
-    resolveScopeFromAuth: ({ token, clientCode, accountId }) => {
-      const code = String(clientCode || '').trim().toUpperCase();
-      if (code) {
-        const byCode = exchangeAccountsStore.find(
-          (a) => a.client_access_code.toUpperCase() === code
-        );
-        if (byCode) {
-          return { accountId: byCode.id, isClient: !byCode.is_owner };
-        }
-      }
-      const reqAccId = String(accountId || '').trim();
-      if (reqAccId && reqAccId !== 'master') {
-        const byId = exchangeAccountsStore.find((a) => a.id === reqAccId);
-        if (byId) {
-          return { accountId: byId.id, isClient: !byId.is_owner };
-        }
-      }
-      if (token) {
-        const verified = sqliteDb.verifyAuthToken(token);
-        if (verified.valid && verified.role === 'client' && verified.accountId) {
-          return { accountId: verified.accountId, isClient: true };
-        }
-      }
-      return { accountId: 'master', isClient: false };
-    },
-    buildSnapshotForScope: async (accountId, isClient) => {
+    resolveScopeFromAuth: (params) => resolveAuthFromCredentials(params),
+    resolveTradeUserId: (trade) => resolveTradeUserId(trade),
+    resolveScopeUserId: (scopeOrAccountId) => resolveScopeUserId(scopeOrAccountId),
+    buildSnapshotForScope: async (scope) => {
       await initializeBotTrades();
-      const connected = hasConnectedExchangeAccount();
-      const scopeAccount =
-        accountId === 'master'
-          ? exchangeAccountsStore.find((a) => a.enabled && a.is_owner) ||
-            exchangeAccountsStore.find((a) => a.enabled)
-          : exchangeAccountsStore.find((a) => a.id === accountId);
+      const anyConnected = hasConnectedExchangeAccount();
+      const userAccs = getAccountsForUser(scope);
+      const activeUserAccs = userAccs.filter((a) => a.enabled);
+      const userConnected = activeUserAccs.length > 0;
+      const userBalance = Number(
+        activeUserAccs
+          .reduce((s, a) => s + Number(a.wallet_balance_usdt ?? a.balance_usdt ?? 0), 0)
+          .toFixed(2)
+      );
 
-      const scopedTrades = filterTradesForScope(accountId);
+      const scopedTrades = filterTradesForUserScope(scope);
       for (const t of scopedTrades) {
         if (t.is_open) {
           refreshTradeLivePriceFromWs(t);
@@ -8600,111 +8118,36 @@ async function startServer() {
 
       const openTrades = scopedTrades.filter((t) => t.is_open);
       const closedTrades = scopedTrades.filter((t) => !t.is_open);
-      const isRealAcc = Boolean(
-        scopeAccount?.api_key_raw && !isSimulatedTestApiKey(scopeAccount.api_key_raw)
-      );
-      const compounded = getCompoundedAccountBalance(accountId);
-      const baseDeposit =
-        compounded.baseDeposit > 0
-          ? compounded.baseDeposit
-          : Number(scopeAccount?.balance_usdt || 0);
-      const totalBalance = isRealAcc
-        ? Number(
-            (
-              scopeAccount?.wallet_balance_usdt ??
-              scopeAccount?.balance_usdt ??
-              compounded.compoundedBalance
-            ).toFixed(4)
-          )
-        : Number(compounded.compoundedBalance.toFixed(2));
-      const openProfitAbs =
-        isRealAcc && typeof scopeAccount?.unrealized_pnl === 'number' && openTrades.length > 0
-          ? Number(scopeAccount.unrealized_pnl.toFixed(4))
-          : Number(openTrades.reduce((acc, t) => acc + t.profit_abs, 0).toFixed(4));
+      const metrics = getAggregatedMetricsForUser(userAccs, openTrades, closedTrades);
+      const baseDeposit = metrics.baseDeposit;
+      const totalBalance = metrics.totalBalance;
+      const openProfitAbs = metrics.openProfitAbs;
       const closedProfitAbs = Number(
         closedTrades.reduce((acc, t) => acc + (t.net_profit ?? t.profit_abs ?? 0), 0).toFixed(4)
       );
       const allProfitAbs = Number((closedProfitAbs + openProfitAbs).toFixed(4));
-      const equityBalance = Number((totalBalance + openProfitAbs).toFixed(4));
-      const localUsedStake = Number(
-        openTrades.reduce((acc, t) => acc + t.stake_amount, 0).toFixed(2)
-      );
-      const usedStake =
-        isRealAcc &&
-        typeof scopeAccount?.used_margin_usdt === 'number' &&
-        Number.isFinite(scopeAccount.used_margin_usdt)
-          ? Number(scopeAccount.used_margin_usdt.toFixed(2))
-          : localUsedStake;
-      const freeBalance =
-        isRealAcc &&
-        typeof scopeAccount?.available_balance_usdt === 'number' &&
-        Number.isFinite(scopeAccount.available_balance_usdt)
-          ? Number(scopeAccount.available_balance_usdt.toFixed(2))
-          : Number(Math.max(0, totalBalance - usedStake).toFixed(2));
+      const equityBalance = metrics.equityBalance;
+      const usedStake = metrics.usedStake;
+      const freeBalance = metrics.freeBalance;
 
       const wins = closedTrades.filter((t) => (t.net_profit ?? t.profit_abs) >= 0).length;
       const losses = closedTrades.filter((t) => (t.net_profit ?? t.profit_abs) < 0).length;
       const winrate =
         closedTrades.length > 0 ? Number(((wins / closedTrades.length) * 100).toFixed(1)) : 0;
 
-      const masterOpen = tradesStore.filter(
-        (t) => t.is_open && (!t.account_id || t.account_id === 'master')
-      );
-      const accountsPayload = isClient
-        ? undefined
-        : exchangeAccountsStore.map((acc) => {
-            if (!acc.enabled) {
-              return {
-                ...acc,
-                open_trades_count: 0,
-                unrealized_pnl: 0,
-                used_margin_usdt: 0,
-                available_balance_usdt: Number(
-                  (acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2)
-                ),
-                status: 'paused' as const,
-              };
-            }
-            const accOpen = acc.is_owner
-              ? masterOpen
-              : tradesStore.filter((t) => t.is_open && t.account_id === acc.id);
-            const accOpenPnl = accOpen.reduce((sum, t) => sum + t.profit_abs, 0);
-            const accLocalUsed = Number(
-              accOpen.reduce((sum, t) => sum + t.stake_amount, 0).toFixed(2)
-            );
-            const liveUpl =
-              typeof acc.unrealized_pnl === 'number' &&
-              Number.isFinite(acc.unrealized_pnl) &&
-              acc.unrealized_pnl !== 0
-                ? acc.unrealized_pnl
-                : accOpenPnl;
-            const usedM =
-              typeof acc.used_margin_usdt === 'number' && Number.isFinite(acc.used_margin_usdt)
-                ? Number(acc.used_margin_usdt.toFixed(2))
-                : accLocalUsed;
-            const wBal = Number((acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2));
-            const aBal =
-              typeof acc.available_balance_usdt === 'number' &&
-              Number.isFinite(acc.available_balance_usdt)
-                ? Number(acc.available_balance_usdt.toFixed(2))
-                : Number(Math.max(0, wBal - usedM).toFixed(2));
-            return {
-              ...acc,
-              open_trades_count: accOpen.length,
-              unrealized_pnl: Number(liveUpl.toFixed(4)),
-              used_margin_usdt: usedM,
-              available_balance_usdt: aBal,
-              status: 'connected' as const,
-            };
-          });
+      const accountsPayload = userAccs.map(buildAccountPayload);
+      const scopedLogs = botLogs
+        .filter((l) => l.publicMarket || l.userId === scope.userId)
+        .slice(-80)
+        .reverse();
 
       return {
         botConfig: {
           ...botConfig,
-          state: connected ? botConfig.state : 'stopped',
-          starting_balance: connected ? Number(scopeAccount?.balance_usdt || 0) : 0,
-          exchange_connected: connected,
-          active_accounts_count: exchangeAccountsStore.filter((a) => a.enabled).length,
+          state: anyConnected && !ownerManuallyStoppedBot ? botConfig.state : 'stopped',
+          starting_balance: userConnected ? userBalance : 0,
+          exchange_connected: userConnected,
+          active_accounts_count: activeUserAccs.length,
           available_strategies: ['ScalpingStrategy', 'GlobalHedgeStrategy'],
           available_timeframes: [
             '1m',
@@ -8776,7 +8219,7 @@ async function startServer() {
           equity_balance: equityBalance,
           unrealized_pnl: openProfitAbs,
         },
-        logs: [...botLogs].slice(-80).reverse(),
+        logs: scopedLogs,
         accounts: accountsPayload,
         timestamp: Date.now(),
       };

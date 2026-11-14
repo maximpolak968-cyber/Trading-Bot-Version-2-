@@ -220,7 +220,10 @@ export default function App() {
       }
       try {
         const res = await fetch(
-          `/api/v1/pair_levels?pair=${encodeURIComponent(pairArg)}&timeframe=${encodeURIComponent(tfArg)}`
+          `/api/v1/pair_levels?pair=${encodeURIComponent(pairArg)}&timeframe=${encodeURIComponent(tfArg)}`,
+          {
+            headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+          }
         );
         if (res.ok) {
           const data = await res.json();
@@ -236,13 +239,15 @@ export default function App() {
         console.error('Failed to fetch pair_levels:', err);
       }
     },
-    [selectedPair, timeframe]
+    [authToken, selectedPair, timeframe]
   );
 
   const fetchPairDrawings = useCallback(
     async (pairArg = selectedPair) => {
       try {
-        const res = await fetch(`/api/v1/chart_drawings?pair=${encodeURIComponent(pairArg)}`);
+        const res = await fetch(`/api/v1/chart_drawings?pair=${encodeURIComponent(pairArg)}`, {
+          headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+        });
         if (res.ok) {
           const data = await res.json();
           setDrawings(data.drawings || []);
@@ -251,16 +256,13 @@ export default function App() {
         console.error('Failed to fetch chart_drawings:', err);
       }
     },
-    [selectedPair]
+    [authToken, selectedPair]
   );
 
   const restoringVaultRef = useRef<boolean>(false);
+  const vaultStorageKey = `scalpbot_saved_accounts_vault_v1_${authState.user_id || authState.role || 'owner'}`;
 
   const fetchAccounts = useCallback(async () => {
-    if (authState.role !== 'owner') {
-      setAccounts([]);
-      return;
-    }
     try {
       const res = await fetch('/api/v1/accounts', {
         headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
@@ -270,7 +272,7 @@ export default function App() {
         const serverAccounts: ExchangeAccount[] = data.accounts || [];
         if (serverAccounts.length === 0 && !restoringVaultRef.current) {
           try {
-            const rawVault = localStorage.getItem('scalpbot_saved_accounts_vault_v1');
+            const rawVault = localStorage.getItem(vaultStorageKey);
             const rawItems = rawVault ? JSON.parse(rawVault) : [];
             const vaultItems = Array.isArray(rawItems)
               ? rawItems.filter((item: any) => {
@@ -321,7 +323,7 @@ export default function App() {
     } catch (err) {
       console.error('Failed to fetch accounts:', err);
     }
-  }, [authState.role, authToken]);
+  }, [authToken, vaultStorageKey]);
 
   const fetchBotState = useCallback(async () => {
     const reqStartTs = Date.now();
@@ -439,6 +441,7 @@ export default function App() {
             owner_login: String(data.owner_login || 'admin'),
             authenticated: Boolean(data.authenticated),
             role: data.role === 'client' ? 'client' : 'owner',
+            user_id: data.user_id ? String(data.user_id) : undefined,
             login: String(data.login || data.owner_login || 'admin'),
             account_id: data.account_id,
             client_code: data.client_code || clientCode,
@@ -854,12 +857,17 @@ export default function App() {
     fetchCandles(selectedPair, timeframe, strategy);
     fetchPairBotLevels(selectedPair, timeframe);
     fetchPairDrawings(selectedPair);
-    fetch('/api/v1/config', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ timeframe, strategy }),
-    }).catch(() => {});
-  }, [authState.loading, authState.require_login, authState.authenticated, selectedPair, timeframe, strategy, fetchCandles, fetchPairBotLevels, fetchPairDrawings]);
+    if (authState.role === 'owner') {
+      fetch('/api/v1/config', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
+        body: JSON.stringify({ timeframe, strategy }),
+      }).catch(() => {});
+    }
+  }, [authState.loading, authState.require_login, authState.authenticated, authState.role, authToken, selectedPair, timeframe, strategy, fetchCandles, fetchPairBotLevels, fetchPairDrawings]);
 
   const parsedCandles = useMemo(
     () => parseDataframeToCandles(dataframe),
@@ -883,7 +891,10 @@ export default function App() {
   );
 
   const handleBotCommand = async (endpoint: 'start' | 'stop' | 'stopbuy' | 'reload_config') => {
-    const res = await fetch(`/api/v1/${endpoint}`, { method: 'POST' });
+    const res = await fetch(`/api/v1/${endpoint}`, {
+      method: 'POST',
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+    });
     if (!res.ok) {
       try {
         const errData = await res.json();
@@ -915,7 +926,10 @@ export default function App() {
     const nextPause = !botConfig?.pause_new_entries;
     const res = await fetch('/api/v1/bot/pause_entries', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
       body: JSON.stringify({ pause_new_entries: nextPause }),
     });
     if (res.ok) {
@@ -932,7 +946,10 @@ export default function App() {
   const handleForceExit = async (tradeId: number | 'all') => {
     const res = await fetch('/api/v1/forceexit', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
       body: JSON.stringify({ tradeid: tradeId }),
     });
     const data = await res.json().catch(() => ({}));
@@ -955,7 +972,10 @@ export default function App() {
   const handleAverageTrade = async (tradeId: number) => {
     const res = await fetch('/api/v1/dca', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
       body: JSON.stringify({ tradeid: tradeId }),
     });
     if (res.ok) {
@@ -1209,7 +1229,10 @@ export default function App() {
   const handleAddDrawing = useCallback(async (drawing: Omit<ChartDrawingObject, 'id' | 'created_at'>) => {
     const res = await fetch('/api/v1/chart_drawings', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
       body: JSON.stringify(drawing),
     });
     if (res.ok) {
@@ -1219,25 +1242,31 @@ export default function App() {
         setStatusNotification('Линейка зафиксирована на графике (удаление по кнопке × на замере)');
       }
     }
-  }, []);
+  }, [authToken]);
 
   const handleUpdateDrawing = useCallback(async (id: string, patch: Partial<ChartDrawingObject>) => {
     setDrawings((prev) => prev.map((d) => (d.id === id ? { ...d, ...patch } : d)));
     const res = await fetch(`/api/v1/chart_drawings/${encodeURIComponent(id)}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
       body: JSON.stringify({ ...patch, pair: selectedPair }),
     });
     if (res.ok) {
       const data = await res.json();
       if (data.drawings) setDrawings(data.drawings);
     }
-  }, [selectedPair]);
+  }, [authToken, selectedPair]);
 
   const handleDeleteDrawing = async (id: string) => {
     const res = await fetch(
       `/api/v1/chart_drawings/${encodeURIComponent(id)}?pair=${encodeURIComponent(selectedPair)}`,
-      { method: 'DELETE' }
+      {
+        method: 'DELETE',
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+      }
     );
     if (res.ok) {
       const data = await res.json();
@@ -1248,6 +1277,7 @@ export default function App() {
   const handleClearAllDrawings = async () => {
     const res = await fetch(`/api/v1/chart_drawings?pair=${encodeURIComponent(selectedPair)}`, {
       method: 'DELETE',
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
     });
     if (res.ok) {
       setDrawings([]);
@@ -1258,7 +1288,10 @@ export default function App() {
   const handleQuickOrderFromChart = async (payload: QuickOrderFromChartPayload) => {
     const res = await fetch('/api/v1/forceenter', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
       body: JSON.stringify({
         pair: payload.pair,
         side: payload.side,
@@ -1292,13 +1325,16 @@ export default function App() {
     }
   };
 
-  // Обработчики раздела API / Клиенты (только для владельца)
+  // Обработчики раздела API-ключей (изолированы по user_id)
   const handleAddAccount = async (
     payload: Partial<ExchangeAccount> & { api_key?: string; api_secret?: string; passphrase?: string }
   ) => {
     const res = await fetch('/api/v1/accounts', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
       body: JSON.stringify(payload),
     });
     if (res.ok) {
@@ -1307,7 +1343,7 @@ export default function App() {
       try {
         if (payload.api_key && payload.api_secret) {
           const rawPayload = payload as Record<string, any>;
-          const rawVault = localStorage.getItem('scalpbot_saved_accounts_vault_v1');
+          const rawVault = localStorage.getItem(vaultStorageKey);
           const vaultItems = rawVault ? JSON.parse(rawVault) : [];
           const list = Array.isArray(vaultItems) ? vaultItems : [];
           const createdId = data.account?.id;
@@ -1326,14 +1362,12 @@ export default function App() {
             api_secret: payload.api_secret,
             passphrase: payload.passphrase,
             subaccount: rawPayload.subaccount,
-            is_owner: payload.is_owner,
             enabled: payload.enabled ?? true,
             max_leverage: payload.max_leverage,
-            copy_trading: payload.copy_trading,
             balance_usdt: data.account?.balance_usdt ?? payload.balance_usdt,
             client_access_code: payload.client_access_code,
           });
-          localStorage.setItem('scalpbot_saved_accounts_vault_v1', JSON.stringify(nextList));
+          localStorage.setItem(vaultStorageKey, JSON.stringify(nextList));
         }
       } catch {
         // ignore storage error
@@ -1352,20 +1386,23 @@ export default function App() {
   const handleToggleAccount = async (id: string, enabled: boolean) => {
     const res = await fetch(`/api/v1/accounts/${encodeURIComponent(id)}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
       body: JSON.stringify({ enabled }),
     });
     if (res.ok) {
       const data = await res.json();
       if (data.accounts) setAccounts(data.accounts);
       try {
-        const rawVault = localStorage.getItem('scalpbot_saved_accounts_vault_v1');
+        const rawVault = localStorage.getItem(vaultStorageKey);
         const vaultItems = rawVault ? JSON.parse(rawVault) : [];
         if (Array.isArray(vaultItems)) {
           const nextList = vaultItems.map((item: any) =>
             item.id === id ? { ...item, enabled } : item
           );
-          localStorage.setItem('scalpbot_saved_accounts_vault_v1', JSON.stringify(nextList));
+          localStorage.setItem(vaultStorageKey, JSON.stringify(nextList));
         }
       } catch {
         // ignore
@@ -1377,19 +1414,20 @@ export default function App() {
   const handleDeleteAccount = async (id: string) => {
     try {
       const targetAcc = accounts.find((a) => a.id === id);
-      const rawVault = localStorage.getItem('scalpbot_saved_accounts_vault_v1');
+      const rawVault = localStorage.getItem(vaultStorageKey);
       const vaultItems = rawVault ? JSON.parse(rawVault) : [];
       if (Array.isArray(vaultItems)) {
         const nextList = vaultItems.filter(
           (item: any) => item.id !== id && (!targetAcc || item.name !== targetAcc.name)
         );
-        localStorage.setItem('scalpbot_saved_accounts_vault_v1', JSON.stringify(nextList));
+        localStorage.setItem(vaultStorageKey, JSON.stringify(nextList));
       }
     } catch {
       // ignore
     }
     const res = await fetch(`/api/v1/accounts/${encodeURIComponent(id)}`, {
       method: 'DELETE',
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
     });
     if (res.ok) {
       const data = await res.json();
@@ -1400,12 +1438,13 @@ export default function App() {
 
   const handleClearAllAccounts = async () => {
     try {
-      localStorage.removeItem('scalpbot_saved_accounts_vault_v1');
+      localStorage.removeItem(vaultStorageKey);
     } catch {
       // ignore
     }
     const res = await fetch('/api/v1/accounts?confirm=true', {
       method: 'DELETE',
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
     });
     if (res.ok) {
       setAccounts([]);
@@ -1414,9 +1453,12 @@ export default function App() {
   };
 
   const handleDeleteTrade = async (tradeId: number) => {
-    setOpenTrades((prev) => prev.filter((t) => t.trade_id !== tradeId && t.parent_trade_id !== tradeId));
-    setClosedTrades((prev) => prev.filter((t) => t.trade_id !== tradeId && t.parent_trade_id !== tradeId));
-    await fetch(`/api/v1/trades/${tradeId}`, { method: 'DELETE' });
+    setOpenTrades((prev) => prev.filter((t) => t.trade_id !== tradeId));
+    setClosedTrades((prev) => prev.filter((t) => t.trade_id !== tradeId));
+    await fetch(`/api/v1/trades/${tradeId}`, {
+      method: 'DELETE',
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+    });
     setStatusNotification(`🗑️ Сделка #${tradeId} удалена из базы`);
     await fetchBotState();
   };
@@ -1432,7 +1474,10 @@ export default function App() {
     try {
       const res = await fetch('/api/v1/forceenter', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
         body: JSON.stringify({
           pair: forcePair,
           side: forceSide,
@@ -1556,25 +1601,23 @@ export default function App() {
               <span>График</span>
             </button>
 
-            {authState.role === 'owner' && (
-              <button
-                type="button"
-                onClick={() => setActiveRoute('accounts')}
-                className={`inline-flex items-center gap-1.5 transition-colors ${
-                  activeRoute === 'accounts'
-                    ? 'text-[#00b4d8] font-medium'
-                    : 'text-[#9ca3af] hover:text-[#e2e8f0]'
-                }`}
-              >
-                <Key className="w-3.5 h-3.5" />
-                <span>API / Клиенты</span>
-                {accounts.length > 0 && (
-                  <span className="px-1.5 py-0.2 rounded-full bg-[#00b4d8]/20 border border-[#00b4d8]/50 text-[#38bdf8] text-[10px] font-mono">
-                    {accounts.filter((a) => a.enabled).length}
-                  </span>
-                )}
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => setActiveRoute('accounts')}
+              className={`inline-flex items-center gap-1.5 transition-colors ${
+                activeRoute === 'accounts'
+                  ? 'text-[#00b4d8] font-medium'
+                  : 'text-[#9ca3af] hover:text-[#e2e8f0]'
+              }`}
+            >
+              <Key className="w-3.5 h-3.5" />
+              <span>{authState.role === 'owner' ? 'API / Аккаунты' : 'Мои API'}</span>
+              {accounts.length > 0 && (
+                <span className="px-1.5 py-0.2 rounded-full bg-[#00b4d8]/20 border border-[#00b4d8]/50 text-[#38bdf8] text-[10px] font-mono">
+                  {accounts.filter((a) => a.enabled).length}
+                </span>
+              )}
+            </button>
 
             <button
               type="button"
@@ -1790,6 +1833,7 @@ export default function App() {
             rightPanelTab={rightPanelTab}
             onChangeRightPanelTab={setRightPanelTab}
             statusNotification={statusNotification}
+            isOwner={authState.role === 'owner'}
           />
         )}
 
@@ -1850,10 +1894,11 @@ export default function App() {
           </div>
         )}
 
-        {/* ВКЛАДКА 4: API / Клиенты (только для владельца: кого добавляем + секретные ключи) */}
+        {/* ВКЛАДКА 4: API-ключи (изолированы по каждому пользователю) */}
         {activeRoute === 'accounts' && (
           <ExchangeAccountsView
             accounts={accounts}
+            authToken={authToken}
             onAddAccount={handleAddAccount}
             onToggleAccount={handleToggleAccount}
             onDeleteAccount={handleDeleteAccount}
