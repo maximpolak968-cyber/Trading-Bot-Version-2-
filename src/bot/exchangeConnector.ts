@@ -15,7 +15,11 @@ import {
   isSupportedFuturesSymbol,
   cleanSymbolToPair,
   setBybitWsTimeOffset,
+  sanitizePositionMarginUsdt,
+  sanitizeWalletUsedMarginUsdt,
 } from './exchangeWebSocket.ts';
+
+export { sanitizePositionMarginUsdt, sanitizeWalletUsedMarginUsdt };
 
 export type SupportedExchange = 'binance' | 'bybit' | 'okx' | 'bitget' | 'bingx';
 
@@ -2332,17 +2336,24 @@ export async function testExchangeConnection(
                 p.entryPrice || p.markPrice || p.breakEvenPrice || liveTick?.markPrice || liveTick?.price || 0
               );
               if (!(entryPrice > 0)) continue;
-              const markPrice = Number(p.markPrice || liveTick?.markPrice || liveTick?.price || entryPrice);
+              const markPrice = Number(
+                (liveTick && liveTick.markPrice > 0 ? liveTick.markPrice : 0) ||
+                  p.markPrice ||
+                  liveTick?.price ||
+                  entryPrice
+              );
               const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
               const posSide = String(p.positionSide || '').toUpperCase();
               const isShort = posSide === 'SHORT' || rawAmt < 0;
-              const notional = size * entryPrice;
               const initMargin = Number(
                 p.initialMargin || p.positionInitialMargin || p.isolatedMargin || p.isolatedWallet || 0
               );
-              const marginUsdt =
-                initMargin > 0 ? Number(initMargin.toFixed(2)) : Number((notional / lev).toFixed(2));
+              const marginUsdt = sanitizePositionMarginUsdt(initMargin, size, entryPrice, lev);
               const uTime = Number(p.updateTime || Date.now());
+              const liveUnrealPnl =
+                liveTick && liveTick.markPrice > 0
+                  ? Number(((isShort ? entryPrice - markPrice : markPrice - entryPrice) * size).toFixed(4))
+                  : Number(p.unrealizedProfit ?? p.unRealizedProfit ?? 0);
               parsedPositions.push({
                 pair: symbolToFreqtradePair(sym),
                 symbol: sym,
@@ -2352,7 +2363,7 @@ export async function testExchangeConnection(
                 mark_price: markPrice > 0 ? markPrice : entryPrice,
                 leverage: lev,
                 margin_usdt: marginUsdt,
-                unrealized_pnl: Number(p.unrealizedProfit ?? p.unRealizedProfit ?? 0),
+                unrealized_pnl: liveUnrealPnl,
                 created_time: uTime,
                 updated_time: uTime,
               });
@@ -2361,13 +2372,16 @@ export async function testExchangeConnection(
           const posMarginSum = Number(
             parsedPositions.reduce((s, p) => s + Number(p.margin_usdt || 0), 0).toFixed(2)
           );
-          if (usedMargin <= 0 && posMarginSum > 0) {
-            usedMargin = posMarginSum;
-          }
+          usedMargin = sanitizeWalletUsedMarginUsdt(
+            usedMargin,
+            walletBalance,
+            posMarginSum,
+            parsedPositions.length
+          );
           const effectiveAvailableBalance =
-            availableBalance > 0 && usedMargin === 0
-              ? availableBalance
-              : usdtAsset && Number(usdtAsset.availableBalance || 0) > 0
+            availableBalance > 0 &&
+            availableBalance <= walletBalance - usedMargin + 0.5 &&
+            (usedMargin === 0 || (usdtAsset && Number(usdtAsset.availableBalance || 0) > 0))
               ? availableBalance
               : Math.max(0, walletBalance - usedMargin);
 
@@ -2780,18 +2794,23 @@ export async function testExchangeConnection(
                       p.avgPrice || p.entryPrice || p.markPrice || liveTick?.markPrice || liveTick?.price || 0
                     );
                     if (!(entryPrice > 0)) continue;
-                    const markPrice = Number(p.markPrice || liveTick?.markPrice || entryPrice);
+                    const markPrice = Number(
+                      (liveTick && liveTick.markPrice > 0 ? liveTick.markPrice : 0) ||
+                        p.markPrice ||
+                        entryPrice
+                    );
                     const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
                     const sideStr = String(p.side || '').toLowerCase();
                     const isShort = sideStr === 'sell' || Number(p.positionIdx) === 2;
                     const posKey = `${sym}:${isShort ? 'S' : 'L'}`;
                     if (seenBybitPos.has(posKey)) continue;
                     seenBybitPos.add(posKey);
-                    const notional = size * entryPrice;
                     const rawIm = Number(p.positionIM || p.positionBalance || 0);
-                    const marginUsdt =
-                      rawIm > 0 ? Number(rawIm.toFixed(2)) : Number((notional / lev).toFixed(2));
-                    const unreal = Number(p.unrealisedPnl || 0);
+                    const marginUsdt = sanitizePositionMarginUsdt(rawIm, size, entryPrice, lev);
+                    const unreal =
+                      liveTick && liveTick.markPrice > 0
+                        ? Number(((isShort ? entryPrice - markPrice : markPrice - entryPrice) * size).toFixed(4))
+                        : Number(p.unrealisedPnl || 0);
                     posUnrealizedSum += unreal;
                     posMarginSum += marginUsdt;
                     const tp = Number(p.takeProfit || 0);
@@ -2830,15 +2849,17 @@ export async function testExchangeConnection(
               resolvedUnrealizedPnl = posUnrealizedSum;
               resolvedEquity = resolvedBalance + resolvedUnrealizedPnl;
             }
-            if (openPositions > 0 && posMarginSum > 0 && resolvedUsedMargin <= 0) {
-              resolvedUsedMargin = posMarginSum;
-            }
-
             const finalWalletBal = resolvedBalance > 0 ? resolvedBalance : fundBalance;
+            resolvedUsedMargin = sanitizeWalletUsedMarginUsdt(
+              resolvedUsedMargin,
+              finalWalletBal,
+              posMarginSum,
+              openPositions
+            );
             const finalEquity =
               resolvedEquity > 0 ? resolvedEquity : finalWalletBal + resolvedUnrealizedPnl;
             const finalAvail =
-              resolvedAvailable > 0
+              resolvedAvailable > 0 && resolvedAvailable <= finalWalletBal - resolvedUsedMargin + 0.5
                 ? resolvedAvailable
                 : Math.max(0, finalWalletBal - resolvedUsedMargin);
 
@@ -3448,21 +3469,27 @@ export async function fetchExchangeOpenPositions(
                 p.avgPrice || p.entryPrice || p.markPrice || liveTick?.markPrice || liveTick?.price || 0
               );
               if (!(entryPrice > 0)) continue;
-              const markPrice = Number(p.markPrice || liveTick?.markPrice || entryPrice);
+              const markPrice = Number(
+                (liveTick && liveTick.markPrice > 0 ? liveTick.markPrice : 0) ||
+                  p.markPrice ||
+                  entryPrice
+              );
               const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
               const sideStr = String(p.side || '').toLowerCase();
               const isShort = sideStr === 'sell' || Number(p.positionIdx) === 2;
               const posKey = `${sym}:${isShort ? 'S' : 'L'}`;
               if (seenPosKeys.has(posKey)) continue;
               seenPosKeys.add(posKey);
-              const notional = size * entryPrice;
               const rawIm = Number(p.positionIM || p.positionBalance || 0);
-              const marginUsdt =
-                rawIm > 0 ? Number(rawIm.toFixed(2)) : Number((notional / lev).toFixed(2));
+              const marginUsdt = sanitizePositionMarginUsdt(rawIm, size, entryPrice, lev);
               const tp = Number(p.takeProfit || 0);
               const sl = Number(p.stopLoss || 0);
               const cTime = Number(p.createdTime || p.updatedTime || Date.now());
               const uTime = Number(p.updatedTime || cTime);
+              const unrealPnl =
+                liveTick && liveTick.markPrice > 0
+                  ? Number(((isShort ? entryPrice - markPrice : markPrice - entryPrice) * size).toFixed(4))
+                  : Number(p.unrealisedPnl || 0);
               const posItem: ExchangePositionItem = {
                 pair: symbolToFreqtradePair(sym),
                 symbol: sym,
@@ -3472,7 +3499,7 @@ export async function fetchExchangeOpenPositions(
                 mark_price: markPrice > 0 ? markPrice : entryPrice,
                 leverage: lev,
                 margin_usdt: marginUsdt,
-                unrealized_pnl: Number(p.unrealisedPnl || 0),
+                unrealized_pnl: unrealPnl,
                 take_profit: tp > 0 ? tp : undefined,
                 stop_loss: sl > 0 ? sl : undefined,
                 created_time: cTime,
@@ -3667,19 +3694,23 @@ export async function fetchExchangeOpenPositions(
               p.entryPrice || p.markPrice || p.breakEvenPrice || liveTick?.markPrice || liveTick?.price || 0
             );
             if (!(entryPrice > 0)) continue;
-            const markPrice = Number(p.markPrice || liveTick?.markPrice || entryPrice);
+            const markPrice = Number(
+              (liveTick && liveTick.markPrice > 0 ? liveTick.markPrice : 0) ||
+                p.markPrice ||
+                entryPrice
+            );
             const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
             const posSide = String(p.positionSide || '').toUpperCase();
             const isShort = posSide === 'SHORT' || rawAmt < 0;
-            const notional = size * entryPrice;
             const initialMargin = Number(
               p.initialMargin || p.positionInitialMargin || p.isolatedMargin || p.isolatedWallet || 0
             );
-            const marginUsdt =
-              initialMargin > 0
-                ? Number(initialMargin.toFixed(2))
-                : Number((notional / lev).toFixed(2));
+            const marginUsdt = sanitizePositionMarginUsdt(initialMargin, size, entryPrice, lev);
             const uTime = Number(p.updateTime || Date.now());
+            const unrealPnl =
+              liveTick && liveTick.markPrice > 0
+                ? Number(((isShort ? entryPrice - markPrice : markPrice - entryPrice) * size).toFixed(4))
+                : Number(p.unRealizedProfit ?? p.unrealizedProfit ?? 0);
             const posItem: ExchangePositionItem = {
               pair: symbolToFreqtradePair(sym),
               symbol: sym,
@@ -3689,7 +3720,7 @@ export async function fetchExchangeOpenPositions(
               mark_price: markPrice > 0 ? markPrice : entryPrice,
               leverage: lev,
               margin_usdt: marginUsdt,
-              unrealized_pnl: Number(p.unRealizedProfit ?? p.unrealizedProfit ?? 0),
+              unrealized_pnl: unrealPnl,
               created_time: uTime,
               updated_time: uTime,
             };
@@ -3779,7 +3810,12 @@ export async function fetchExchangeOpenPositions(
             const markPrice = Number(p.markPx || entryPrice);
             const lev = Math.max(1, Math.round(Number(p.lever || 25)));
             const isShort = String(p.posSide || '').toLowerCase() === 'short' || rawPos < 0;
-            const marginUsdt = Number(p.margin || p.imr || (size * entryPrice) / lev);
+            const marginUsdt = sanitizePositionMarginUsdt(
+              Number(p.margin || p.imr || 0),
+              size,
+              entryPrice,
+              lev
+            );
             positions.push({
               pair: symbolToFreqtradePair(instId),
               symbol: instId,
@@ -3851,7 +3887,12 @@ export async function fetchExchangeOpenPositions(
               const markPrice = Number(p.markPrice || entryPrice);
               const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
               const isShort = String(p.holdSide || '').toLowerCase() === 'short';
-              const marginUsdt = Number(p.marginSize || (size * entryPrice) / lev);
+              const marginUsdt = sanitizePositionMarginUsdt(
+                Number(p.marginSize || 0),
+                size,
+                entryPrice,
+                lev
+              );
               positions.push({
                 pair: symbolToFreqtradePair(sym),
                 symbol: sym,
@@ -3912,7 +3953,12 @@ export async function fetchExchangeOpenPositions(
             const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
             const posSide = String(p.positionSide || '').toUpperCase();
             const isShort = posSide === 'SHORT' || (posSide !== 'LONG' && rawAmt < 0);
-            const marginUsdt = Number(p.margin || (size * entryPrice) / lev);
+            const marginUsdt = sanitizePositionMarginUsdt(
+              Number(p.margin || 0),
+              size,
+              entryPrice,
+              lev
+            );
             positions.push({
               pair: symbolToFreqtradePair(sym),
               symbol: sym,

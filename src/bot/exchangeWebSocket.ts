@@ -203,6 +203,61 @@ export function pairToSymbol(pair: string): string {
     .replace(/[^A-Z0-9]/g, '');
 }
 
+/**
+ * Защита от битых/сентинельных значений маржи биржи (например, INT64_MAX * 1e-8 = 92233720368.54775807 на Binance Testnet/Mainnet
+ * в полях isolatedWallet / isolatedMargin / initialMargin) и некорректных значений, превышающих объём позиции (notional).
+ */
+export function sanitizePositionMarginUsdt(
+  rawMargin: number | string | undefined | null,
+  size: number,
+  entryOrMarkPrice: number,
+  leverage: number
+): number {
+  const cleanSize = Math.abs(Number(size || 0));
+  const cleanPrice = Math.max(0, Number(entryOrMarkPrice || 0));
+  const lev = Math.max(1, Math.min(125, Math.round(Number(leverage || 25))));
+  const notional = cleanSize * cleanPrice;
+  const expectedMargin = notional > 0 ? Number((notional / lev).toFixed(2)) : 0;
+  const m = Number(rawMargin || 0);
+  if (
+    !Number.isFinite(m) ||
+    m <= 0 ||
+    m >= 100_000_000 ||
+    (notional > 0 && m > Math.max(notional * 1.05, 500))
+  ) {
+    return expectedMargin > 0 ? Math.max(0.01, expectedMargin) : 0;
+  }
+  return Number(m.toFixed(2));
+}
+
+export function sanitizeWalletUsedMarginUsdt(
+  rawUsedMargin: number | string | undefined | null,
+  walletBalance: number,
+  posMarginSum: number,
+  openPositionsCount?: number
+): number {
+  const m = Number(rawUsedMargin || 0);
+  const wb = Math.max(0, Number(walletBalance || 0));
+  const pSum = Math.max(0, Number(posMarginSum || 0));
+  if (openPositionsCount === 0 && pSum === 0) {
+    if (!Number.isFinite(m) || m <= 0 || m >= 100_000_000 || (wb > 0 && m > wb * 1.2)) {
+      return 0;
+    }
+    return Number(m.toFixed(2));
+  }
+  if (
+    !Number.isFinite(m) ||
+    m <= 0 ||
+    m >= 100_000_000 ||
+    (wb > 0 && m > Math.max(wb * 1.5, pSum * 2.5 + 100)) ||
+    (pSum > 0 && m > Math.max(pSum * 3.0, 500))
+  ) {
+    return Number(pSum.toFixed(2));
+  }
+  return Number(m.toFixed(2));
+}
+
+
 function mapIntervalToBybitWs(interval: string): string {
   const map: Record<string, string> = {
     '1m': '1',
@@ -608,6 +663,11 @@ function connectBybitPublicWs(): void {
           const bid = Array.isArray(d.b) && d.b[0] ? Number(d.b[0][0]) : prev?.bestBid || 0;
           const ask = Array.isArray(d.a) && d.a[0] ? Number(d.a[0][0]) : prev?.bestAsk || 0;
           if (!(bid > 0) && !(ask > 0)) return;
+          if (prev && prev.markPrice > 0) {
+            prev.bestBid = bid > 0 ? bid : prev.bestBid;
+            prev.bestAsk = ask > 0 ? ask : prev.bestAsk;
+            return;
+          }
           const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : bid || ask;
           emitTickerUpdate({
             pair: cleanSymbolToPair(sym),
@@ -813,6 +873,11 @@ function connectBinancePublicWs(): void {
           const bestAsk = Number(msg.a || 0);
           if (!(bestBid > 0) && !(bestAsk > 0)) return;
           const prev = wsTickersByExchangeAndSymbol.get(`binance:${sym}`);
+          if (prev && prev.markPrice > 0) {
+            prev.bestBid = bestBid > 0 ? bestBid : prev.bestBid;
+            prev.bestAsk = bestAsk > 0 ? bestAsk : prev.bestAsk;
+            return;
+          }
           const mid = bestBid > 0 && bestAsk > 0 ? (bestBid + bestAsk) / 2 : bestBid || bestAsk;
           emitTickerUpdate({
             pair: cleanSymbolToPair(sym),
@@ -1631,13 +1696,17 @@ export async function ensureBinancePrivateUserStream(
                 const lev = prevPos?.leverage || 25;
                 const prevSizeChanged = !prevPos || Math.abs(prevPos.size - size) > 1e-6;
                 const rawIw = Number(rawP.iw || 0);
-                const computedCrossMargin = Number(((size * (markPrice > 0 ? markPrice : entryPrice)) / lev).toFixed(2));
+                const sanitizedIw = sanitizePositionMarginUsdt(rawIw, size, entryPrice, lev);
+                const sanitizedPrevMargin =
+                  !prevSizeChanged && prevPos?.margin_usdt
+                    ? sanitizePositionMarginUsdt(prevPos.margin_usdt, size, entryPrice, lev)
+                    : 0;
                 const marginUsdt =
-                  rawIw > 0
-                    ? Number(rawIw.toFixed(2))
-                    : !prevSizeChanged && prevPos?.margin_usdt && prevPos.margin_usdt > 0
-                    ? prevPos.margin_usdt
-                    : Math.max(0.01, computedCrossMargin);
+                  sanitizedIw > 0
+                    ? sanitizedIw
+                    : sanitizedPrevMargin > 0
+                    ? sanitizedPrevMargin
+                    : sanitizePositionMarginUsdt(0, size, markPrice > 0 ? markPrice : entryPrice, lev);
                 const unrealizedPnl = Number(rawP.up ?? prevPos?.unrealized_pnl ?? 0);
                 const updatedPos: ExchangePositionItem = {
                   pair: cleanSymbolToPair(sym),
@@ -1665,10 +1734,12 @@ export async function ensureBinancePrivateUserStream(
             const sumPosMargin = Number(
               state.positions.reduce((s, p) => s + Number(p.margin_usdt || 0), 0).toFixed(2)
             );
-            state.usedMarginUsdt =
-              state.positions.length > 0
-                ? Math.max(sumPosMargin, state.usedMarginUsdt > 0 && msg.a.P.length < state.positions.length ? state.usedMarginUsdt : sumPosMargin)
-                : 0;
+            state.usedMarginUsdt = sanitizeWalletUsedMarginUsdt(
+              sumPosMargin,
+              state.walletBalanceUsdt,
+              sumPosMargin,
+              state.positions.length
+            );
             state.availableBalanceUsdt = Number(
               Math.max(0, state.walletBalanceUsdt - state.usedMarginUsdt).toFixed(2)
             );
@@ -1920,12 +1991,17 @@ export function ensureBybitPrivateUserStream(
               state.positions.reduce((s, p) => s + Number(p.margin_usdt || 0), 0).toFixed(2)
             );
             const rawUsedMargin = Number(acc.totalInitialMargin || sumIm || usdt?.totalPositionIM || 0);
-            const usedMargin = rawUsedMargin > 0 ? rawUsedMargin : posMarginSum;
-            const avail = Number(
-              acc.totalAvailableBalance ||
-                usdt?.availableToWithdraw ||
-                Math.max(0, walletBal - usedMargin)
+            const usedMargin = sanitizeWalletUsedMarginUsdt(
+              rawUsedMargin,
+              walletBal,
+              posMarginSum,
+              state.positions.length
             );
+            const rawAvail = Number(acc.totalAvailableBalance || usdt?.availableToWithdraw || 0);
+            const avail =
+              rawAvail > 0 && rawAvail <= walletBal - usedMargin + 0.5
+                ? rawAvail
+                : Math.max(0, walletBal - usedMargin);
             if (walletBal >= 0) {
               state.walletBalanceUsdt = walletBal;
               state.unrealizedPnlUsdt = unrealized;
@@ -2052,12 +2128,17 @@ export function ensureBybitPrivateUserStream(
               const lev = Math.max(1, Math.round(Number(rawP.leverage || prevPos?.leverage || 25)));
               const rawIm = Number(rawP.positionIM || rawP.positionBalance || 0);
               const prevSizeChanged = !prevPos || Math.abs(prevPos.size - size) > 1e-6;
+              const sanitizedIm = sanitizePositionMarginUsdt(rawIm, size, entryPrice, lev);
+              const sanitizedPrevIm =
+                !prevSizeChanged && prevPos?.margin_usdt
+                  ? sanitizePositionMarginUsdt(prevPos.margin_usdt, size, entryPrice, lev)
+                  : 0;
               const marginUsdt =
-                rawIm > 0
-                  ? Number(rawIm.toFixed(2))
-                  : !prevSizeChanged && prevPos?.margin_usdt && prevPos.margin_usdt > 0
-                  ? prevPos.margin_usdt
-                  : Number(((size * entryPrice) / lev).toFixed(2));
+                sanitizedIm > 0
+                  ? sanitizedIm
+                  : sanitizedPrevIm > 0
+                  ? sanitizedPrevIm
+                  : sanitizePositionMarginUsdt(0, size, entryPrice, lev);
               const tp = Number(rawP.takeProfit || prevPos?.take_profit || 0);
               const sl = Number(rawP.stopLoss || prevPos?.stop_loss || 0);
               const uTime = Number(rawP.updatedTime || Date.now());
