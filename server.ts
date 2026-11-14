@@ -36,6 +36,8 @@ import {
   isPairTradableOnExchange,
   isBinanceHostRateLimited,
   sanitizeCredentialString,
+  prewarmExchangeAccountCaches,
+  stopExchangePrivateStream,
   ExchangeOrderParams,
   PlacedOrderResult,
 } from './src/bot/exchangeConnector.ts';
@@ -45,9 +47,24 @@ import {
   onWsTickerUpdate,
   onWsKlineUpdate,
   onWsAccountUpdate,
+  onWsExchangeExecution,
+  onWsExchangePositionClosed,
+  getLiveWsTicker,
+  getFuturesExecutionPrice,
   getAllLiveWsTickers,
   getWebSocketEngineStatus,
+  LiveWsTicker,
+  WsOrderFillEvent,
+  WsPositionClosedEvent,
 } from './src/bot/exchangeWebSocket.ts';
+import {
+  attachLiveWebSocketHub,
+  queueLiveTickerBroadcast,
+  broadcastLiveCandleTick,
+  broadcastTradeLifecycleEvent,
+  scheduleScopeStateSync,
+  getConnectedUiClientsCount,
+} from './src/bot/liveWsHub.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -150,12 +167,272 @@ function pairToBinanceSymbol(pair: string): string {
 
 const candleCache = new Map<string, { timestamp: number; candles: RawCandle[]; source: string }>();
 const tickerCache = new Map<string, { price: number; change24h: number; volume24h: number; high24h: number; low24h: number; updatedAt: number }>();
+const exchangeTickerCache = new Map<string, LiveWsTicker>();
+const fastTpInFlightIds = new Set<number>();
 
-// Подключаем живые WebSocket-потоки тикеров и свечей (Bybit V5 Linear WS + Binance Market WS):
-// обновляем tickerCache и свечи в candleCache в реальном времени без единого REST-запроса!
+function refreshTradeLivePriceFromWs(t: FreqtradeTrade): boolean {
+  if (!t.is_open) return false;
+  const wsTick =
+    getLiveWsTicker(t.pair, t.exchange) ||
+    exchangeTickerCache.get(`${t.exchange}:${t.pair}`);
+  if (
+    wsTick &&
+    (wsTick.markPrice > 0 || wsTick.price > 0) &&
+    (!t.exchange_synced_at || wsTick.updatedAt >= t.exchange_synced_at)
+  ) {
+    const mark = wsTick.markPrice > 0 ? wsTick.markPrice : wsTick.price;
+    t.exchange_mark_price = mark;
+    t.current_rate = roundPrice(mark);
+    if (t.open_rate > 0 && t.amount > 0) {
+      const liveUpl = (t.is_short ? t.open_rate - mark : mark - t.open_rate) * t.amount;
+      t.exchange_unrealized_pnl = Number(liveUpl.toFixed(4));
+      t.exchange_synced_at = wsTick.updatedAt;
+    }
+    return true;
+  }
+
+  const hasFreshRestExchangeMark =
+    t.exchange_mark_price &&
+    t.exchange_synced_at &&
+    Date.now() - t.exchange_synced_at < 60_000;
+  if (!hasFreshRestExchangeMark) {
+    const fallbackTick = tickerCache.get(t.pair);
+    if (fallbackTick && fallbackTick.price > 0) {
+      t.current_rate = roundPrice(fallbackTick.price);
+      return true;
+    }
+  }
+  return false;
+}
+
+async function processFastWsTradeClose(
+  tradeId: number,
+  execInfo: NonNullable<ReturnType<typeof getFuturesExecutionPrice>>,
+  reasonTag: 'roi_target_tp' | 'hedge_breakeven_profit'
+): Promise<void> {
+  if (fastTpInFlightIds.has(tradeId)) return;
+  const candidate = tradesStore.find((t) => t.trade_id === tradeId && t.is_open);
+  if (!candidate || botConfig.state === 'stopped') return;
+
+  const targetAccId = candidate.account_id || 'master';
+  const lockKey = getPosLockKey(targetAccId, candidate.pair, candidate.is_short);
+  if (activePositionKeys.has(lockKey)) return;
+
+  fastTpInFlightIds.add(tradeId);
+  try {
+    await withPositionLock(lockKey, async () => {
+      const trade = tradesStore.find((t) => t.trade_id === tradeId && t.is_open);
+      if (!trade || botConfig.state === 'stopped') return;
+
+      const latestExec =
+        getFuturesExecutionPrice(trade.pair, trade.is_short, true, trade.exchange) || execInfo;
+      const markPrice = roundPrice(latestExec.markPrice);
+      const execPrice = roundPrice(latestExec.executionPrice);
+
+      trade.exchange_mark_price = markPrice;
+      trade.current_rate = markPrice;
+      if (trade.open_rate > 0 && trade.amount > 0) {
+        const markUpl =
+          (trade.is_short ? trade.open_rate - markPrice : markPrice - trade.open_rate) *
+          trade.amount;
+        trade.exchange_unrealized_pnl = Number(markUpl.toFixed(4));
+        trade.exchange_synced_at = latestExec.updatedAt;
+      }
+      recalculateTradeMetrics(trade, false);
+
+      const execUpl =
+        trade.open_rate > 0 && trade.amount > 0
+          ? Number(
+              (
+                (trade.is_short ? trade.open_rate - execPrice : execPrice - trade.open_rate) *
+                trade.amount
+              ).toFixed(4)
+            )
+          : undefined;
+      const guard = verifySafeProfitableClose(
+        trade,
+        {
+          mark_price: markPrice,
+          unrealized_pnl: execUpl,
+          size: trade.amount,
+        },
+        execPrice
+      );
+      if (!guard.ok) return;
+
+      const targetAcc = resolveExchangeAccountRecord(targetAccId);
+      const isRealAcc = Boolean(
+        targetAcc?.api_key_raw && !isSimulatedTestApiKey(targetAcc.api_key_raw)
+      );
+      const closeOrderRes = await dispatchOrderToExchangeAccount(targetAcc, {
+        pair: trade.pair,
+        action: 'CLOSE',
+        isShort: trade.is_short,
+        quantity: trade.amount,
+        referencePrice: execPrice,
+        leverage: trade.leverage || 25,
+      });
+      if (isRealAcc && !closeOrderRes?.success) {
+        return;
+      }
+
+      const actualClosePrice =
+        closeOrderRes?.success && closeOrderRes.price > 0
+          ? roundPrice(closeOrderRes.price)
+          : execPrice;
+      const now =
+        closeOrderRes?.exchange_time && closeOrderRes.exchange_time > 0
+          ? closeOrderRes.exchange_time
+          : Date.now();
+      const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
+
+      sqliteDb.runInTransaction(() => {
+        trade.is_open = false;
+        trade.close_rate = actualClosePrice;
+        trade.current_rate = actualClosePrice;
+        trade.close_date = nowStr;
+        trade.close_timestamp = now;
+        if (closeOrderRes?.commission_usdt && closeOrderRes.commission_usdt > 0) {
+          trade.fee_close = Number(closeOrderRes.commission_usdt.toFixed(4));
+        }
+        if (typeof closeOrderRes?.realized_pnl_usdt === 'number') {
+          const totalFees = (trade.fee_open || 0) + (trade.fee_close || 0);
+          trade.exchange_realized_pnl = Number(
+            (closeOrderRes.realized_pnl_usdt - totalFees).toFixed(4)
+          );
+        }
+        trade.exit_reason = reasonTag;
+        trade.trade_state = 'CLOSED';
+        trade.planned_dca_levels = [];
+        recalculateTradeMetrics(trade, false);
+        sqliteDb.upsertTrade(trade);
+        sqliteDb.recordOrder({
+          trade_id: trade.trade_id,
+          pair: trade.pair,
+          order_type: 'market',
+          side: trade.is_short ? 'buy' : 'sell',
+          price: actualClosePrice,
+          amount: trade.amount,
+          cost: Number((actualClosePrice * trade.amount).toFixed(4)),
+          fee: trade.fee_close || 0,
+          realized_pnl: trade.net_profit || trade.profit_abs,
+          action_type: reasonTag === 'hedge_breakeven_profit' ? 'HEDGE_PROFIT_EXIT' : 'TAKE_PROFIT',
+          notes: `[WS FAST TP] Closed at ${actualClosePrice} (Mark: ${markPrice}, Bid: ${latestExec.bestBid}, Ask: ${latestExec.bestAsk}), Net PnL: +${trade.profit_abs} USDT`,
+        });
+
+        if ((!trade.account_id || trade.account_id === 'master') && trade.campaign_id) {
+          const sibling = tradesStore.find(
+            (s) =>
+              s.is_open &&
+              (!s.account_id || s.account_id === 'master') &&
+              s.campaign_id === trade.campaign_id &&
+              s.trade_id !== trade.trade_id
+          );
+          if (sibling) {
+            sibling.campaign_banked_profit = trade.net_profit || trade.profit_abs;
+            sqliteDb.upsertTrade(sibling);
+          }
+        }
+
+        if (targetAcc) {
+          const remOpen = tradesStore.filter(
+            (x) =>
+              x.is_open &&
+              (targetAccId === 'master'
+                ? !x.account_id || x.account_id === 'master'
+                : x.account_id === targetAccId)
+          );
+          targetAcc.open_trades_count = remOpen.length;
+          targetAcc.used_margin_usdt = Number(
+            remOpen.reduce((s, x) => s + (x.stake_amount || 0), 0).toFixed(2)
+          );
+          targetAcc.unrealized_pnl = Number(
+            remOpen.reduce((s, x) => s + (x.profit_abs || 0), 0).toFixed(4)
+          );
+        }
+      });
+
+      if (!trade.account_id || trade.account_id === 'master') {
+        await closeClientCopiesForMasterTrade(
+          trade,
+          actualClosePrice,
+          now,
+          nowStr,
+          reasonTag
+        );
+      }
+      cooldownPairs.set(trade.pair, Date.now());
+      appendLog(
+        'freqtrade.bot.exit',
+        'INFO',
+        `⚡ [WS FAST TP] [${trade.pair}] #${trade.trade_id}: мгновенно закрыто по потоку биржи @ ${actualClosePrice}$ (Mark: ${markPrice}$) | Чистый PnL: +${trade.profit_abs}$ (комиссия: ${trade.fee_total}$)`
+      );
+      broadcastTradeLifecycleEvent('trade:closed', trade);
+      scheduleScopeStateSync(targetAccId);
+    });
+  } finally {
+    fastTpInFlightIds.delete(tradeId);
+  }
+}
+
+function evaluateFastWsTpExit(wsTick: LiveWsTicker): void {
+  if (!initializedTrades || botConfig.state === 'stopped') return;
+  const tickExchange: 'bybit' | 'binance' = wsTick.source === 'binance_ws' ? 'binance' : 'bybit';
+
+  for (const t of tradesStore) {
+    if (!t.is_open || t.pair !== wsTick.pair) continue;
+    if (
+      (t.exchange === 'binance' || t.exchange === 'bybit') &&
+      t.exchange !== tickExchange &&
+      getLiveWsTicker(t.pair, t.exchange)
+    ) {
+      continue;
+    }
+    if (fastTpInFlightIds.has(t.trade_id)) continue;
+
+    const execInfo = getFuturesExecutionPrice(t.pair, t.is_short, true, t.exchange);
+    if (!execInfo || !(execInfo.markPrice > 0)) continue;
+
+    const mark = execInfo.markPrice;
+    const execPrice = execInfo.executionPrice;
+    const minSafeTp = t.min_profitable_tp || t.breakeven_price || t.open_rate;
+
+    if (t.take_profit_abs > 0) {
+      const hitTp = t.is_short
+        ? mark <= t.take_profit_abs || execPrice <= t.take_profit_abs
+        : mark >= t.take_profit_abs || execPrice >= t.take_profit_abs;
+      const clearedSafeTp = t.is_short
+        ? mark <= minSafeTp && execPrice <= minSafeTp
+        : mark >= minSafeTp && execPrice >= minSafeTp;
+      if (hitTp && clearedSafeTp) {
+        void processFastWsTradeClose(t.trade_id, execInfo, 'roi_target_tp');
+        continue;
+      }
+    }
+
+    if (
+      t.campaign_banked_profit !== undefined &&
+      t.campaign_banked_profit !== null &&
+      t.min_profitable_tp &&
+      t.min_profitable_tp > 0
+    ) {
+      const reachedMin = t.is_short
+        ? mark <= t.min_profitable_tp && execPrice <= t.min_profitable_tp
+        : mark >= t.min_profitable_tp && execPrice >= t.min_profitable_tp;
+      if (reachedMin) {
+        void processFastWsTradeClose(t.trade_id, execInfo, 'hedge_breakeven_profit');
+      }
+    }
+  }
+}
+
+// Подключаем живые WebSocket-потоки фьючерсов (Bybit V5 Linear WS + Binance USD-M Futures WS):
+// обновляем tickerCache, свечи, Mark Price & PnL открытых сделок, триггерим быстрый WS TP и пушим на сайт!
 onWsTickerUpdate((wsTick) => {
+  const tickExchange: 'bybit' | 'binance' = wsTick.source === 'binance_ws' ? 'binance' : 'bybit';
+  exchangeTickerCache.set(`${tickExchange}:${wsTick.pair}`, wsTick);
   tickerCache.set(wsTick.pair, {
-    price: wsTick.price,
+    price: wsTick.markPrice > 0 ? wsTick.markPrice : wsTick.price,
     change24h: wsTick.change24h,
     volume24h: wsTick.volume24h,
     high24h: wsTick.high24h,
@@ -173,6 +450,38 @@ onWsTickerUpdate((wsTick) => {
       entry.timestamp = Date.now();
     }
   }
+
+  // Мгновенно обновляем Mark Price и PnL открытых сделок без 30-60с REST-задержек
+  for (const t of tradesStore) {
+    if (!t.is_open || t.pair !== wsTick.pair) continue;
+    if (
+      (t.exchange === 'binance' || t.exchange === 'bybit') &&
+      t.exchange !== tickExchange &&
+      getLiveWsTicker(t.pair, t.exchange)
+    ) {
+      continue;
+    }
+    refreshTradeLivePriceFromWs(t);
+    recalculateTradeMetrics(t, false);
+  }
+
+  // Пушим батч тикеров (до 100мс) подключённым браузерам на сайте
+  queueLiveTickerBroadcast({
+    pair: wsTick.pair,
+    exchange: tickExchange,
+    price: wsTick.price,
+    markPrice: wsTick.markPrice > 0 ? wsTick.markPrice : wsTick.price,
+    bestBid: wsTick.bestBid,
+    bestAsk: wsTick.bestAsk,
+    change24h: wsTick.change24h,
+    volume24h: wsTick.volume24h,
+    high24h: wsTick.high24h,
+    low24h: wsTick.low24h,
+    updatedAt: wsTick.updatedAt,
+  });
+
+  // Event-driven проверка Take Profit прямо на WS-тике (с защитой Zero-Loss Guard + Best Bid/Ask)
+  evaluateFastWsTpExit(wsTick);
 });
 
 onWsKlineUpdate((wsKline) => {
@@ -209,6 +518,18 @@ onWsKlineUpdate((wsKline) => {
       }
     }
   }
+
+  broadcastLiveCandleTick({
+    pair: wsKline.pair,
+    interval: wsKline.interval,
+    timestamp: barTsMs,
+    open: wsKline.open,
+    high: wsKline.high,
+    low: wsKline.low,
+    close: wsKline.close,
+    volume: wsKline.volume,
+    confirmed: wsKline.confirmed,
+  });
 });
 
 async function fetchWithTimeout(url: string, timeoutMs = 6000): Promise<Response> {
@@ -2123,6 +2444,13 @@ async function initializeBotTrades() {
 
   if (hasActiveExchange) {
     syncRealExchangeBalancesIfNeeded(true).catch(() => {});
+    for (const acc of exchangeAccountsStore) {
+      if (!acc.enabled) continue;
+      const creds = getAccountCredentialsFromStore(acc);
+      if (creds && !isSimulatedTestApiKey(creds.apiKey)) {
+        prewarmExchangeAccountCaches(creds).catch(() => {});
+      }
+    }
   }
 }
 
@@ -3080,19 +3408,10 @@ async function runScalpBotCycle(waitForActive = false) {
       }
     }
 
-    // Always refresh live prices on any open client trades first (preserve live exchange mark_price if synced)
+    // Always refresh live prices on any open client trades first from real-time WS Mark Price
     for (const ct of tradesStore) {
       if (ct.is_open && ct.account_id && ct.account_id !== 'master') {
-        const hasFreshExchangeMark =
-          ct.exchange_mark_price &&
-          ct.exchange_synced_at &&
-          Date.now() - ct.exchange_synced_at < 30_000;
-        if (!hasFreshExchangeMark) {
-          const liveTicker = tickerCache.get(ct.pair);
-          if (liveTicker && liveTicker.price > 0) {
-            ct.current_rate = liveTicker.price;
-          }
-        }
+        refreshTradeLivePriceFromWs(ct);
         recalculateTradeMetrics(ct, false);
       }
     }
@@ -3107,16 +3426,27 @@ async function runScalpBotCycle(waitForActive = false) {
       if (!candles1h || candles1h.length === 0) continue;
 
       const liveExPos = liveExchangePosMap.get(`${trade.pair}:${trade.is_short ? 'S' : 'L'}`);
-      const liveTicker = tickerCache.get(trade.pair);
+      const execInfo = getFuturesExecutionPrice(trade.pair, trade.is_short, true, trade.exchange);
       const currentPrice =
-        liveTicker && liveTicker.price > 0
-          ? roundPrice(liveTicker.price)
+        execInfo && execInfo.markPrice > 0
+          ? roundPrice(execInfo.markPrice)
           : liveExPos && liveExPos.mark_price > 0
           ? roundPrice(liveExPos.mark_price)
           : candles1h[candles1h.length - 1].close;
+      const closeExecPrice =
+        execInfo && execInfo.executionPrice > 0
+          ? roundPrice(execInfo.executionPrice)
+          : currentPrice;
 
       trade.current_rate = currentPrice;
-      if (liveExPos) {
+      if (execInfo && execInfo.markPrice > 0 && trade.open_rate > 0 && trade.amount > 0) {
+        trade.exchange_mark_price = execInfo.markPrice;
+        const wsUpl =
+          (trade.is_short ? trade.open_rate - execInfo.markPrice : execInfo.markPrice - trade.open_rate) *
+          trade.amount;
+        trade.exchange_unrealized_pnl = Number(wsUpl.toFixed(4));
+        trade.exchange_synced_at = execInfo.updatedAt;
+      } else if (liveExPos) {
         trade.exchange_mark_price = liveExPos.mark_price;
         trade.exchange_unrealized_pnl = liveExPos.unrealized_pnl;
         trade.exchange_synced_at = Date.now();
@@ -3126,160 +3456,60 @@ async function runScalpBotCycle(waitForActive = false) {
       // Sync current_rate to any open client copies for this pair
       for (const ct of tradesStore) {
         if (ct.is_open && ct.account_id && ct.account_id !== 'master' && ct.pair === trade.pair) {
-          if (!ct.exchange_synced_at || Date.now() - ct.exchange_synced_at >= 30_000) {
-            ct.current_rate = currentPrice;
-          }
+          refreshTradeLivePriceFromWs(ct);
           recalculateTradeMetrics(ct, false);
         }
       }
 
-      // ZERO-LOSS EXCHANGE GUARD: проверяем чистый PnL с учетом всех комиссий (вход + DCA + выход) и резерва на проскальзывание
-      const closeProfitGuard = verifySafeProfitableClose(trade, liveExPos, currentPrice);
+      // ZERO-LOSS EXCHANGE GUARD: проверяем чистый PnL по фактической цене исполнения стакана (Bid/Ask) и Mark Price
+      const execUnrealized =
+        trade.open_rate > 0 && trade.amount > 0
+          ? Number(
+              (
+                (trade.is_short ? trade.open_rate - closeExecPrice : closeExecPrice - trade.open_rate) *
+                trade.amount
+              ).toFixed(4)
+            )
+          : liveExPos?.unrealized_pnl;
+      const closeProfitGuard = verifySafeProfitableClose(
+        trade,
+        {
+          mark_price: currentPrice,
+          unrealized_pnl: execUnrealized,
+          size: trade.amount,
+        },
+        closeExecPrice
+      );
 
-      // 1A. Target TP check (respects user-dragged TP on chart, strictly enforces Zero-Loss Exchange Guard)
+      // 1A. Target TP check (serialized via withPositionLock so fast WS TP & cycle never double-close)
       if (trade.take_profit_abs > 0) {
         const isTpHit = trade.is_short
-          ? currentPrice <= trade.take_profit_abs
-          : currentPrice >= trade.take_profit_abs;
+          ? currentPrice <= trade.take_profit_abs || closeExecPrice <= trade.take_profit_abs
+          : currentPrice >= trade.take_profit_abs || closeExecPrice >= trade.take_profit_abs;
         if (isTpHit && closeProfitGuard.ok) {
-          const closeOrderRes = await dispatchOrderToExchangeAccount(ownerAcc, {
-            pair: trade.pair,
-            action: 'CLOSE',
-            isShort: trade.is_short,
-            quantity: trade.amount,
-            referencePrice: currentPrice,
-            leverage: trade.leverage || 25,
-          });
-          if (ownerAcc && !isSimulatedTestApiKey(ownerAcc.api_key_raw) && !closeOrderRes?.success) {
-            continue;
-          }
-
-          const actualClosePrice =
-            closeOrderRes?.success && closeOrderRes.price > 0
-              ? roundPrice(closeOrderRes.price)
-              : currentPrice;
-          const now =
-            closeOrderRes?.exchange_time && closeOrderRes.exchange_time > 0
-              ? closeOrderRes.exchange_time
-              : Date.now();
-          const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
-          sqliteDb.runInTransaction(() => {
-            trade.is_open = false;
-            trade.close_rate = actualClosePrice;
-            trade.current_rate = actualClosePrice;
-            trade.close_date = nowStr;
-            trade.close_timestamp = now;
-            if (closeOrderRes?.commission_usdt && closeOrderRes.commission_usdt > 0) {
-              trade.fee_close = Number(closeOrderRes.commission_usdt.toFixed(4));
+          let closedInCycle = false;
+          const lockKey = getPosLockKey(trade.account_id || 'master', trade.pair, trade.is_short);
+          await withPositionLock(lockKey, async () => {
+            if (!trade.is_open) {
+              closedInCycle = true;
+              return;
             }
-            if (typeof closeOrderRes?.realized_pnl_usdt === 'number') {
-              const totalFees = (trade.fee_open || 0) + (trade.fee_close || 0);
-              trade.exchange_realized_pnl = Number(
-                (closeOrderRes.realized_pnl_usdt - totalFees).toFixed(4)
-              );
-            }
-            trade.exit_reason = 'roi_target_tp';
-            trade.trade_state = 'CLOSED';
-            trade.planned_dca_levels = [];
-            recalculateTradeMetrics(trade, false);
-            sqliteDb.upsertTrade(trade);
-            sqliteDb.recordOrder({
-              trade_id: trade.trade_id,
-              pair: trade.pair,
-              order_type: 'market',
-              side: trade.is_short ? 'buy' : 'sell',
-              price: actualClosePrice,
-              amount: trade.amount,
-              cost: Number((actualClosePrice * trade.amount).toFixed(4)),
-              fee: trade.fee_close || 0,
-              realized_pnl: trade.net_profit || trade.profit_abs,
-              action_type: 'TAKE_PROFIT',
-              notes: `Target TP hit at ${actualClosePrice}, Net PnL: +${trade.profit_abs} USDT (Fee total: ${trade.fee_total} USDT)`,
-            });
-
-            // If this is leg 1 of a 4H Hedge Campaign, transfer banked profit to sibling leg
-            if (trade.campaign_id) {
-              const sibling = tradesStore.find(
-                (s) =>
-                  s.is_open &&
-                  (!s.account_id || s.account_id === 'master') &&
-                  s.campaign_id === trade.campaign_id &&
-                  s.trade_id !== trade.trade_id
-              );
-              if (sibling) {
-                sibling.campaign_banked_profit = trade.net_profit || trade.profit_abs;
-                sqliteDb.upsertTrade(sibling);
-                appendLog(
-                  'freqtrade.bot.hedge',
-                  'INFO',
-                  `🏦 Hedge Campaign ${trade.campaign_id}: закрыта нога ${trade.pair} (${trade.is_short ? 'SHORT' : 'LONG'}) в чистый плюс +${trade.profit_abs}$ (после комиссии ${trade.fee_total}$). Вторая нога выводится в плюс через Smart DCA.`
-                );
-              }
-            }
-
-            if (ownerAcc) {
-              const remMasterOpen = tradesStore.filter(
-                (t) => t.is_open && (!t.account_id || t.account_id === 'master')
-              );
-              ownerAcc.open_trades_count = remMasterOpen.length;
-              ownerAcc.used_margin_usdt = Number(remMasterOpen.reduce((s, t) => s + (t.stake_amount || 0), 0).toFixed(2));
-              ownerAcc.unrealized_pnl = Number(remMasterOpen.reduce((s, t) => s + (t.profit_abs || 0), 0).toFixed(4));
-            }
-          });
-
-          await closeClientCopiesForMasterTrade(trade, actualClosePrice, now, nowStr, 'roi_target_tp');
-          cooldownPairs.set(trade.pair, Date.now());
-          appendLog(
-            'freqtrade.bot.exit',
-            'INFO',
-            `🎯 Target TP Hit [${trade.pair}] #${trade.trade_id}: закрыто по реальной цене биржи ${actualClosePrice}$ | Чистый PnL: +${trade.profit_abs}$ (комиссия: ${trade.fee_total}$)`
-          );
-          continue;
-        } else if (
-          isTpHit &&
-          !closeProfitGuard.ok &&
-          trade.min_profitable_tp &&
-          !trade.tp_manual_override
-        ) {
-          // Сдвигаем автоматический TP к расширенному безопасному безубытку и обновляем на бирже
-          trade.take_profit_abs = trade.min_profitable_tp;
-          recalculateTradeMetrics(trade, false);
-          sqliteDb.upsertTrade(trade);
-          const ownerCreds = getAccountCredentialsFromStore(ownerAcc);
-          if (ownerCreds && !isSimulatedTestApiKey(ownerCreds.apiKey) && trade.take_profit_abs > 0) {
-            placeOrUpdateExchangeTakeProfitOrder(ownerCreds, {
-              pair: trade.pair,
-              isShort: trade.is_short,
-              quantity: trade.amount,
-              takeProfitPrice: trade.take_profit_abs,
-            }).catch(() => {});
-          }
-        }
-      }
-
-      // 1C. 4H Hedge Campaign Second Leg Check — СТРОГО БЕЗ ЗАКРЫТИЯ В МИНУС!
-      if (trade.campaign_banked_profit !== undefined && trade.campaign_banked_profit !== null) {
-        if (closeProfitGuard.ok && currentPrice && trade.min_profitable_tp) {
-          const reachedMinProfit = trade.is_short
-            ? currentPrice <= trade.min_profitable_tp
-            : currentPrice >= trade.min_profitable_tp;
-          if (reachedMinProfit) {
             const closeOrderRes = await dispatchOrderToExchangeAccount(ownerAcc, {
               pair: trade.pair,
               action: 'CLOSE',
               isShort: trade.is_short,
               quantity: trade.amount,
-              referencePrice: currentPrice,
+              referencePrice: closeExecPrice,
               leverage: trade.leverage || 25,
             });
             if (ownerAcc && !isSimulatedTestApiKey(ownerAcc.api_key_raw) && !closeOrderRes?.success) {
-              continue;
+              return;
             }
 
             const actualClosePrice =
               closeOrderRes?.success && closeOrderRes.price > 0
                 ? roundPrice(closeOrderRes.price)
-                : currentPrice;
+                : closeExecPrice;
             const now =
               closeOrderRes?.exchange_time && closeOrderRes.exchange_time > 0
                 ? closeOrderRes.exchange_time
@@ -3300,7 +3530,7 @@ async function runScalpBotCycle(waitForActive = false) {
                   (closeOrderRes.realized_pnl_usdt - totalFees).toFixed(4)
                 );
               }
-              trade.exit_reason = 'hedge_breakeven_profit';
+              trade.exit_reason = 'roi_target_tp';
               trade.trade_state = 'CLOSED';
               trade.planned_dca_levels = [];
               recalculateTradeMetrics(trade, false);
@@ -3315,9 +3545,29 @@ async function runScalpBotCycle(waitForActive = false) {
                 cost: Number((actualClosePrice * trade.amount).toFixed(4)),
                 fee: trade.fee_close || 0,
                 realized_pnl: trade.net_profit || trade.profit_abs,
-                action_type: 'HEDGE_PROFIT_EXIT',
-                notes: `2-я нога хеджа выведена в чистый плюс +${trade.profit_abs} USDT (комиссия: ${trade.fee_total} USDT)`,
+                action_type: 'TAKE_PROFIT',
+                notes: `Target TP hit at ${actualClosePrice}, Net PnL: +${trade.profit_abs} USDT (Fee total: ${trade.fee_total} USDT)`,
               });
+
+              if (trade.campaign_id) {
+                const sibling = tradesStore.find(
+                  (s) =>
+                    s.is_open &&
+                    (!s.account_id || s.account_id === 'master') &&
+                    s.campaign_id === trade.campaign_id &&
+                    s.trade_id !== trade.trade_id
+                );
+                if (sibling) {
+                  sibling.campaign_banked_profit = trade.net_profit || trade.profit_abs;
+                  sqliteDb.upsertTrade(sibling);
+                  appendLog(
+                    'freqtrade.bot.hedge',
+                    'INFO',
+                    `🏦 Hedge Campaign ${trade.campaign_id}: закрыта нога ${trade.pair} (${trade.is_short ? 'SHORT' : 'LONG'}) в чистый плюс +${trade.profit_abs}$ (после комиссии ${trade.fee_total}$). Вторая нога выводится в плюс через Smart DCA.`
+                  );
+                }
+              }
+
               if (ownerAcc) {
                 const remMasterOpen = tradesStore.filter(
                   (t) => t.is_open && (!t.account_id || t.account_id === 'master')
@@ -3327,13 +3577,127 @@ async function runScalpBotCycle(waitForActive = false) {
                 ownerAcc.unrealized_pnl = Number(remMasterOpen.reduce((s, t) => s + (t.profit_abs || 0), 0).toFixed(4));
               }
             });
-            await closeClientCopiesForMasterTrade(trade, actualClosePrice, now, nowStr, 'hedge_breakeven_profit');
+
+            await closeClientCopiesForMasterTrade(trade, actualClosePrice, now, nowStr, 'roi_target_tp');
+            cooldownPairs.set(trade.pair, Date.now());
             appendLog(
-              'freqtrade.bot.hedge',
+              'freqtrade.bot.exit',
               'INFO',
-              `⚖️ 2-я нога хеджа #${trade.trade_id} [${trade.pair}] выведена в чистый плюс по ${actualClosePrice}$ (+${trade.profit_abs}$ после комиссий ${trade.fee_total}$). Обе ноги кампании закрыты в плюс!`
+              `🎯 Target TP Hit [${trade.pair}] #${trade.trade_id}: закрыто по реальной цене биржи ${actualClosePrice}$ | Чистый PnL: +${trade.profit_abs}$ (комиссия: ${trade.fee_total}$)`
             );
-            continue;
+            broadcastTradeLifecycleEvent('trade:closed', trade);
+            closedInCycle = true;
+          });
+          if (closedInCycle) continue;
+        } else if (
+          isTpHit &&
+          !closeProfitGuard.ok &&
+          trade.min_profitable_tp &&
+          !trade.tp_manual_override
+        ) {
+          trade.take_profit_abs = trade.min_profitable_tp;
+          recalculateTradeMetrics(trade, false);
+          sqliteDb.upsertTrade(trade);
+          const ownerCreds = getAccountCredentialsFromStore(ownerAcc);
+          if (ownerCreds && !isSimulatedTestApiKey(ownerCreds.apiKey) && trade.take_profit_abs > 0) {
+            placeOrUpdateExchangeTakeProfitOrder(ownerCreds, {
+              pair: trade.pair,
+              isShort: trade.is_short,
+              quantity: trade.amount,
+              takeProfitPrice: trade.take_profit_abs,
+            }).catch(() => {});
+          }
+          broadcastTradeLifecycleEvent('trade:updated', trade);
+        }
+      }
+
+      // 1C. 4H Hedge Campaign Second Leg Check — СТРОГО БЕЗ ЗАКРЫТИЯ В МИНУС!
+      if (trade.campaign_banked_profit !== undefined && trade.campaign_banked_profit !== null) {
+        if (closeProfitGuard.ok && currentPrice && trade.min_profitable_tp) {
+          const reachedMinProfit = trade.is_short
+            ? currentPrice <= trade.min_profitable_tp && closeExecPrice <= trade.min_profitable_tp
+            : currentPrice >= trade.min_profitable_tp && closeExecPrice >= trade.min_profitable_tp;
+          if (reachedMinProfit) {
+            let closedHedgeInCycle = false;
+            const lockKey = getPosLockKey(trade.account_id || 'master', trade.pair, trade.is_short);
+            await withPositionLock(lockKey, async () => {
+              if (!trade.is_open) {
+                closedHedgeInCycle = true;
+                return;
+              }
+              const closeOrderRes = await dispatchOrderToExchangeAccount(ownerAcc, {
+                pair: trade.pair,
+                action: 'CLOSE',
+                isShort: trade.is_short,
+                quantity: trade.amount,
+                referencePrice: closeExecPrice,
+                leverage: trade.leverage || 25,
+              });
+              if (ownerAcc && !isSimulatedTestApiKey(ownerAcc.api_key_raw) && !closeOrderRes?.success) {
+                return;
+              }
+
+              const actualClosePrice =
+                closeOrderRes?.success && closeOrderRes.price > 0
+                  ? roundPrice(closeOrderRes.price)
+                  : closeExecPrice;
+              const now =
+                closeOrderRes?.exchange_time && closeOrderRes.exchange_time > 0
+                  ? closeOrderRes.exchange_time
+                  : Date.now();
+              const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
+              sqliteDb.runInTransaction(() => {
+                trade.is_open = false;
+                trade.close_rate = actualClosePrice;
+                trade.current_rate = actualClosePrice;
+                trade.close_date = nowStr;
+                trade.close_timestamp = now;
+                if (closeOrderRes?.commission_usdt && closeOrderRes.commission_usdt > 0) {
+                  trade.fee_close = Number(closeOrderRes.commission_usdt.toFixed(4));
+                }
+                if (typeof closeOrderRes?.realized_pnl_usdt === 'number') {
+                  const totalFees = (trade.fee_open || 0) + (trade.fee_close || 0);
+                  trade.exchange_realized_pnl = Number(
+                    (closeOrderRes.realized_pnl_usdt - totalFees).toFixed(4)
+                  );
+                }
+                trade.exit_reason = 'hedge_breakeven_profit';
+                trade.trade_state = 'CLOSED';
+                trade.planned_dca_levels = [];
+                recalculateTradeMetrics(trade, false);
+                sqliteDb.upsertTrade(trade);
+                sqliteDb.recordOrder({
+                  trade_id: trade.trade_id,
+                  pair: trade.pair,
+                  order_type: 'market',
+                  side: trade.is_short ? 'buy' : 'sell',
+                  price: actualClosePrice,
+                  amount: trade.amount,
+                  cost: Number((actualClosePrice * trade.amount).toFixed(4)),
+                  fee: trade.fee_close || 0,
+                  realized_pnl: trade.net_profit || trade.profit_abs,
+                  action_type: 'HEDGE_PROFIT_EXIT',
+                  notes: `2-я нога хеджа выведена в чистый плюс +${trade.profit_abs} USDT (комиссия: ${trade.fee_total} USDT)`,
+                });
+                if (ownerAcc) {
+                  const remMasterOpen = tradesStore.filter(
+                    (t) => t.is_open && (!t.account_id || t.account_id === 'master')
+                  );
+                  ownerAcc.open_trades_count = remMasterOpen.length;
+                  ownerAcc.used_margin_usdt = Number(remMasterOpen.reduce((s, t) => s + (t.stake_amount || 0), 0).toFixed(2));
+                  ownerAcc.unrealized_pnl = Number(remMasterOpen.reduce((s, t) => s + (t.profit_abs || 0), 0).toFixed(4));
+                }
+              });
+              await closeClientCopiesForMasterTrade(trade, actualClosePrice, now, nowStr, 'hedge_breakeven_profit');
+              appendLog(
+                'freqtrade.bot.hedge',
+                'INFO',
+                `⚖️ 2-я нога хеджа #${trade.trade_id} [${trade.pair}] выведена в чистый плюс по ${actualClosePrice}$ (+${trade.profit_abs}$ после комиссий ${trade.fee_total}$). Обе ноги кампании закрыты в плюс!`
+              );
+              broadcastTradeLifecycleEvent('trade:closed', trade);
+              closedHedgeInCycle = true;
+            });
+            if (closedHedgeInCycle) continue;
           }
         }
       }
@@ -3796,6 +4160,7 @@ async function runScalpBotCycle(waitForActive = false) {
                 'INFO',
                 `✅ Smart DCA #${nextStep} [${trade.pair}]: +${addAmount} монет @ ${actualDcaPrice}$ ($${addStake} маржи) | Новая средняя: ${newAvgOpenRate}$ (подтянута к цене на ${dynamicDca.pullDistancePct}%) | Безубыток (с комиссией): ${trade.breakeven_price}$ | Пост-DCA TP: ${trade.take_profit_abs}$ | След. DCA: ${trade.next_dca_price}$`
               );
+              broadcastTradeLifecycleEvent('trade:updated', trade);
             }
           }
         }
@@ -3809,76 +4174,85 @@ async function runScalpBotCycle(waitForActive = false) {
       (ct) => ct.is_open && ct.account_id && ct.account_id !== 'master' && ct.take_profit_abs > 0
     );
     for (const ct of independentClientTrades) {
-      const liveTicker = tickerCache.get(ct.pair);
-      const livePrice = liveTicker && liveTicker.price > 0 ? roundPrice(liveTicker.price) : ct.current_rate;
-      if (livePrice <= 0) continue;
-      ct.current_rate = livePrice;
+      refreshTradeLivePriceFromWs(ct);
       recalculateTradeMetrics(ct, false);
+      const execInfo = getFuturesExecutionPrice(ct.pair, ct.is_short, true, ct.exchange);
+      const livePrice =
+        execInfo && execInfo.markPrice > 0 ? roundPrice(execInfo.markPrice) : ct.current_rate;
+      const closeExecPrice =
+        execInfo && execInfo.executionPrice > 0 ? roundPrice(execInfo.executionPrice) : livePrice;
+      if (livePrice <= 0) continue;
+
       const isTpHit = ct.is_short
-        ? livePrice <= ct.take_profit_abs
-        : livePrice >= ct.take_profit_abs;
-      const clientGuard = verifySafeProfitableClose(ct, undefined, livePrice);
+        ? livePrice <= ct.take_profit_abs || closeExecPrice <= ct.take_profit_abs
+        : livePrice >= ct.take_profit_abs || closeExecPrice >= ct.take_profit_abs;
+      const clientGuard = verifySafeProfitableClose(ct, undefined, closeExecPrice);
       if (isTpHit && clientGuard.ok) {
-        const clientAcc = exchangeAccountsStore.find((a) => a.id === ct.account_id);
-        let clientCloseRes: PlacedOrderResult | null = null;
-        if (clientAcc) {
-          clientCloseRes = await dispatchOrderToExchangeAccount(clientAcc, {
-            pair: ct.pair,
-            action: 'CLOSE',
-            isShort: ct.is_short,
-            quantity: ct.amount,
-            referencePrice: livePrice,
-            leverage: ct.leverage || 25,
-          });
-          if (!isSimulatedTestApiKey(clientAcc.api_key_raw) && !clientCloseRes?.success) {
-            continue;
-          }
-        }
-        const actualClientClosePrice =
-          clientCloseRes?.success && clientCloseRes.price > 0
-            ? roundPrice(clientCloseRes.price)
-            : livePrice;
-        const now =
-          clientCloseRes?.exchange_time && clientCloseRes.exchange_time > 0
-            ? clientCloseRes.exchange_time
-            : Date.now();
-        const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
-        sqliteDb.runInTransaction(() => {
-          ct.is_open = false;
-          ct.close_rate = actualClientClosePrice;
-          ct.current_rate = actualClientClosePrice;
-          ct.close_date = nowStr;
-          ct.close_timestamp = now;
-          if (clientCloseRes?.commission_usdt && clientCloseRes.commission_usdt > 0) {
-            ct.fee_close = Number(clientCloseRes.commission_usdt.toFixed(4));
-          }
-          ct.exit_reason = 'client_roi_target_tp';
-          ct.trade_state = 'CLOSED';
-          ct.planned_dca_levels = [];
-          recalculateTradeMetrics(ct, false);
-          sqliteDb.upsertTrade(ct);
-          sqliteDb.recordOrder({
-            trade_id: ct.trade_id,
-            pair: ct.pair,
-            order_type: 'market',
-            side: ct.is_short ? 'buy' : 'sell',
-            price: actualClientClosePrice,
-            amount: ct.amount,
-            cost: Number((actualClientClosePrice * ct.amount).toFixed(4)),
-            fee: ct.fee_close || 0,
-            realized_pnl: ct.net_profit || ct.profit_abs,
-            action_type: 'CLIENT_TAKE_PROFIT',
-            notes: `Client Target TP hit at ${actualClientClosePrice}, Net PnL: +${ct.profit_abs}`,
-          });
+        const cLockKey = getPosLockKey(ct.account_id!, ct.pair, ct.is_short);
+        await withPositionLock(cLockKey, async () => {
+          if (!ct.is_open) return;
+          const clientAcc = exchangeAccountsStore.find((a) => a.id === ct.account_id);
+          let clientCloseRes: PlacedOrderResult | null = null;
           if (clientAcc) {
-            const netProfit = ct.net_profit || ct.profit_abs;
-            const { compoundedBalance } = getCompoundedAccountBalance(clientAcc.id);
-            appendLog(
-              'freqtrade.copytrading',
-              'INFO',
-              `🎯 Клиент «${clientAcc.name}»: закрыт TP по #${ct.trade_id} @ ${actualClientClosePrice}$ (+${netProfit}$ чистыми). Баланс: $${compoundedBalance}`
-            );
+            clientCloseRes = await dispatchOrderToExchangeAccount(clientAcc, {
+              pair: ct.pair,
+              action: 'CLOSE',
+              isShort: ct.is_short,
+              quantity: ct.amount,
+              referencePrice: closeExecPrice,
+              leverage: ct.leverage || 25,
+            });
+            if (!isSimulatedTestApiKey(clientAcc.api_key_raw) && !clientCloseRes?.success) {
+              return;
+            }
           }
+          const actualClientClosePrice =
+            clientCloseRes?.success && clientCloseRes.price > 0
+              ? roundPrice(clientCloseRes.price)
+              : closeExecPrice;
+          const now =
+            clientCloseRes?.exchange_time && clientCloseRes.exchange_time > 0
+              ? clientCloseRes.exchange_time
+              : Date.now();
+          const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
+          sqliteDb.runInTransaction(() => {
+            ct.is_open = false;
+            ct.close_rate = actualClientClosePrice;
+            ct.current_rate = actualClientClosePrice;
+            ct.close_date = nowStr;
+            ct.close_timestamp = now;
+            if (clientCloseRes?.commission_usdt && clientCloseRes.commission_usdt > 0) {
+              ct.fee_close = Number(clientCloseRes.commission_usdt.toFixed(4));
+            }
+            ct.exit_reason = 'client_roi_target_tp';
+            ct.trade_state = 'CLOSED';
+            ct.planned_dca_levels = [];
+            recalculateTradeMetrics(ct, false);
+            sqliteDb.upsertTrade(ct);
+            sqliteDb.recordOrder({
+              trade_id: ct.trade_id,
+              pair: ct.pair,
+              order_type: 'market',
+              side: ct.is_short ? 'buy' : 'sell',
+              price: actualClientClosePrice,
+              amount: ct.amount,
+              cost: Number((actualClientClosePrice * ct.amount).toFixed(4)),
+              fee: ct.fee_close || 0,
+              realized_pnl: ct.net_profit || ct.profit_abs,
+              action_type: 'CLIENT_TAKE_PROFIT',
+              notes: `Client Target TP hit at ${actualClientClosePrice}, Net PnL: +${ct.profit_abs}`,
+            });
+            if (clientAcc) {
+              const netProfit = ct.net_profit || ct.profit_abs;
+              const { compoundedBalance } = getCompoundedAccountBalance(clientAcc.id);
+              appendLog(
+                'freqtrade.copytrading',
+                'INFO',
+                `🎯 Клиент «${clientAcc.name}»: закрыт TP по #${ct.trade_id} @ ${actualClientClosePrice}$ (+${netProfit}$ чистыми). Баланс: $${compoundedBalance}`
+              );
+            }
+          });
+          broadcastTradeLifecycleEvent('trade:closed', ct);
         });
       }
     }
@@ -5007,6 +5381,7 @@ async function createScalpBotPosition(
               'INFO',
               `📋 Проанализирована и открыта позиция #${clientTradeId} для «${acc.name}» (${acc.exchange.toUpperCase()}): ${cleanPair} ${isShort ? 'SHORT' : 'LONG'} ${clientLev}x | Ставка 0.5%: $${clientStakeUsdt} (депозит $${clientDeposit}) | Объем: ${coinAmount} ($${notionalUsdt})`
             );
+            broadcastTradeLifecycleEvent('trade:opened', clientTrade);
           }
 
           if (syncedNames.length > 0) {
@@ -5027,6 +5402,8 @@ async function createScalpBotPosition(
       `🟢 Открыта позиция #${id} [${cleanPair}] ${isShort ? 'SHORT' : 'LONG'} ${leverage}x @ ${entryRate}$ | Маржа: ${stake}$ | TP (${tpHorizon}): ${newTrade.take_profit_abs}$ [${tpReason}] | Next DCA (${strongestDca.source}): ${nextDcaPrice}$ | Аккаунтов: ${activeAccounts.length}`
     );
 
+    subscribePairKlineStream(cleanPair, botConfig.timeframe || '1h');
+    broadcastTradeLifecycleEvent('trade:opened', newTrade);
     return newTrade;
   });
 
@@ -5601,16 +5978,7 @@ async function startServer() {
     const scopedTrades = filterTradesForScope(scope.accountId);
     for (const t of scopedTrades) {
       if (t.is_open) {
-        const hasFreshExchangeMark =
-          t.exchange_mark_price &&
-          t.exchange_synced_at &&
-          Date.now() - t.exchange_synced_at < 60_000;
-        if (!hasFreshExchangeMark) {
-          const liveTicker = tickerCache.get(t.pair);
-          if (liveTicker && liveTicker.price > 0) {
-            t.current_rate = liveTicker.price;
-          }
-        }
+        refreshTradeLivePriceFromWs(t);
         recalculateTradeMetrics(t);
       }
     }
@@ -5621,6 +5989,12 @@ async function startServer() {
     await initializeBotTrades();
     const scope = resolveRequestAccountScope(req);
     const scopedTrades = filterTradesForScope(scope.accountId);
+    for (const t of scopedTrades) {
+      if (t.is_open) {
+        refreshTradeLivePriceFromWs(t);
+        recalculateTradeMetrics(t);
+      }
+    }
     res.json(scopedTrades.filter((t) => t.is_open));
   });
 
@@ -5962,16 +6336,13 @@ async function startServer() {
 
     const { candles, source } = await fetchRealCandles(pair, timeframe, limit, endTime);
 
-    // Update current rate for open trades on this pair without overwriting live exchange mark_price
+    // Update current rate for open trades on this pair using live WS Futures Mark Price first
     if (!endTime && candles.length > 0) {
       const cLatest = candles[candles.length - 1];
       for (const t of tradesStore) {
         if (t.is_open && t.pair === pair && cLatest) {
-          const hasFreshExchangeMark =
-            t.exchange_mark_price &&
-            t.exchange_synced_at &&
-            Date.now() - t.exchange_synced_at < 60_000;
-          if (!hasFreshExchangeMark) {
+          const updatedFromWs = refreshTradeLivePriceFromWs(t);
+          if (!updatedFromWs && (!t.exchange_mark_price || !t.exchange_synced_at || Date.now() - t.exchange_synced_at >= 60_000)) {
             t.current_rate = cLatest.close;
           }
           recalculateTradeMetrics(t);
@@ -6006,6 +6377,7 @@ async function startServer() {
     botConfig.state = 'running';
     botConfig.pause_new_entries = false;
     appendLog('freqtrade.rpc.rpc', 'INFO', 'Changing state to: RUNNING (Новые входы разрешены)');
+    scheduleScopeStateSync();
     res.json({
       status: 'starting trader ...',
       state: botConfig.state,
@@ -6016,6 +6388,7 @@ async function startServer() {
   app.post('/api/v1/stop', (_req, res) => {
     botConfig.state = 'stopped';
     appendLog('freqtrade.rpc.rpc', 'WARNING', 'Changing state to: STOPPED');
+    scheduleScopeStateSync();
     res.json({
       status: 'stopping trader ...',
       state: botConfig.state,
@@ -6035,6 +6408,7 @@ async function startServer() {
         ? '⏸️ Владелец включил «Остановить открытие новых сделок»: бот прекратил новые входы, но продолжает усреднять (DCA) и закрывать в плюс текущие позиции.'
         : '▶️ Владелец отключил паузу новых входов: бот снова ищет точки входа по стратегиям ScalpingStrategy и GlobalHedgeStrategy.'
     );
+    scheduleScopeStateSync();
     res.json({
       status: botConfig.pause_new_entries ? 'paused new entries' : 'resumed new entries',
       state: botConfig.state,
@@ -6056,6 +6430,7 @@ async function startServer() {
         ? '⏸️ Владелец включил режим «Без новых сделок»: бот НЕ открывает новые позиции, продолжая вести, усреднять (DCA) и закрывать в плюс уже открытые сделки.'
         : '▶️ Владелец разрешил открытие новых сделок: сканер рынка и входы по стратегиям активны.'
     );
+    scheduleScopeStateSync();
     res.json({
       status: botConfig.pause_new_entries ? 'paused_new_entries' : 'active_entries',
       state: botConfig.state,
@@ -6066,6 +6441,7 @@ async function startServer() {
   app.post('/api/v1/reload_config', (_req, res) => {
     candleCache.clear();
     appendLog('freqtrade.rpc.rpc', 'INFO', 'Reloading config ...');
+    scheduleScopeStateSync();
     res.json({ status: 'Reloading config ...', state: botConfig.state });
   });
 
@@ -6568,6 +6944,9 @@ async function startServer() {
       `🔄 Усреднение #${nextStep} [${trade.pair}]: +${addStake}$ @ ${fillPrice}$. Средняя цена: ${prevOpenRate}$ ➔ ${newAvgOpenRate}$ | Безубыток (с комиссией 0.06%): ${trade.breakeven_price}$ | Новый TP: ${trade.take_profit_abs}$ | След. DCA: ${trade.next_dca_price}$`
     );
 
+    broadcastTradeLifecycleEvent('trade:updated', trade);
+    scheduleScopeStateSync();
+
     res.json({
       result: `Trade #${id} averaged (DCA ×${nextStep})`,
       previous_open_rate: prevOpenRate,
@@ -6742,6 +7121,8 @@ async function startServer() {
         }
       }
     });
+
+    broadcastTradeLifecycleEvent('trade:updated', trade);
 
     res.json({
       result: 'Level updated and synced with bot SQLite database',
@@ -7311,11 +7692,16 @@ async function startServer() {
 
       if (!isSimulatedTestApiKey(cleanKeyInput)) {
         await syncPositionsAndHistoryFromExchanges(existingAcc, true);
+        const existingCreds = getAccountCredentialsFromStore(existingAcc);
+        if (existingCreds) {
+          prewarmExchangeAccountCaches(existingCreds).catch(() => {});
+        }
       }
       botConfig.state = 'running';
       if (!isSimulatedTestApiKey(cleanKeyInput)) {
         runScalpBotCycle(false).catch(() => {});
       }
+      scheduleScopeStateSync();
 
       res.json({
         account: existingAcc,
@@ -7383,11 +7769,16 @@ async function startServer() {
 
     if (!isSimulatedTestApiKey(cleanKeyInput)) {
       await syncPositionsAndHistoryFromExchanges(newAcc, true);
+      const newCreds = getAccountCredentialsFromStore(newAcc);
+      if (newCreds) {
+        prewarmExchangeAccountCaches(newCreds).catch(() => {});
+      }
     }
     botConfig.state = 'running';
     if (!isSimulatedTestApiKey(cleanKeyInput)) {
       runScalpBotCycle(false).catch(() => {});
     }
+    scheduleScopeStateSync();
 
     res.json({
       account: newAcc,
@@ -7417,6 +7808,14 @@ async function startServer() {
     if (enabled !== undefined) {
       target.enabled = Boolean(enabled);
       target.status = target.enabled ? 'connected' : 'paused';
+      if (!target.enabled) {
+        if (target.api_key_raw) {
+          stopExchangePrivateStream(target.exchange, target.api_key_raw);
+        }
+      } else {
+        const tCreds = getAccountCredentialsFromStore(target);
+        if (tCreds) prewarmExchangeAccountCaches(tCreds).catch(() => {});
+      }
     }
     if (copy_trading !== undefined) target.copy_trading = Boolean(copy_trading);
     if (copy_multiplier !== undefined) {
@@ -7441,12 +7840,16 @@ async function startServer() {
       'INFO',
       `Обновлены параметры аккаунта ${target.name} (${target.exchange.toUpperCase()}): Активен=${target.enabled}, Копирование=${target.copy_trading} (×${target.copy_multiplier})`
     );
+    scheduleScopeStateSync();
     res.json({ account: target, accounts: exchangeAccountsStore });
   });
 
   app.delete('/api/v1/accounts/:id', (req, res) => {
     const id = String(req.params.id);
     const target = exchangeAccountsStore.find((a) => a.id === id);
+    if (target && target.api_key_raw) {
+      stopExchangePrivateStream(target.exchange, target.api_key_raw);
+    }
     exchangeAccountsStore = exchangeAccountsStore.filter((a) => a.id !== id);
     sqliteDb.deleteExchangeAccount(id);
     // Также удаляем открытые копии сделок удаленного клиентского аккаунта
@@ -7472,11 +7875,17 @@ async function startServer() {
         `Отключен и удален API-аккаунт: ${target.name} (${target.exchange.toUpperCase()})`
       );
     }
+    scheduleScopeStateSync();
     res.json({ removed_id: id, accounts: exchangeAccountsStore });
   });
 
   app.delete('/api/v1/accounts', (req, res) => {
     const explicitUserClear = req.query.confirm === 'true';
+    for (const acc of exchangeAccountsStore) {
+      if (acc.api_key_raw) {
+        stopExchangePrivateStream(acc.exchange, acc.api_key_raw);
+      }
+    }
     exchangeAccountsStore = [];
     sqliteDb.clearAllExchangeAccounts(explicitUserClear);
     botConfig.state = 'stopped';
@@ -7489,6 +7898,7 @@ async function startServer() {
       'WARNING',
       `База API-аккаунтов полностью очищена владельцем. Бот переведен в статус STOPPED.`
     );
+    scheduleScopeStateSync();
     res.json({ accounts: [] });
   });
 
@@ -7741,6 +8151,7 @@ async function startServer() {
         if (!t.account_id || t.account_id === 'master') {
           await closeClientCopiesForMasterTrade(t, t.close_rate || t.current_rate, now, nowStr, 'force_exit');
         }
+        broadcastTradeLifecycleEvent('trade:closed', t);
       }
       if (closedCount > 0) {
         const targetAcc = resolveExchangeAccountRecord(scope.accountId);
@@ -7751,6 +8162,7 @@ async function startServer() {
           targetAcc.unrealized_pnl = Number(remainingOpen.reduce((s, x) => s + (x.profit_abs || 0), 0).toFixed(4));
         }
         syncRealExchangeBalancesIfNeeded(true).catch(() => {});
+        scheduleScopeStateSync(scope.accountId);
       }
       if (closedCount === 0 && skippedNegativeCount > 0) {
         res.status(400).json({
@@ -7888,6 +8300,8 @@ async function startServer() {
       'INFO',
       `Закрыта сделка #${id} (${trade.pair}) @ ${trade.close_rate} $ | Чистый итог: +${trade.profit_abs} $ (комиссия: ${trade.fee_total}$)`
     );
+    broadcastTradeLifecycleEvent('trade:closed', trade);
+    scheduleScopeStateSync(targetAccId);
     res.json({ result: `Closed trade #${id}`, trade });
   });
 
@@ -7913,25 +8327,215 @@ async function startServer() {
     for (const remId of toRemoveIds) {
       sqliteDb.deleteTrade(remId);
     }
+    scheduleScopeStateSync();
     res.json({ result_msg: `Deleted trade #${id}`, deleted_ids: toRemoveIds });
   });
 
   app.get('/api/v1/ws_status', (_req, res) => {
     res.json({
       status: 'ok',
+      ui_ws_clients: getConnectedUiClientsCount(),
       websocket: getWebSocketEngineStatus(),
     });
   });
 
   const httpServer = http.createServer(app);
 
-  // Запускаем постоянные WebSocket-потоки бирж (Bybit V5 Linear WS + Binance Market WS + User Data Streams)
+  // Мгновенное закрытие/синхронизация позиции при срабатывании биржевого TP или ручного закрытия на бирже через приватный WS
+  const handleInstantExchangeCloseFromWs = async (params: {
+    exchange: 'binance' | 'bybit';
+    apiKey: string;
+    pair: string;
+    isShort: boolean;
+    closePrice?: number;
+    fee?: number;
+    realizedPnl?: number;
+    closedTime?: number;
+    orderId?: string;
+    qty?: number;
+    fromPositionZero: boolean;
+  }) => {
+    await initializeBotTrades();
+    const matchedAcc = exchangeAccountsStore.find(
+      (a) => a.enabled && sanitizeCredentialString(a.api_key_raw) === params.apiKey
+    );
+    if (!matchedAcc) return;
+
+    const masterOwnerAcc = resolveExchangeAccountRecord('master');
+    const isEffectiveMaster = Boolean(
+      matchedAcc.is_owner || (masterOwnerAcc && matchedAcc.id === masterOwnerAcc.id)
+    );
+    const targetAccountId = isEffectiveMaster ? 'master' : matchedAcc.id;
+
+    // Если это событие срабатывания ордера, убедимся что закрыта вся или >= 90% позиции
+    const preMatch = tradesStore.find(
+      (t) =>
+        t.is_open &&
+        (targetAccountId === 'master'
+          ? !t.account_id || t.account_id === 'master'
+          : t.account_id === targetAccountId) &&
+        t.pair === params.pair &&
+        t.is_short === params.isShort
+    );
+    if (!preMatch) return;
+    if (!params.fromPositionZero && params.qty && preMatch.amount > 0 && params.qty < preMatch.amount * 0.9) {
+      return;
+    }
+
+    const lockKey = getPosLockKey(targetAccountId, preMatch.pair, preMatch.is_short);
+    if (activePositionKeys.has(lockKey)) return;
+
+    await withPositionLock(lockKey, async () => {
+      const trade = tradesStore.find((t) => t.trade_id === preMatch.trade_id && t.is_open);
+      if (!trade) return;
+
+      const execInfo = getFuturesExecutionPrice(trade.pair, trade.is_short, true, trade.exchange);
+      let closePrice =
+        params.closePrice && params.closePrice > 0
+          ? roundPrice(params.closePrice)
+          : execInfo && execInfo.executionPrice > 0
+          ? roundPrice(execInfo.executionPrice)
+          : roundPrice(trade.take_profit_abs > 0 ? trade.take_profit_abs : trade.current_rate);
+      let closeTs = params.closedTime && params.closedTime > 0 ? params.closedTime : Date.now();
+      let closeFee = params.fee && params.fee > 0 ? Number(params.fee.toFixed(4)) : trade.fee_close || 0;
+      let realizedNetPnl: number | undefined;
+      let exOrderId = params.orderId || '';
+
+      if (typeof params.realizedPnl === 'number' && Number.isFinite(params.realizedPnl)) {
+        const totalFees = Number(((trade.fee_open || 0) + closeFee).toFixed(4));
+        realizedNetPnl = Number((params.realizedPnl - totalFees).toFixed(4));
+      } else {
+        const creds = getAccountCredentialsFromStore(matchedAcc);
+        if (creds && !isSimulatedTestApiKey(creds.apiKey)) {
+          const closedPnlRes = await fetchExchangeClosedPnl(creds, 10, [trade.pair], true).catch(() => ({
+            success: false,
+            closed: [],
+          }));
+          if (closedPnlRes.success && closedPnlRes.closed.length > 0) {
+            const matched = closedPnlRes.closed.find(
+              (c) =>
+                c.pair === trade.pair &&
+                (c.is_short === trade.is_short || c.order_id.startsWith('inc-')) &&
+                c.updated_time >= (trade.open_timestamp || 0) - 120_000
+            );
+            if (matched) {
+              if (matched.exit_price > 0) closePrice = roundPrice(matched.exit_price);
+              if (matched.updated_time > 0) closeTs = matched.updated_time;
+              if (matched.open_fee > 0) trade.fee_open = matched.open_fee;
+              if (matched.close_fee > 0) closeFee = matched.close_fee;
+              realizedNetPnl = matched.closed_pnl;
+              if (matched.order_id) exOrderId = matched.order_id;
+            }
+          }
+        }
+      }
+
+      const closeDateStr = new Date(closeTs).toISOString().replace('T', ' ').slice(0, 19);
+      sqliteDb.runInTransaction(() => {
+        trade.is_open = false;
+        trade.close_rate = closePrice;
+        trade.current_rate = closePrice;
+        trade.close_timestamp = closeTs;
+        trade.close_date = closeDateStr;
+        if (closeFee > 0) trade.fee_close = closeFee;
+        if (typeof realizedNetPnl === 'number') {
+          trade.exchange_realized_pnl = realizedNetPnl;
+        }
+        trade.exit_reason = 'exchange_ws_tp_sync';
+        trade.trade_state = 'CLOSED';
+        trade.planned_dca_levels = [];
+        if (exOrderId) {
+          trade.plan_notes = `Мгновенно закрыто на бирже ${matchedAcc.exchange.toUpperCase()} (OrderID: ${exOrderId})`;
+        }
+        recalculateTradeMetrics(trade, false);
+        sqliteDb.upsertTrade(trade);
+        sqliteDb.recordOrder({
+          trade_id: trade.trade_id,
+          pair: trade.pair,
+          order_type: 'market',
+          side: trade.is_short ? 'buy' : 'sell',
+          price: closePrice,
+          amount: trade.amount,
+          cost: Number((closePrice * trade.amount).toFixed(4)),
+          fee: trade.fee_close || 0,
+          realized_pnl: trade.net_profit || trade.profit_abs,
+          action_type: 'EXCHANGE_TP_WS_SYNC',
+          notes: `Instant WS exchange close sync @ ${closePrice}${exOrderId ? ` | OrderID: ${exOrderId}` : ''}`,
+        });
+
+        const remOpen = tradesStore.filter(
+          (x) =>
+            x.is_open &&
+            (targetAccountId === 'master'
+              ? !x.account_id || x.account_id === 'master'
+              : x.account_id === targetAccountId)
+        );
+        matchedAcc.open_trades_count = remOpen.length;
+        matchedAcc.used_margin_usdt = Number(
+          remOpen.reduce((s, x) => s + (x.stake_amount || 0), 0).toFixed(2)
+        );
+        matchedAcc.unrealized_pnl = Number(
+          remOpen.reduce((s, x) => s + (x.profit_abs || 0), 0).toFixed(4)
+        );
+      });
+
+      if (targetAccountId === 'master') {
+        await closeClientCopiesForMasterTrade(
+          trade,
+          closePrice,
+          closeTs,
+          closeDateStr,
+          'exchange_ws_tp_sync'
+        );
+      }
+
+      cooldownPairs.set(trade.pair, Date.now());
+      appendLog(
+        `freqtrade.exchange.${matchedAcc.exchange}`,
+        'INFO',
+        `⚡ [WS EXCHANGE CLOSE 1:1] Сделка #${trade.trade_id} [${trade.pair}] мгновенно синхронизирована после закрытия на бирже @ ${closePrice}$ | Чистый PnL: ${trade.profit_abs >= 0 ? '+' : ''}${trade.profit_abs}$ (Комиссия: ${trade.fee_total}$)`
+      );
+      broadcastTradeLifecycleEvent('trade:closed', trade);
+      scheduleScopeStateSync(targetAccountId);
+    });
+  };
+
+  onWsExchangeExecution((evt: WsOrderFillEvent) => {
+    if (!evt.isCloseFill) return;
+    void handleInstantExchangeCloseFromWs({
+      exchange: evt.exchange,
+      apiKey: evt.apiKey,
+      pair: evt.pair,
+      isShort: evt.isShort,
+      closePrice: evt.avgPrice,
+      fee: evt.fee,
+      realizedPnl: evt.realizedPnl,
+      closedTime: evt.tradeTime,
+      orderId: evt.orderId,
+      qty: evt.qty,
+      fromPositionZero: false,
+    });
+  });
+
+  onWsExchangePositionClosed((evt: WsPositionClosedEvent) => {
+    void handleInstantExchangeCloseFromWs({
+      exchange: evt.exchange,
+      apiKey: evt.apiKey,
+      pair: evt.pair,
+      isShort: evt.isShort,
+      closedTime: evt.closedTime,
+      fromPositionZero: true,
+    });
+  });
+
+  // Запускаем постоянные WebSocket-потоки бирж (Bybit V5 Linear WS + Binance USD-M Futures WS + User Data Streams)
   startPublicMarketWebSockets();
   for (const p of PINNED_PAIRS.slice(0, 6)) {
     subscribePairKlineStream(p, '1h');
     subscribePairKlineStream(p, '4h');
   }
   onWsAccountUpdate((wsState) => {
+    let targetScopeId: string | undefined;
     for (const acc of exchangeAccountsStore) {
       if (acc.enabled && sanitizeCredentialString(acc.api_key_raw) === wsState.apiKey) {
         acc.balance_usdt = Number(wsState.walletBalanceUsdt.toFixed(4));
@@ -7942,8 +8546,244 @@ async function startServer() {
         acc.used_margin_usdt = Number(wsState.usedMarginUsdt.toFixed(2));
         acc.open_trades_count = wsState.positions.length;
         acc.status = 'connected';
+        targetScopeId = acc.is_owner ? 'master' : acc.id;
       }
     }
+    if (targetScopeId) {
+      scheduleScopeStateSync(targetScopeId);
+    }
+  });
+
+  // Подключаем реальный WebSocket-хаб /ws/live для мгновенного push-обновления сайта (цены, свечи, PnL, закрытия, баланс)
+  attachLiveWebSocketHub(httpServer, {
+    resolveScopeFromAuth: ({ token, clientCode, accountId }) => {
+      const code = String(clientCode || '').trim().toUpperCase();
+      if (code) {
+        const byCode = exchangeAccountsStore.find(
+          (a) => a.client_access_code.toUpperCase() === code
+        );
+        if (byCode) {
+          return { accountId: byCode.id, isClient: !byCode.is_owner };
+        }
+      }
+      const reqAccId = String(accountId || '').trim();
+      if (reqAccId && reqAccId !== 'master') {
+        const byId = exchangeAccountsStore.find((a) => a.id === reqAccId);
+        if (byId) {
+          return { accountId: byId.id, isClient: !byId.is_owner };
+        }
+      }
+      if (token) {
+        const verified = sqliteDb.verifyAuthToken(token);
+        if (verified.valid && verified.role === 'client' && verified.accountId) {
+          return { accountId: verified.accountId, isClient: true };
+        }
+      }
+      return { accountId: 'master', isClient: false };
+    },
+    buildSnapshotForScope: async (accountId, isClient) => {
+      await initializeBotTrades();
+      const connected = hasConnectedExchangeAccount();
+      const scopeAccount =
+        accountId === 'master'
+          ? exchangeAccountsStore.find((a) => a.enabled && a.is_owner) ||
+            exchangeAccountsStore.find((a) => a.enabled)
+          : exchangeAccountsStore.find((a) => a.id === accountId);
+
+      const scopedTrades = filterTradesForScope(accountId);
+      for (const t of scopedTrades) {
+        if (t.is_open) {
+          refreshTradeLivePriceFromWs(t);
+          recalculateTradeMetrics(t, false);
+        }
+      }
+
+      const openTrades = scopedTrades.filter((t) => t.is_open);
+      const closedTrades = scopedTrades.filter((t) => !t.is_open);
+      const isRealAcc = Boolean(
+        scopeAccount?.api_key_raw && !isSimulatedTestApiKey(scopeAccount.api_key_raw)
+      );
+      const compounded = getCompoundedAccountBalance(accountId);
+      const baseDeposit =
+        compounded.baseDeposit > 0
+          ? compounded.baseDeposit
+          : Number(scopeAccount?.balance_usdt || 0);
+      const totalBalance = isRealAcc
+        ? Number(
+            (
+              scopeAccount?.wallet_balance_usdt ??
+              scopeAccount?.balance_usdt ??
+              compounded.compoundedBalance
+            ).toFixed(4)
+          )
+        : Number(compounded.compoundedBalance.toFixed(2));
+      const openProfitAbs =
+        isRealAcc && typeof scopeAccount?.unrealized_pnl === 'number' && openTrades.length > 0
+          ? Number(scopeAccount.unrealized_pnl.toFixed(4))
+          : Number(openTrades.reduce((acc, t) => acc + t.profit_abs, 0).toFixed(4));
+      const closedProfitAbs = Number(
+        closedTrades.reduce((acc, t) => acc + (t.net_profit ?? t.profit_abs ?? 0), 0).toFixed(4)
+      );
+      const allProfitAbs = Number((closedProfitAbs + openProfitAbs).toFixed(4));
+      const equityBalance = Number((totalBalance + openProfitAbs).toFixed(4));
+      const localUsedStake = Number(
+        openTrades.reduce((acc, t) => acc + t.stake_amount, 0).toFixed(2)
+      );
+      const usedStake =
+        isRealAcc &&
+        typeof scopeAccount?.used_margin_usdt === 'number' &&
+        Number.isFinite(scopeAccount.used_margin_usdt)
+          ? Number(scopeAccount.used_margin_usdt.toFixed(2))
+          : localUsedStake;
+      const freeBalance =
+        isRealAcc &&
+        typeof scopeAccount?.available_balance_usdt === 'number' &&
+        Number.isFinite(scopeAccount.available_balance_usdt)
+          ? Number(scopeAccount.available_balance_usdt.toFixed(2))
+          : Number(Math.max(0, totalBalance - usedStake).toFixed(2));
+
+      const wins = closedTrades.filter((t) => (t.net_profit ?? t.profit_abs) >= 0).length;
+      const losses = closedTrades.filter((t) => (t.net_profit ?? t.profit_abs) < 0).length;
+      const winrate =
+        closedTrades.length > 0 ? Number(((wins / closedTrades.length) * 100).toFixed(1)) : 0;
+
+      const masterOpen = tradesStore.filter(
+        (t) => t.is_open && (!t.account_id || t.account_id === 'master')
+      );
+      const accountsPayload = isClient
+        ? undefined
+        : exchangeAccountsStore.map((acc) => {
+            if (!acc.enabled) {
+              return {
+                ...acc,
+                open_trades_count: 0,
+                unrealized_pnl: 0,
+                used_margin_usdt: 0,
+                available_balance_usdt: Number(
+                  (acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2)
+                ),
+                status: 'paused' as const,
+              };
+            }
+            const accOpen = acc.is_owner
+              ? masterOpen
+              : tradesStore.filter((t) => t.is_open && t.account_id === acc.id);
+            const accOpenPnl = accOpen.reduce((sum, t) => sum + t.profit_abs, 0);
+            const accLocalUsed = Number(
+              accOpen.reduce((sum, t) => sum + t.stake_amount, 0).toFixed(2)
+            );
+            const liveUpl =
+              typeof acc.unrealized_pnl === 'number' &&
+              Number.isFinite(acc.unrealized_pnl) &&
+              acc.unrealized_pnl !== 0
+                ? acc.unrealized_pnl
+                : accOpenPnl;
+            const usedM =
+              typeof acc.used_margin_usdt === 'number' && Number.isFinite(acc.used_margin_usdt)
+                ? Number(acc.used_margin_usdt.toFixed(2))
+                : accLocalUsed;
+            const wBal = Number((acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2));
+            const aBal =
+              typeof acc.available_balance_usdt === 'number' &&
+              Number.isFinite(acc.available_balance_usdt)
+                ? Number(acc.available_balance_usdt.toFixed(2))
+                : Number(Math.max(0, wBal - usedM).toFixed(2));
+            return {
+              ...acc,
+              open_trades_count: accOpen.length,
+              unrealized_pnl: Number(liveUpl.toFixed(4)),
+              used_margin_usdt: usedM,
+              available_balance_usdt: aBal,
+              status: 'connected' as const,
+            };
+          });
+
+      return {
+        botConfig: {
+          ...botConfig,
+          state: connected ? botConfig.state : 'stopped',
+          starting_balance: connected ? Number(scopeAccount?.balance_usdt || 0) : 0,
+          exchange_connected: connected,
+          active_accounts_count: exchangeAccountsStore.filter((a) => a.enabled).length,
+          available_strategies: ['ScalpingStrategy', 'GlobalHedgeStrategy'],
+          available_timeframes: [
+            '1m',
+            '3m',
+            '5m',
+            '15m',
+            '30m',
+            '1h',
+            '2h',
+            '4h',
+            '6h',
+            '8h',
+            '12h',
+            '1d',
+            '1w',
+          ],
+        },
+        openTrades,
+        closedTrades,
+        balance: {
+          currencies: [
+            {
+              currency: 'USDT',
+              free: freeBalance,
+              used: usedStake,
+              balance: totalBalance,
+              est_stake: equityBalance,
+              stake: 'USDT',
+            },
+          ],
+          total: totalBalance,
+          wallet_balance: totalBalance,
+          unrealized_pnl: openProfitAbs,
+          equity: equityBalance,
+          equity_balance: equityBalance,
+          available_balance: freeBalance,
+          used_margin: usedStake,
+          symbol: 'USDT',
+          value: totalBalance,
+          starting_capital: baseDeposit,
+          starting_capital_ratio: 0,
+        },
+        profit: {
+          profit_closed_coin: closedProfitAbs,
+          profit_closed_percent:
+            baseDeposit > 0 ? Number(((closedProfitAbs / baseDeposit) * 100).toFixed(2)) : 0,
+          profit_closed_fiat: closedProfitAbs,
+          profit_all_coin: allProfitAbs,
+          profit_all_percent:
+            baseDeposit > 0 ? Number(((allProfitAbs / baseDeposit) * 100).toFixed(2)) : 0,
+          profit_all_fiat: allProfitAbs,
+          profit_open_coin: openProfitAbs,
+          profit_open_percent:
+            baseDeposit > 0 ? Number(((openProfitAbs / baseDeposit) * 100).toFixed(2)) : 0,
+          trade_count: scopedTrades.length,
+          closed_trade_count: closedTrades.length,
+          open_trade_count: openTrades.length,
+          winning_trades: wins,
+          losing_trades: losses,
+          winrate,
+          expectancy: 0,
+          max_drawdown: 0,
+          max_drawdown_abs: 0,
+          best_pair: closedTrades[0]?.pair || openTrades[0]?.pair || 'ETH/USDT:USDT',
+          best_rate: 0,
+          starting_balance: baseDeposit,
+          current_balance: totalBalance,
+          wallet_balance: totalBalance,
+          equity_balance: equityBalance,
+          unrealized_pnl: openProfitAbs,
+        },
+        logs: [...botLogs].slice(-80).reverse(),
+        accounts: accountsPayload,
+        timestamp: Date.now(),
+      };
+    },
+    onClientPairSubscribe: (pair, timeframe) => {
+      subscribePairKlineStream(pair, timeframe);
+    },
   });
 
   if (process.env.NODE_ENV !== 'production') {

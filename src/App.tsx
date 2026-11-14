@@ -132,6 +132,7 @@ export default function App() {
 
   // Подключённые API-аккаунты владельца и людей (Binance, Bybit, OKX, Bitget, BingX)
   const [accounts, setAccounts] = useState<ExchangeAccount[]>([]);
+  const [wsLiveConnected, setWsLiveConnected] = useState<boolean>(false);
 
   const [loadingChart, setLoadingChart] = useState<boolean>(false);
 
@@ -461,16 +462,390 @@ export default function App() {
     fetchCandlesRef.current = fetchCandles;
   }, [fetchCandles]);
 
+  const fetchPairBotLevelsRef = useRef(fetchPairBotLevels);
+  useEffect(() => {
+    fetchPairBotLevelsRef.current = fetchPairBotLevels;
+  }, [fetchPairBotLevels]);
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const wsLiveConnectedRef = useRef<boolean>(false);
+  wsLiveConnectedRef.current = wsLiveConnected;
+  const selectedPairRef = useRef<string>(selectedPair);
+  selectedPairRef.current = selectedPair;
+  const timeframeRef = useRef<string>(timeframe);
+  timeframeRef.current = timeframe;
+  const authTokenRef = useRef<string>(authToken);
+  authTokenRef.current = authToken;
+  const authClientCodeRef = useRef<string>(authState.client_code || '');
+  authClientCodeRef.current = authState.client_code || '';
+  const authRoleRef = useRef<'owner' | 'client'>(authState.role);
+  authRoleRef.current = authState.role;
+  const dynamicUpdateRef = useRef<boolean>(dynamicUpdate);
+  dynamicUpdateRef.current = dynamicUpdate;
+  const autoRefreshRef = useRef<boolean>(autoRefresh);
+  autoRefreshRef.current = autoRefresh;
+
+  // Real-time /ws/live WebSocket stream from server (Zero-delay Futures Mark/Orderbook, candles, trades, PnL)
+  useEffect(() => {
+    if (authState.loading || (authState.require_login && !authState.authenticated)) {
+      return;
+    }
+
+    let disposed = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let pingTimer: ReturnType<typeof setInterval> | null = null;
+    let backoffMs = 500;
+
+    const applySnapshotPayload = (snap: any, snapTs: number) => {
+      if (!snap || typeof snap !== 'object') return;
+      if (snap.botConfig) setBotConfig(snap.botConfig);
+      if (
+        Array.isArray(snap.openTrades) &&
+        pendingLevelMutationsRef.current === 0 &&
+        snapTs >= lastLevelMutationTsRef.current &&
+        Date.now() - lastLevelMutationTsRef.current >= 3000
+      ) {
+        setOpenTrades(snap.openTrades);
+      }
+      if (Array.isArray(snap.closedTrades)) setClosedTrades(snap.closedTrades);
+      if (snap.balance) setBalance(snap.balance);
+      if (snap.profit) setProfit(snap.profit);
+      if (Array.isArray(snap.daily)) setDaily(snap.daily);
+      if (Array.isArray(snap.logs)) setLogs(snap.logs);
+      if (authRoleRef.current === 'owner' && Array.isArray(snap.accounts)) {
+        setAccounts(snap.accounts);
+      }
+    };
+
+    const connectLiveWs = () => {
+      if (disposed) return;
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const qs = new URLSearchParams();
+      if (authTokenRef.current) qs.set('token', authTokenRef.current);
+      if (authClientCodeRef.current) qs.set('client', authClientCodeRef.current);
+      qs.set('pair', selectedPairRef.current);
+      qs.set('timeframe', timeframeRef.current);
+
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(`${proto}//${window.location.host}/ws/live?${qs.toString()}`);
+      } catch {
+        setWsLiveConnected(false);
+        reconnectTimer = setTimeout(connectLiveWs, backoffMs);
+        backoffMs = Math.min(5000, Math.round(backoffMs * 1.6));
+        return;
+      }
+
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (disposed) {
+          ws.close();
+          return;
+        }
+        backoffMs = 500;
+        setWsLiveConnected(true);
+        try {
+          ws.send(
+            JSON.stringify({
+              op: 'subscribe',
+              pair: selectedPairRef.current,
+              timeframe: timeframeRef.current,
+              token: authTokenRef.current,
+              client: authClientCodeRef.current,
+            })
+          );
+        } catch {
+          // ignore
+        }
+        if (pingTimer) clearInterval(pingTimer);
+        pingTimer = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.send(JSON.stringify({ op: 'ping' }));
+            } catch {
+              // ignore
+            }
+          }
+        }, 15000);
+      };
+
+      ws.onmessage = (ev) => {
+        if (disposed) return;
+        let msg: any;
+        try {
+          msg = JSON.parse(String(ev.data));
+        } catch {
+          return;
+        }
+        if (!msg || typeof msg.type !== 'string') return;
+
+        if (msg.type === 'snapshot' || msg.type === 'state:sync') {
+          const msgTs = Number(msg.ts || msg.data?.timestamp || Date.now());
+          applySnapshotPayload(msg.data, msgTs);
+          return;
+        }
+
+        if (msg.type === 'ticker:batch' && Array.isArray(msg.tickers) && msg.tickers.length > 0) {
+          if (!autoRefreshRef.current) return;
+
+          const byExAndPair = new Map<string, any>();
+          const byPairLatest = new Map<string, any>();
+          for (const tk of msg.tickers) {
+            if (!tk || !tk.pair) continue;
+            const exKey = `${String(tk.exchange || '').toLowerCase()}:${tk.pair}`;
+            byExAndPair.set(exKey, tk);
+            const prevTk = byPairLatest.get(tk.pair);
+            if (!prevTk || Number(tk.updatedAt || 0) >= Number(prevTk.updatedAt || 0)) {
+              byPairLatest.set(tk.pair, tk);
+            }
+          }
+
+          setWhitelist((prev) => {
+            if (!prev || !Array.isArray(prev.pair_metrics)) return prev;
+            let changed = false;
+            const nextMetrics = prev.pair_metrics.map((cur) => {
+              const tk = byPairLatest.get(cur.pair);
+              const livePx = Number(tk?.markPrice || tk?.price || 0);
+              if (!tk || livePx <= 0) return cur;
+              changed = true;
+              const has24hStats = typeof tk.volume24h === 'number' && tk.volume24h > 0;
+              return {
+                ...cur,
+                price: livePx,
+                change24h:
+                  has24hStats && typeof tk.change24h === 'number' ? tk.change24h : cur.change24h,
+                volume24h: has24hStats ? tk.volume24h : cur.volume24h,
+                high24h:
+                  has24hStats && typeof tk.high24h === 'number' && tk.high24h > 0
+                    ? tk.high24h
+                    : cur.high24h,
+                low24h:
+                  has24hStats && typeof tk.low24h === 'number' && tk.low24h > 0
+                    ? tk.low24h
+                    : cur.low24h,
+              };
+            });
+            return changed ? { ...prev, pair_metrics: nextMetrics } : prev;
+          });
+
+          setOpenTrades((prev) => {
+            if (!prev.length) return prev;
+            let anyChanged = false;
+            const updated = prev.map((t) => {
+              const trEx = String(t.exchange || '').toLowerCase();
+              const tk = (trEx ? byExAndPair.get(`${trEx}:${t.pair}`) : null) || byPairLatest.get(t.pair);
+              if (!tk) return t;
+              const liveMark = Number(tk.markPrice > 0 ? tk.markPrice : tk.price || 0);
+              if (!Number.isFinite(liveMark) || liveMark <= 0 || liveMark === t.current_rate) {
+                return t;
+              }
+              anyChanged = true;
+              const gross = (t.is_short ? t.open_rate - liveMark : liveMark - t.open_rate) * t.amount;
+              const fees = Number(t.fee_total || 0);
+              const net = gross - fees;
+              const stake = Math.max(1e-8, Number(t.stake_amount || 1));
+              const pct = (net / stake) * 100;
+              return {
+                ...t,
+                current_rate: liveMark,
+                profit_abs: Number(net.toFixed(3)),
+                net_profit: Number(net.toFixed(3)),
+                profit_pct: Number(pct.toFixed(2)),
+                net_profit_percent: Number(pct.toFixed(2)),
+                profit_ratio: Number((pct / 100).toFixed(4)),
+              };
+            });
+            return anyChanged ? updated : prev;
+          });
+
+          if (dynamicUpdateRef.current) {
+            const activeTick = byPairLatest.get(selectedPairRef.current);
+            const tickPx = Number(activeTick?.price || activeTick?.markPrice || 0);
+            if (tickPx > 0) {
+              setDataframe((prev) => {
+                if (!prev || prev.pair !== selectedPairRef.current || !prev.data.length) return prev;
+                const nextData = prev.data.slice();
+                const lastIdx = nextData.length - 1;
+                const row = nextData[lastIdx];
+                if (!Array.isArray(row)) return prev;
+                const updatedRow = row.slice();
+                const curHigh = Number(updatedRow[2] || tickPx);
+                const curLow = Number(updatedRow[3] || tickPx);
+                updatedRow[2] = Math.max(curHigh, tickPx);
+                updatedRow[3] = Math.min(curLow, tickPx);
+                updatedRow[4] = tickPx;
+                nextData[lastIdx] = updatedRow;
+                return { ...prev, data: nextData };
+              });
+            }
+          }
+          return;
+        }
+
+        if (msg.type === 'candle:tick' && msg.candle) {
+          if (!autoRefreshRef.current || !dynamicUpdateRef.current) return;
+          const c = msg.candle;
+          if (c.pair !== selectedPairRef.current || c.interval !== timeframeRef.current) return;
+          setDataframe((prev) => {
+            if (!prev || prev.pair !== c.pair || prev.timeframe !== c.interval || !prev.data.length) {
+              return prev;
+            }
+            const nextData = prev.data.slice();
+            const lastIdx = nextData.length - 1;
+            const lastRow = nextData[lastIdx];
+            const lastTs = Number(lastRow?.[0] || 0);
+            const newRow: (number | string | null)[] = [
+              c.timestamp,
+              c.open,
+              c.high,
+              c.low,
+              c.close,
+              c.volume,
+              lastRow?.[6] ?? null,
+              lastRow?.[7] ?? null,
+              lastRow?.[8] ?? null,
+              lastRow?.[9] ?? null,
+              lastRow?.[10] ?? null,
+              lastRow?.[11] ?? null,
+            ];
+            if (c.timestamp === lastTs) {
+              nextData[lastIdx] = newRow;
+            } else if (c.timestamp > lastTs) {
+              newRow[6] = null;
+              newRow[7] = null;
+              newRow[8] = null;
+              newRow[9] = null;
+              newRow[10] = null;
+              newRow[11] = null;
+              nextData.push(newRow);
+              if (nextData.length > 1005) nextData.shift();
+            } else {
+              return prev;
+            }
+            return { ...prev, data: nextData, length: nextData.length };
+          });
+          return;
+        }
+
+        if (msg.type === 'trade:opened' && msg.trade) {
+          const t: FreqtradeTrade = msg.trade;
+          if (t.is_open) {
+            setOpenTrades((prev) => {
+              const exists = prev.some((x) => x.trade_id === t.trade_id);
+              return exists
+                ? prev.map((x) => (x.trade_id === t.trade_id ? t : x))
+                : [t, ...prev];
+            });
+          }
+          return;
+        }
+
+        if (msg.type === 'trade:updated' && msg.trade) {
+          const t: FreqtradeTrade = msg.trade;
+          if (
+            pendingLevelMutationsRef.current === 0 &&
+            Date.now() - lastLevelMutationTsRef.current >= 3000
+          ) {
+            setOpenTrades((prev) => {
+              const exists = prev.some((x) => x.trade_id === t.trade_id);
+              if (!t.is_open) return prev.filter((x) => x.trade_id !== t.trade_id);
+              return exists
+                ? prev.map((x) => (x.trade_id === t.trade_id ? t : x))
+                : [t, ...prev];
+            });
+          }
+          return;
+        }
+
+        if (msg.type === 'trade:closed' && msg.trade) {
+          const t: FreqtradeTrade = msg.trade;
+          setOpenTrades((prev) => prev.filter((x) => x.trade_id !== t.trade_id));
+          setClosedTrades((prev) => {
+            const exists = prev.some((x) => x.trade_id === t.trade_id);
+            return exists
+              ? prev.map((x) => (x.trade_id === t.trade_id ? t : x))
+              : [t, ...prev];
+          });
+          const coin = String(t.pair || '').split('/')[0];
+          const net = Number(t.net_profit ?? t.profit_abs ?? 0);
+          const sign = net >= 0 ? '+' : '';
+          setStatusNotification(`${coin}: Close (${sign}${net.toFixed(2)}$) ➔ Закрытые`);
+        }
+      };
+
+      ws.onclose = () => {
+        if (pingTimer) {
+          clearInterval(pingTimer);
+          pingTimer = null;
+        }
+        if (wsRef.current === ws) wsRef.current = null;
+        setWsLiveConnected(false);
+        if (!disposed) {
+          reconnectTimer = setTimeout(connectLiveWs, backoffMs);
+          backoffMs = Math.min(5000, Math.round(backoffMs * 1.6));
+        }
+      };
+
+      ws.onerror = () => {
+        // onclose handles reconnect cleanly
+      };
+    };
+
+    connectLiveWs();
+
+    return () => {
+      disposed = true;
+      setWsLiveConnected(false);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (pingTimer) clearInterval(pingTimer);
+      if (wsRef.current) {
+        try {
+          wsRef.current.close();
+        } catch {
+          // ignore
+        }
+        wsRef.current = null;
+      }
+    };
+  }, [authState.loading, authState.require_login, authState.authenticated]);
+
+  // Notify live WS hub immediately when selected pair/timeframe or auth scope changes
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(
+          JSON.stringify({
+            op: 'subscribe',
+            pair: selectedPair,
+            timeframe,
+            token: authToken,
+            client: authState.client_code || '',
+          })
+        );
+      } catch {
+        // ignore
+      }
+    }
+  }, [selectedPair, timeframe, authToken, authState.client_code]);
+
+  // Initial state hydration + gentle 30s backup poll (WS /ws/live pushes real-time updates)
   useEffect(() => {
     if (authState.loading || (authState.require_login && !authState.authenticated)) return;
     fetchBotState();
     fetchAccounts();
     if (!autoRefresh) return;
     const interval = setInterval(() => {
-      fetchBotState();
-      fetchCandlesRef.current();
-      fetchAccounts();
-    }, 10000);
+      fetchPairBotLevelsRef.current();
+      if (!wsLiveConnectedRef.current) {
+        fetchBotState();
+        fetchCandlesRef.current();
+        fetchAccounts();
+      } else {
+        fetchBotState();
+      }
+    }, 30000);
     return () => clearInterval(interval);
   }, [authState.loading, authState.require_login, authState.authenticated, autoRefresh, fetchBotState, fetchAccounts]);
 
@@ -1276,7 +1651,12 @@ export default function App() {
           </button>
 
           {/* Зелёный индикатор онлайна */}
-          <span className="w-3 h-3 rounded-full bg-[#10b981] inline-block" title="Бот в сети" />
+          <span
+            className={`w-3 h-3 rounded-full inline-block ${
+              wsLiveConnected ? 'bg-[#10b981]' : 'bg-[#0ea5e9]'
+            }`}
+            title={wsLiveConnected ? 'Бот в сети · Live WebSocket' : 'Бот в сети · Резервный опрос'}
+          />
 
           {/* Чекбокс динамического обновления */}
           <button

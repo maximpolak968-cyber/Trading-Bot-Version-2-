@@ -2,6 +2,9 @@ import crypto from 'node:crypto';
 import https from 'node:https';
 import {
   getBinanceWsRpcClient,
+  getBybitWsTradeClient,
+  waitForWsOrderFill,
+  stopPrivateUserStream,
   getWsAccountLiveState,
   setWsAccountLiveState,
   ensureBinancePrivateUserStream,
@@ -1142,7 +1145,9 @@ export async function executeExchangeFuturesOrder(
 
     for (const baseUrl of candidateHosts) {
       try {
-        await ensureBinanceSymbolLeverage(cleanKey, cleanSecret, symbol, targetLeverage, baseUrl);
+        if (!isClose) {
+          await ensureBinanceSymbolLeverage(cleanKey, cleanSecret, symbol, targetLeverage, baseUrl);
+        }
         let formattedQtyStr = await formatBinanceFuturesQuantity(
           symbol,
           params.quantity,
@@ -1310,10 +1315,25 @@ export async function executeExchangeFuturesOrder(
           let realizedPnlUsdt: number | undefined;
           let exchangeTime = Number(data.updateTime || Date.now());
 
-          // Запрашиваем фактические сделки ордера из /fapi/v1/userTrades для точной цены, комиссии и realizedPnl
-          if (data.orderId && !isBinanceHostRateLimited(baseUrl).limited) {
+          // 1. Сначала мгновенно ждём отчёт исполнения из приватного WS (ORDER_TRADE_UPDATE, 0 REST-веса)
+          const wsFill = data.orderId
+            ? await waitForWsOrderFill('binance', cleanKey, orderIdStr, isClose ? 240 : 120)
+            : null;
+          if (wsFill && wsFill.avgPrice > 0 && wsFill.qty > 0) {
+            avgPrice = Number(wsFill.avgPrice.toPrecision(8));
+            executedQty = Number(wsFill.qty.toFixed(6));
+            if (wsFill.fee > 0) {
+              commissionUsdt = Number(wsFill.fee.toFixed(4));
+            }
+            if (typeof wsFill.realizedPnl === 'number') {
+              realizedPnlUsdt = Number(wsFill.realizedPnl.toFixed(4));
+            }
+            if (wsFill.tradeTime > 0) {
+              exchangeTime = wsFill.tradeTime;
+            }
+          } else if (data.orderId && !isBinanceHostRateLimited(baseUrl).limited) {
+            // 2. Если приватный WS ещё не доставил событие — точечный REST fallback /fapi/v1/userTrades
             try {
-              await new Promise((r) => setTimeout(r, 120));
               const tTs = await getBinanceTimestamp(false, baseUrl);
               const tQuery = `symbol=${symbol}&orderId=${encodeURIComponent(orderIdStr)}&timestamp=${tTs}&recvWindow=10000`;
               const tSig = signBinanceFuturesQuery(tQuery, cleanSecret);
@@ -1422,7 +1442,9 @@ export async function executeExchangeFuturesOrder(
 
     for (const baseUrl of candidateHosts) {
       try {
-        await ensureBybitSymbolLeverage(cleanKey, cleanSecret, symbol, targetLeverage, baseUrl);
+        if (!isClose) {
+          await ensureBybitSymbolLeverage(cleanKey, cleanSecret, symbol, targetLeverage, baseUrl);
+        }
         let formattedQtyStr = await formatBybitFuturesQuantity(
           symbol,
           params.quantity,
@@ -1431,6 +1453,7 @@ export async function executeExchangeFuturesOrder(
           baseUrl
         );
 
+        const bybitWsTrade = getBybitWsTradeClient(cleanKey, cleanSecret, baseUrl);
         const sendBybitOrder = async (
           positionIdx: 0 | 1 | 2,
           forceTimeSync = false,
@@ -1449,9 +1472,24 @@ export async function executeExchangeFuturesOrder(
           if (isClose) {
             bodyObj.reduceOnly = true;
           }
+
+          // 1. Отправка через постоянный Bybit V5 WebSocket Trade API (субсекундная задержка)
+          const wsTradeRes = await bybitWsTrade.placeOrder(timestamp, recvWindow, bodyObj, 3500);
+          if (wsTradeRes.status === 200) {
+            return {
+              statusCode: 200,
+              data: JSON.stringify({
+                retCode: wsTradeRes.retCode ?? 0,
+                retMsg: wsTradeRes.retMsg || 'OK',
+                result: wsTradeRes.result || {},
+              }),
+              latencyMs: wsTradeRes.latencyMs,
+            };
+          }
+
+          // 2. Прозрачный HTTPS REST fallback (если WS Trade недоступен на Demo/сети)
           const bodyStr = JSON.stringify(bodyObj);
           const signature = signBybitV5(timestamp, cleanKey, recvWindow, bodyStr, cleanSecret);
-
           return makeHttpsRequest(`${baseUrl}/v5/order/create`, {
             method: 'POST',
             headers: {
@@ -1582,10 +1620,24 @@ export async function executeExchangeFuturesOrder(
             );
             let actualExchangeTime = Date.now();
 
-            // Запрашиваем реальную цену исполнения (avgPrice), объём и комиссию напрямую из Bybit V5 API
-            if (json.result?.orderId) {
+            // 1. Сначала мгновенно ждём отчёт об исполнении из приватного Bybit WS (execution/order)
+            const wsFill = json.result?.orderId
+              ? await waitForWsOrderFill('bybit', cleanKey, orderId, 280)
+              : null;
+
+            if (wsFill && wsFill.avgPrice > 0 && wsFill.qty > 0) {
+              actualAvgPrice = wsFill.avgPrice;
+              actualExecQty = wsFill.qty;
+              if (wsFill.fee > 0) {
+                actualExecFee = wsFill.fee;
+              }
+              if (wsFill.tradeTime > 0) {
+                actualExchangeTime = wsFill.tradeTime;
+              }
+            } else if (json.result?.orderId) {
+              // 2. Fallback на REST API, если приватный WS не успел доставить событие
               try {
-                await new Promise((r) => setTimeout(r, 180));
+                await new Promise((r) => setTimeout(r, 120));
                 const qTs = await getBybitTimestamp(baseUrl, false);
                 const recvWindow = '10000';
                 const qStr = `category=linear&symbol=${symbol}&orderId=${encodeURIComponent(orderId)}`;
@@ -2269,7 +2321,7 @@ export async function testExchangeConnection(
               if (!(size > 0)) continue;
               const sym = String(p.symbol || '').toUpperCase();
               if (!isSupportedFuturesSymbol(sym)) continue;
-              const liveTick = getLiveWsTicker(sym);
+              const liveTick = getLiveWsTicker(sym, 'binance');
               const entryPrice = Number(
                 p.entryPrice || p.markPrice || p.breakEvenPrice || liveTick?.markPrice || liveTick?.price || 0
               );
@@ -2706,7 +2758,7 @@ export async function testExchangeConnection(
                     if (!(size > 0)) continue;
                     const sym = String(p.symbol || '').toUpperCase();
                     if (!isSupportedFuturesSymbol(sym)) continue;
-                    const liveTick = getLiveWsTicker(sym);
+                    const liveTick = getLiveWsTicker(sym, 'bybit');
                     const entryPrice = Number(
                       p.avgPrice || p.entryPrice || p.markPrice || liveTick?.markPrice || liveTick?.price || 0
                     );
@@ -3296,7 +3348,7 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
       Date.now() - liveBybitWs.lastRestBootstrapAt < 120_000
     ) {
       for (const pos of liveBybitWs.positions) {
-        const tick = getLiveWsTicker(pos.symbol);
+        const tick = getLiveWsTicker(pos.symbol, 'bybit');
         if (tick && tick.markPrice > 0) {
           pos.mark_price = tick.markPrice;
           const diff = pos.is_short
@@ -3357,7 +3409,7 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
               if (!(size > 0)) continue;
               const sym = String(p.symbol || '').toUpperCase();
               if (!isSupportedFuturesSymbol(sym)) continue;
-              const liveTick = getLiveWsTicker(sym);
+              const liveTick = getLiveWsTicker(sym, 'bybit');
               const entryPrice = Number(
                 p.avgPrice || p.entryPrice || p.markPrice || liveTick?.markPrice || liveTick?.price || 0
               );
@@ -3470,7 +3522,7 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
       Date.now() - liveWsState.lastRestBootstrapAt < 120_000
     ) {
       for (const pos of liveWsState.positions) {
-        const tick = getLiveWsTicker(pos.symbol);
+        const tick = getLiveWsTicker(pos.symbol, 'binance');
         if (tick && tick.markPrice > 0) {
           pos.mark_price = tick.markPrice;
           const diff = pos.is_short
@@ -3490,7 +3542,7 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
     const cachedPos = binancePositionsCache.get(cleanKey);
     if (cachedPos && Date.now() - cachedPos.timestamp < 75_000) {
       for (const pos of cachedPos.positions) {
-        const tick = getLiveWsTicker(pos.symbol);
+        const tick = getLiveWsTicker(pos.symbol, 'binance');
         if (tick && tick.markPrice > 0) {
           pos.mark_price = tick.markPrice;
           const diff = pos.is_short
@@ -3552,7 +3604,7 @@ export async function fetchExchangeOpenPositions(creds: ExchangeCredentials): Pr
             if (!(size > 0)) continue;
             const sym = String(p.symbol || '').toUpperCase();
             if (!isSupportedFuturesSymbol(sym)) continue;
-            const liveTick = getLiveWsTicker(sym);
+            const liveTick = getLiveWsTicker(sym, 'binance');
             const entryPrice = Number(
               p.entryPrice || p.markPrice || p.breakEvenPrice || liveTick?.markPrice || liveTick?.price || 0
             );
@@ -4703,6 +4755,44 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
     take_profit_price: Number(formattedTp),
   };
 }
+
+export function stopExchangePrivateStream(exchange: SupportedExchange, apiKey: string): void {
+  const cleanKey = sanitizeCredentialString(apiKey);
+  if (!cleanKey) return;
+  if (exchange === 'binance' || exchange === 'bybit') {
+    stopPrivateUserStream(exchange, cleanKey);
+  }
+}
+
+/**
+ * Прогревает кэши точности лотов, режима позиций (Hedge/One-Way), часового сдвига
+ * и приватный WebSocket-поток сразу при старте/добавлении аккаунта, чтобы закрытие срабатывало без задержки.
+ */
+export async function prewarmExchangeAccountCaches(creds: ExchangeCredentials): Promise<void> {
+  const cleanKey = sanitizeCredentialString(creds.apiKey);
+  const cleanSecret = sanitizeCredentialString(creds.apiSecret);
+  if (!cleanKey || !cleanSecret || isSimulatedTestApiKey(cleanKey)) return;
+
+  if (creds.exchange === 'binance') {
+    const baseUrl = getBinanceCandidateHosts(cleanKey, creds.isTestnet)[0];
+    await Promise.allSettled([
+      getBinanceTimestamp(false, baseUrl),
+      ensureBinanceExchangeInfo(baseUrl),
+      getBinanceDualSideMode(cleanKey, cleanSecret, false, baseUrl),
+      ensureBinancePrivateUserStream(cleanKey, cleanSecret, baseUrl),
+    ]);
+  } else if (creds.exchange === 'bybit') {
+    const baseUrl = getBybitCandidateHosts(cleanKey, creds.isTestnet)[0];
+    await Promise.allSettled([
+      getBybitTimestamp(baseUrl, false),
+      ensureBybitInstrumentsInfo(baseUrl),
+    ]);
+    ensureBybitPrivateUserStream(cleanKey, cleanSecret, baseUrl);
+    // Warm Bybit WS Trade connection proactively
+    getBybitWsTradeClient(cleanKey, cleanSecret, baseUrl);
+  }
+}
+
 
 
 
