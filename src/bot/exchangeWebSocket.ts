@@ -555,7 +555,7 @@ function connectBybitPublicWs(): void {
           const d = msg.data;
           if (!d) return;
           const sym = String(d.symbol || topic.slice(8)).toUpperCase();
-          if (!sym.endsWith('USDT')) return;
+          if (!isSupportedFuturesSymbol(sym)) return;
           const prev = wsTickersByExchangeAndSymbol.get(`bybit:${sym}`);
           const price = Number(d.lastPrice || prev?.price || 0);
           const markPrice = Number(d.markPrice || prev?.markPrice || price);
@@ -598,7 +598,7 @@ function connectBybitPublicWs(): void {
           const d = msg.data;
           if (!d) return;
           const sym = String(d.s || topic.slice('orderbook.1.'.length)).toUpperCase();
-          if (!sym.endsWith('USDT')) return;
+          if (!isSupportedFuturesSymbol(sym)) return;
           const prev = wsTickersByExchangeAndSymbol.get(`bybit:${sym}`);
           const bid = Array.isArray(d.b) && d.b[0] ? Number(d.b[0][0]) : prev?.bestBid || 0;
           const ask = Array.isArray(d.a) && d.a[0] ? Number(d.a[0][0]) : prev?.bestAsk || 0;
@@ -741,7 +741,7 @@ function connectBinancePublicWs(): void {
           for (const item of msg) {
             const ev = item?.e;
             const sym = String(item?.s || '').toUpperCase();
-            if (!sym.endsWith('USDT')) continue;
+            if (!isSupportedFuturesSymbol(sym)) continue;
 
             if (ev === 'markPriceUpdate') {
               const mark = Number(item.p || 0);
@@ -803,7 +803,7 @@ function connectBinancePublicWs(): void {
         // 2. Futures best bid/ask bookTicker event (sub-50ms)
         if ((msg.e === 'bookTicker' || (msg.u && msg.b && msg.a)) && msg.s) {
           const sym = String(msg.s).toUpperCase();
-          if (!sym.endsWith('USDT')) return;
+          if (!isSupportedFuturesSymbol(sym)) return;
           const bestBid = Number(msg.b || 0);
           const bestAsk = Number(msg.a || 0);
           if (!(bestBid > 0) && !(bestAsk > 0)) return;
@@ -896,7 +896,7 @@ export function subscribePairKlineStream(pair: string, interval = '1h'): void {
     startPublicMarketWebSockets();
   }
   const sym = pairToSymbol(pair);
-  if (!sym.endsWith('USDT')) return;
+  if (!isSupportedFuturesSymbol(sym)) return;
 
   // 1. Bybit ticker, orderbook.1 & kline subscription
   const tickerTopic = `tickers.${sym}`;

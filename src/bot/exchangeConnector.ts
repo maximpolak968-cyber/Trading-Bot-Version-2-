@@ -94,6 +94,7 @@ interface BybitSymbolFilterMeta {
   minOrderQty: number;
   maxMktOrderQty: number;
   minNotional: number;
+  tickSize: number;
 }
 
 let binanceTimeOffsetMs = 0;
@@ -506,10 +507,12 @@ async function ensureBybitInstrumentsInfo(
           const sym = String(item.symbol || '');
           if (!sym) continue;
           const lot = item.lotSizeFilter || {};
+          const pf = item.priceFilter || {};
           const qtyStep = Number(lot.qtyStep || 0.01);
           const minOrderQty = Number(lot.minOrderQty || qtyStep || 0.01);
           const maxMktOrderQty = Number(lot.maxMktOrderQty || lot.maxOrderQty || 1_000_000);
           const minNotional = Number(lot.minNotionalValue || 5);
+          const tickSize = Number(pf.tickSize || 0.0001);
           nextMap.set(sym, {
             symbol: sym,
             status: String(item.status || 'Trading'),
@@ -517,6 +520,7 @@ async function ensureBybitInstrumentsInfo(
             minOrderQty: minOrderQty > 0 ? minOrderQty : 0.01,
             maxMktOrderQty: maxMktOrderQty > 0 ? maxMktOrderQty : 1_000_000,
             minNotional: minNotional > 0 ? minNotional : 5,
+            tickSize: tickSize > 0 ? tickSize : 0.0001,
           });
         }
         if (nextMap.size > 0) {
@@ -4577,28 +4581,81 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
     };
   }
 
-  // Форматируем цену TP с разумной точностью для биржи
-  const formatTpPriceStr = (price: number): string => {
-    if (price >= 1000) return price.toFixed(2);
-    if (price >= 10) return price.toFixed(3);
-    if (price >= 1) return price.toFixed(4);
-    if (price >= 0.01) return price.toFixed(5);
-    return price.toFixed(6);
+  // Форматируем цену TP строго по биржевому шагу цены (tickSize / pricePrecision) конкретной пары
+  const formatTpPriceForHost = async (
+    exchange: SupportedExchange,
+    rawPrice: number,
+    baseUrl?: string
+  ): Promise<string> => {
+    let tickSize = 0;
+    let maxPrecision: number | undefined;
+
+    if (exchange === 'bybit') {
+      const host = baseUrl || 'https://api.bybit.com';
+      const hostMap = await ensureBybitInstrumentsInfo(host);
+      let meta = hostMap.get(symbol);
+      if (!meta && host !== 'https://api.bybit.com') {
+        const mainMap = await ensureBybitInstrumentsInfo('https://api.bybit.com');
+        meta = mainMap.get(symbol);
+      }
+      if (meta && meta.tickSize > 0) {
+        tickSize = meta.tickSize;
+      }
+    } else if (exchange === 'binance') {
+      const host = baseUrl || 'https://fapi.binance.com';
+      const hostMap = await ensureBinanceExchangeInfo(host);
+      let meta = hostMap.get(symbol);
+      if (!meta && host !== 'https://fapi.binance.com') {
+        const mainMap = await ensureBinanceExchangeInfo('https://fapi.binance.com');
+        meta = mainMap.get(symbol);
+      }
+      if (meta && meta.tickSize > 0) {
+        tickSize = meta.tickSize;
+        if (typeof meta.pricePrecision === 'number' && meta.pricePrecision >= 0) {
+          maxPrecision = meta.pricePrecision;
+        }
+      }
+    }
+
+    if (!(tickSize > 0)) {
+      if (rawPrice >= 10000) tickSize = 0.1;
+      else if (rawPrice >= 50) tickSize = 0.01;
+      else if (rawPrice >= 1) tickSize = 0.001;
+      else if (rawPrice >= 0.1) tickSize = 0.0001;
+      else if (rawPrice >= 0.005) tickSize = 0.00001;
+      else tickSize = 0.000001;
+    }
+
+    const tickDecimals = countStepDecimals(tickSize);
+    const decimals =
+      maxPrecision !== undefined ? Math.min(tickDecimals, maxPrecision) : tickDecimals;
+    const effectiveTick = decimals < tickDecimals ? Math.pow(10, -decimals) : tickSize;
+    const steps = params.isShort
+      ? Math.floor((rawPrice + 1e-12) / effectiveTick)
+      : Math.ceil((rawPrice - 1e-12) / effectiveTick);
+    const aligned = Math.max(effectiveTick, steps * effectiveTick);
+    return aligned.toFixed(decimals);
   };
-  const formattedTp = formatTpPriceStr(tpNum);
+
+  let formattedTp = await formatTpPriceForHost(creds.exchange, tpNum);
 
   // 1. BYBIT V5 (/v5/position/trading-stop)
   if (creds.exchange === 'bybit') {
     const candidateHosts = getBybitCandidateHosts(cleanKey, creds.isTestnet);
     for (const baseUrl of candidateHosts) {
       try {
-        const sendBybitTradingStop = async (positionIdx: 0 | 1 | 2) => {
-          const timestamp = await getBybitTimestamp(baseUrl, false);
+        formattedTp = await formatTpPriceForHost('bybit', tpNum, baseUrl);
+        const sendBybitTradingStop = async (
+          positionIdx: 0 | 1 | 2,
+          tpPriceStr = formattedTp,
+          forceTimeSync = false
+        ) => {
+          const timestamp = await getBybitTimestamp(baseUrl, forceTimeSync);
           const recvWindow = '15000';
           const bodyObj = {
             category: 'linear',
             symbol,
-            takeProfit: formattedTp,
+            takeProfit: tpPriceStr,
             tpTriggerBy: 'MarkPrice',
             tpslMode: 'Full',
             tpOrderType: 'Market',
@@ -4620,15 +4677,43 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
           });
         };
 
-        let res = await sendBybitTradingStop(0);
+        const cachedHedge = bybitHedgeModeCache.get(cleanKey) === true;
+        let activePosIdx: 0 | 1 | 2 = cachedHedge ? (params.isShort ? 2 : 1) : 0;
+        let res = await sendBybitTradingStop(activePosIdx, formattedTp, false);
         if (res.statusCode === 200) {
           let json = JSON.parse(res.data);
-          // Если аккаунт Bybit в Hedge Mode (retCode 10001: positionIdx not match position mode)
-          if (json.retCode === 10001) {
-            const hedgeIdx: 1 | 2 = params.isShort ? 2 : 1;
-            const retryRes = await sendBybitTradingStop(hedgeIdx);
+          if (json.retCode === 10002) {
+            res = await sendBybitTradingStop(activePosIdx, formattedTp, true);
+            if (res.statusCode === 200) {
+              json = JSON.parse(res.data);
+            }
+          }
+          // Если аккаунт Bybit в Hedge Mode или наоборот One-Way Mode (retCode 10001: positionIdx not match position mode)
+          if (
+            json.retCode === 10001 &&
+            String(json.retMsg || '')
+              .toLowerCase()
+              .includes('position')
+          ) {
+            if (activePosIdx === 0) {
+              activePosIdx = params.isShort ? 2 : 1;
+              bybitHedgeModeCache.set(cleanKey, true);
+            } else {
+              activePosIdx = 0;
+              bybitHedgeModeCache.set(cleanKey, false);
+            }
+            const retryRes = await sendBybitTradingStop(activePosIdx, formattedTp, false);
             if (retryRes.statusCode === 200) {
               json = JSON.parse(retryRes.data);
+            }
+          }
+          // Если ошибка шага цены tickSize — обновляем справочник инструментов Bybit и повторяем
+          if (json.retCode === 10001) {
+            await ensureBybitInstrumentsInfo(baseUrl, true);
+            formattedTp = await formatTpPriceForHost('bybit', tpNum, baseUrl);
+            const retryTickRes = await sendBybitTradingStop(activePosIdx, formattedTp, false);
+            if (retryTickRes.statusCode === 200) {
+              json = JSON.parse(retryTickRes.data);
             }
           }
           // retCode 0 = успех, retCode 34040 = "not modified" (уже стоит такой же TP)
@@ -4642,7 +4727,7 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
               message: `Bybit TP установлен: ${formattedTp}`,
             };
           }
-          if (json.retCode === 10003 || json.retCode === 10004) {
+          if (json.retCode === 10003 || json.retCode === 10004 || json.retCode === 33004) {
             continue;
           }
           return {
@@ -4665,12 +4750,13 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
     };
   }
 
-  // 2. BINANCE USDⓈ-M FUTURES (WebSocket API ws-fapi order.place TAKE_PROFIT_MARKET + REST fallback)
+  // 2. BINANCE USDⓈ-M FUTURES (WebSocket API ws-fapi order.place TAKE_PROFIT_MARKET + REST & AlgoOrder fallback)
   if (creds.exchange === 'binance') {
     const candidateHosts = getBinanceCandidateHosts(cleanKey, creds.isTestnet);
     for (const baseUrl of candidateHosts) {
       try {
-        const dualSide = await getBinanceDualSideMode(cleanKey, cleanSecret, false, baseUrl);
+        formattedTp = await formatTpPriceForHost('binance', tpNum, baseUrl);
+        let dualSide = await getBinanceDualSideMode(cleanKey, cleanSecret, false, baseUrl);
         const side = params.isShort ? 'BUY' : 'SELL';
         const targetPosSide = params.isShort ? 'SHORT' : 'LONG';
 
@@ -4729,25 +4815,40 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
           // best-effort cancel before placing updated TP
         }
 
-        const timestamp = await getBinanceTimestamp(false, baseUrl);
-
-        // Сначала выставляем TAKE_PROFIT_MARKET через WebSocket API (ws-fapi/v1) без лимитов веса!
         const wsRpc = getBinanceWsRpcClient(baseUrl);
-        const wsTpParams: Record<string, string | number> = {
-          apiKey: cleanKey,
-          symbol,
-          side,
-          type: 'TAKE_PROFIT_MARKET',
-          stopPrice: formattedTp,
-          closePosition: 'true',
-          workingType: 'MARK_PRICE',
-          timestamp,
-          recvWindow: 10000,
+        const tryWsTpOrder = async (useDual: boolean, stopPriceStr: string) => {
+          const ts = await getBinanceTimestamp(false, baseUrl);
+          const wsTpParams: Record<string, string | number> = {
+            apiKey: cleanKey,
+            symbol,
+            side,
+            type: 'TAKE_PROFIT_MARKET',
+            stopPrice: stopPriceStr,
+            closePosition: 'true',
+            workingType: 'MARK_PRICE',
+            timestamp: ts,
+            recvWindow: 10000,
+          };
+          if (useDual) {
+            wsTpParams.positionSide = targetPosSide;
+          }
+          return wsRpc.request('order.place', wsTpParams, cleanSecret, 5500);
         };
-        if (dualSide) {
-          wsTpParams.positionSide = targetPosSide;
+
+        let wsTpRes = await tryWsTpOrder(dualSide, formattedTp);
+        if (wsTpRes.status !== 200 && wsTpRes.error?.code === -4061) {
+          dualSide = !dualSide;
+          binanceDualSideCache.set(cleanKey, { dualSide, updatedAt: Date.now() });
+          wsTpRes = await tryWsTpOrder(dualSide, formattedTp);
         }
-        const wsTpRes = await wsRpc.request('order.place', wsTpParams, cleanSecret, 5500);
+        if (
+          wsTpRes.status !== 200 &&
+          (wsTpRes.error?.code === -1111 || wsTpRes.error?.code === -4014)
+        ) {
+          await ensureBinanceExchangeInfo(baseUrl, true);
+          formattedTp = await formatTpPriceForHost('binance', tpNum, baseUrl);
+          wsTpRes = await tryWsTpOrder(dualSide, formattedTp);
+        }
         if (wsTpRes.status === 200) {
           binanceHostCache.set(cleanKey, baseUrl);
           return {
@@ -4760,29 +4861,76 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
         }
 
         if (isBinanceHostRateLimited(baseUrl).limited) continue;
-        const qp = new URLSearchParams({
-          symbol,
-          side,
-          type: 'TAKE_PROFIT_MARKET',
-          stopPrice: formattedTp,
-          closePosition: 'true',
-          workingType: 'MARK_PRICE',
-          timestamp: String(timestamp),
-          recvWindow: '10000',
-        });
-        if (dualSide) {
-          qp.set('positionSide', targetPosSide);
+
+        const sendRestTpOrder = async (useDual: boolean, stopPriceStr: string) => {
+          const ts = await getBinanceTimestamp(false, baseUrl);
+          const qp = new URLSearchParams({
+            symbol,
+            side,
+            type: 'TAKE_PROFIT_MARKET',
+            stopPrice: stopPriceStr,
+            closePosition: 'true',
+            workingType: 'MARK_PRICE',
+            timestamp: String(ts),
+            recvWindow: '10000',
+          });
+          if (useDual) {
+            qp.set('positionSide', targetPosSide);
+          }
+          const query = qp.toString();
+          const sig = signBinanceFuturesQuery(query, cleanSecret);
+          return makeHttpsRequest(`${baseUrl}/fapi/v1/order?${query}&signature=${sig}`, {
+            method: 'POST',
+            headers: {
+              'X-MBX-APIKEY': cleanKey,
+              'Content-Type': 'application/json',
+            },
+            timeoutMs: 6000,
+          });
+        };
+
+        let res = await sendRestTpOrder(dualSide, formattedTp);
+        if (res.statusCode !== 200 && res.data.includes('-4061')) {
+          dualSide = !dualSide;
+          binanceDualSideCache.set(cleanKey, { dualSide, updatedAt: Date.now() });
+          res = await sendRestTpOrder(dualSide, formattedTp);
         }
-        const query = qp.toString();
-        const sig = signBinanceFuturesQuery(query, cleanSecret);
-        const res = await makeHttpsRequest(`${baseUrl}/fapi/v1/order?${query}&signature=${sig}`, {
-          method: 'POST',
-          headers: {
-            'X-MBX-APIKEY': cleanKey,
-            'Content-Type': 'application/json',
-          },
-          timeoutMs: 6000,
-        });
+        if (res.statusCode !== 200 && (res.data.includes('-1111') || res.data.includes('-4014'))) {
+          await ensureBinanceExchangeInfo(baseUrl, true);
+          formattedTp = await formatTpPriceForHost('binance', tpNum, baseUrl);
+          res = await sendRestTpOrder(dualSide, formattedTp);
+        }
+        // Если Binance требует Algo Order API (-4120) для условного TAKE_PROFIT_MARKET
+        if (res.statusCode !== 200 && res.data.includes('-4120')) {
+          const algoTs = await getBinanceTimestamp(false, baseUrl);
+          const algoQp = new URLSearchParams({
+            algoType: 'CONDITIONAL',
+            symbol,
+            side,
+            type: 'TAKE_PROFIT_MARKET',
+            triggerPrice: formattedTp,
+            closePosition: 'true',
+            workingType: 'MARK_PRICE',
+            timestamp: String(algoTs),
+            recvWindow: '10000',
+          });
+          if (dualSide) {
+            algoQp.set('positionSide', targetPosSide);
+          }
+          const algoQuery = algoQp.toString();
+          const algoSig = signBinanceFuturesQuery(algoQuery, cleanSecret);
+          res = await makeHttpsRequest(
+            `${baseUrl}/fapi/v1/algoOrder?${algoQuery}&signature=${algoSig}`,
+            {
+              method: 'POST',
+              headers: {
+                'X-MBX-APIKEY': cleanKey,
+                'Content-Type': 'application/json',
+              },
+              timeoutMs: 6000,
+            }
+          );
+        }
         if (res.statusCode === 200) {
           binanceHostCache.set(cleanKey, baseUrl);
           return {

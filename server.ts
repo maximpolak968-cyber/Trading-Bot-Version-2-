@@ -387,15 +387,18 @@ function evaluateFastWsTpExit(wsTick: LiveWsTicker): void {
 
     const mark = execInfo.markPrice;
     const execPrice = execInfo.executionPrice;
-    const minSafeTp = t.min_profitable_tp || t.breakeven_price || t.open_rate;
+    const minSafeTp =
+      t.tp_manual_override && t.take_profit_abs > 0
+        ? t.take_profit_abs
+        : t.min_profitable_tp || t.breakeven_price || t.open_rate;
 
     if (t.take_profit_abs > 0) {
       const hitTp = t.is_short
         ? mark <= t.take_profit_abs || execPrice <= t.take_profit_abs
         : mark >= t.take_profit_abs || execPrice >= t.take_profit_abs;
       const clearedSafeTp = t.is_short
-        ? mark <= minSafeTp && execPrice <= minSafeTp
-        : mark >= minSafeTp && execPrice >= minSafeTp;
+        ? mark <= minSafeTp || execPrice <= minSafeTp
+        : mark >= minSafeTp || execPrice >= minSafeTp;
       if (hitTp && clearedSafeTp) {
         void processFastWsTradeClose(t.trade_id, execInfo, 'roi_target_tp');
         continue;
@@ -1439,12 +1442,30 @@ function verifySafeProfitableClose(
 ): { ok: boolean; reason: string; slippageReserveUsdt: number; totalFees: number } {
   const feeRate = getExchangeTakerFeeRate(trade.exchange || 'bybit');
   const refPrice = liveMarketPrice > 0 ? liveMarketPrice : trade.current_rate;
-  const estClosingFee = refPrice * (trade.amount || 0) * feeRate;
+  const markPrice = liveExPos?.mark_price || trade.exchange_mark_price || refPrice;
+  const qty = Math.max(0, trade.amount || 0);
+  const notionalUsdt = refPrice * qty;
+  const estClosingFee = notionalUsdt * feeRate;
   const totalFees = Number(((trade.fee_open || 0) + estClosingFee).toFixed(4));
-  const slippageReserveUsdt = Number(Math.max(0.15, refPrice * (trade.amount || 0) * 0.0012).toFixed(4));
-  const minSafeTp = trade.min_profitable_tp || trade.breakeven_price || trade.open_rate;
+  // Пропорциональный резерв проскальзывания (0.12% от объёма позиции) без завышенного порога $0.15, блокировавшего малые ордера
+  const slippageReserveUsdt = Number(Math.max(0.005, notionalUsdt * 0.0012).toFixed(4));
 
-  const marketPastSafeTp = trade.is_short ? refPrice <= minSafeTp : refPrice >= minSafeTp;
+  // Если пользователь вручную выставил TP (tp_manual_override), разрешаем закрытие при достижении этого TP
+  if (trade.tp_manual_override && trade.take_profit_abs > 0) {
+    const hitManualTp = trade.is_short
+      ? refPrice <= trade.take_profit_abs || markPrice <= trade.take_profit_abs
+      : refPrice >= trade.take_profit_abs || markPrice >= trade.take_profit_abs;
+    if (hitManualTp) {
+      return { ok: true, reason: 'manual_tp_override', slippageReserveUsdt, totalFees };
+    }
+  }
+
+  const minSafeTp = trade.min_profitable_tp || trade.breakeven_price || trade.open_rate;
+  // Допускаем спред стакана в пределах 0.08% вокруг minSafeTp, если Mark-цена или цена исполнения уже пробила целевой TP
+  const spreadTolerance = minSafeTp * 0.0008;
+  const marketPastSafeTp = trade.is_short
+    ? refPrice <= minSafeTp + spreadTolerance
+    : refPrice >= minSafeTp - spreadTolerance;
   if (!marketPastSafeTp) {
     return {
       ok: false,
@@ -1454,9 +1475,10 @@ function verifySafeProfitableClose(
     };
   }
 
-  const markPrice = liveExPos?.mark_price || trade.exchange_mark_price || 0;
   if (markPrice > 0) {
-    const markPastSafeTp = trade.is_short ? markPrice <= minSafeTp : markPrice >= minSafeTp;
+    const markPastSafeTp = trade.is_short
+      ? markPrice <= minSafeTp + spreadTolerance
+      : markPrice >= minSafeTp - spreadTolerance;
     if (!markPastSafeTp) {
       return {
         ok: false,
@@ -1467,32 +1489,58 @@ function verifySafeProfitableClose(
     }
   }
 
+  // Считаем фактический валовой и чистый PnL по актуальной цене закрытия refPrice / markPrice,
+  // чтобы устаревший REST-кэш exchange_unrealized_pnl не блокировал закрытие на импульсном пробое TP
+  const bestCheckPrice =
+    markPrice > 0
+      ? trade.is_short
+        ? Math.max(refPrice, markPrice)
+        : Math.min(refPrice, markPrice)
+      : refPrice;
+  const computedGrossAtRef =
+    trade.open_rate > 0 && qty > 0
+      ? Number(
+          (
+            (trade.is_short ? trade.open_rate - bestCheckPrice : bestCheckPrice - trade.open_rate) *
+            qty
+          ).toFixed(4)
+        )
+      : undefined;
+  const computedNetAtRef =
+    computedGrossAtRef !== undefined
+      ? Number((computedGrossAtRef - totalFees).toFixed(4))
+      : undefined;
+
   const freshExUnrealized =
     liveExPos && typeof liveExPos.unrealized_pnl === 'number'
       ? liveExPos.unrealized_pnl
-      : typeof trade.exchange_unrealized_pnl === 'number' &&
-        trade.exchange_synced_at &&
-        Date.now() - trade.exchange_synced_at < 30_000
-      ? trade.exchange_unrealized_pnl
-      : undefined;
+      : computedGrossAtRef;
 
-  if (typeof freshExUnrealized === 'number' && Number.isFinite(freshExUnrealized)) {
+  const effectiveGross =
+    computedGrossAtRef !== undefined && freshExUnrealized !== undefined
+      ? Math.max(computedGrossAtRef, freshExUnrealized)
+      : (computedGrossAtRef ?? freshExUnrealized);
+
+  if (typeof effectiveGross === 'number' && Number.isFinite(effectiveGross)) {
     const requiredGross = totalFees + slippageReserveUsdt;
-    if (freshExUnrealized <= requiredGross) {
+    if (effectiveGross <= requiredGross) {
       return {
         ok: false,
-        reason: `Unrealized PnL биржи (${freshExUnrealized.toFixed(3)}$) не перекрывает все комиссии + резерв проскальзывания (${requiredGross.toFixed(3)}$)`,
+        reason: `Unrealized PnL (${effectiveGross.toFixed(3)}$) не перекрывает комиссии + резерв проскальзывания (${requiredGross.toFixed(3)}$)`,
         slippageReserveUsdt,
         totalFees,
       };
     }
   }
 
-  const netProfit = trade.net_profit ?? trade.profit_abs ?? 0;
-  if (netProfit <= slippageReserveUsdt) {
+  const effectiveNet =
+    computedNetAtRef !== undefined
+      ? Math.max(computedNetAtRef, trade.net_profit ?? trade.profit_abs ?? -Infinity)
+      : (trade.net_profit ?? trade.profit_abs ?? 0);
+  if (effectiveNet <= slippageReserveUsdt) {
     return {
       ok: false,
-      reason: `Расчётная чистая прибыль (${netProfit.toFixed(3)}$) <= резерва проскальзывания (${slippageReserveUsdt.toFixed(3)}$)`,
+      reason: `Расчётная чистая прибыль (${effectiveNet.toFixed(3)}$) <= резерва проскальзывания (${slippageReserveUsdt.toFixed(3)}$)`,
       slippageReserveUsdt,
       totalFees,
     };
@@ -2460,6 +2508,11 @@ async function initializeBotTrades() {
   }
 
   tradesStore = cleanTrades;
+  for (const t of tradesStore) {
+    if (t.is_open && t.pair) {
+      subscribePairKlineStream(t.pair, t.timeframe || '1h');
+    }
+  }
 
   // Строгое правило: без подключенного биржевого аккаунта бот остановлен (но все существующие сделки в БД сохранены)
   botConfig.state = hasActiveExchange && !ownerManuallyStoppedBot ? 'running' : 'stopped';
@@ -2506,6 +2559,7 @@ async function initializeBotTrades() {
 
 let lastExchangeBalanceSyncTs = 0;
 const accInitialPosSynced = new Set<string>();
+const lastExchangeTpEnsureByTrade = new Map<number, { tp: number; ts: number }>();
 
 function isOwnerAccountRecord(acc: ExchangeAccountRecord | undefined): boolean {
   if (!acc) return false;
@@ -2888,6 +2942,7 @@ async function syncPositionsAndHistoryFromExchanges(
         );
 
         if (existingOpen) {
+          subscribePairKlineStream(existingOpen.pair, existingOpen.timeframe || '1h');
           if (pos.mark_price > 0) {
             existingOpen.current_rate = roundPrice(pos.mark_price);
             existingOpen.exchange_mark_price = pos.mark_price;
@@ -2916,6 +2971,40 @@ async function syncPositionsAndHistoryFromExchanges(
             void enrichImportedPositionMtfLevelsAsync(existingOpen.trade_id, acc, pos, creds);
           }
           recalculateTradeMetrics(existingOpen, false);
+
+          // Если на самой бирже у открытой позиции нет TP (pos.take_profit <= 0) или TP отличается от расчётного на сайте — автоматически выставляем/синхронизируем TP на бирже
+          const exPosTp = Number(pos.take_profit || 0);
+          if (
+            !isSimulatedTestApiKey(creds.apiKey) &&
+            existingOpen.take_profit_abs > 0 &&
+            (!(exPosTp > 0) ||
+              Math.abs(exPosTp - existingOpen.take_profit_abs) / existingOpen.take_profit_abs > 0.002)
+          ) {
+            const prevEnsure = lastExchangeTpEnsureByTrade.get(existingOpen.trade_id);
+            const shouldEnsureNow =
+              !prevEnsure ||
+              Math.abs(prevEnsure.tp - existingOpen.take_profit_abs) > 1e-6 ||
+              Date.now() - prevEnsure.ts > 60_000;
+            if (shouldEnsureNow) {
+              lastExchangeTpEnsureByTrade.set(existingOpen.trade_id, {
+                tp: existingOpen.take_profit_abs,
+                ts: Date.now(),
+              });
+              placeOrUpdateExchangeTakeProfitOrder(creds, {
+                pair: existingOpen.pair,
+                isShort: existingOpen.is_short,
+                quantity: existingOpen.amount,
+                takeProfitPrice: existingOpen.take_profit_abs,
+              })
+                .then((tpRes) => {
+                  if (tpRes.success && tpRes.take_profit_price > 0) {
+                    pos.take_profit = tpRes.take_profit_price;
+                  }
+                })
+                .catch(() => {});
+            }
+          }
+
           sqliteDb.upsertTrade(existingOpen);
         } else {
           // На бирже есть открытая позиция, которой еще нет на сайте — НЕМЕДЛЕННО добавляем её в UI с базовыми уровнями,
