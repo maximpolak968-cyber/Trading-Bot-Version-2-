@@ -4562,8 +4562,65 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
     for (const baseUrl of candidateHosts) {
       try {
         const dualSide = await getBinanceDualSideMode(cleanKey, cleanSecret, false, baseUrl);
-        const timestamp = await getBinanceTimestamp(false, baseUrl);
         const side = params.isShort ? 'BUY' : 'SELL';
+        const targetPosSide = params.isShort ? 'SHORT' : 'LONG';
+
+        // Отменяем старые открытые TP-ордера по этому символу/стороне перед установкой нового TP (иначе Binance даёт -4130 или дублирует ордер)
+        try {
+          if (!isBinanceHostRateLimited(baseUrl).limited) {
+            const openTs = await getBinanceTimestamp(false, baseUrl);
+            const openQuery = `symbol=${encodeURIComponent(symbol)}&timestamp=${openTs}&recvWindow=10000`;
+            const openSig = signBinanceFuturesQuery(openQuery, cleanSecret);
+            const openRes = await makeHttpsRequest(
+              `${baseUrl}/fapi/v1/openOrders?${openQuery}&signature=${openSig}`,
+              {
+                method: 'GET',
+                headers: { 'X-MBX-APIKEY': cleanKey },
+                timeoutMs: 5000,
+              }
+            );
+            if (openRes.statusCode === 200) {
+              const openList = JSON.parse(openRes.data);
+              if (Array.isArray(openList)) {
+                const staleTpOrders = openList.filter((o: any) => {
+                  const ordType = String(o.type || '').toUpperCase();
+                  if (!ordType.includes('TAKE_PROFIT')) return false;
+                  if (dualSide && o.positionSide) {
+                    return String(o.positionSide).toUpperCase() === targetPosSide;
+                  }
+                  return String(o.side || '').toUpperCase() === side;
+                });
+                const wsRpcCancel = getBinanceWsRpcClient(baseUrl);
+                for (const staleOrd of staleTpOrders) {
+                  const ordId = staleOrd.orderId;
+                  if (!ordId) continue;
+                  const cTs = await getBinanceTimestamp(false, baseUrl);
+                  const wsCancelRes = await wsRpcCancel
+                    .request(
+                      'order.cancel',
+                      { apiKey: cleanKey, symbol, orderId: ordId, timestamp: cTs, recvWindow: 10000 },
+                      cleanSecret,
+                      4000
+                    )
+                    .catch(() => null);
+                  if (!wsCancelRes || wsCancelRes.status !== 200) {
+                    const cQuery = `symbol=${encodeURIComponent(symbol)}&orderId=${ordId}&timestamp=${cTs}&recvWindow=10000`;
+                    const cSig = signBinanceFuturesQuery(cQuery, cleanSecret);
+                    await makeHttpsRequest(`${baseUrl}/fapi/v1/order?${cQuery}&signature=${cSig}`, {
+                      method: 'DELETE',
+                      headers: { 'X-MBX-APIKEY': cleanKey },
+                      timeoutMs: 5000,
+                    }).catch(() => {});
+                  }
+                }
+              }
+            }
+          }
+        } catch {
+          // best-effort cancel before placing updated TP
+        }
+
+        const timestamp = await getBinanceTimestamp(false, baseUrl);
 
         // Сначала выставляем TAKE_PROFIT_MARKET через WebSocket API (ws-fapi/v1) без лимитов веса!
         const wsRpc = getBinanceWsRpcClient(baseUrl);
@@ -4579,7 +4636,7 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
           recvWindow: 10000,
         };
         if (dualSide) {
-          wsTpParams.positionSide = params.isShort ? 'SHORT' : 'LONG';
+          wsTpParams.positionSide = targetPosSide;
         }
         const wsTpRes = await wsRpc.request('order.place', wsTpParams, cleanSecret, 5500);
         if (wsTpRes.status === 200) {
@@ -4605,7 +4662,7 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
           recvWindow: '10000',
         });
         if (dualSide) {
-          qp.set('positionSide', params.isShort ? 'SHORT' : 'LONG');
+          qp.set('positionSide', targetPosSide);
         }
         const query = qp.toString();
         const sig = signBinanceFuturesQuery(query, cleanSecret);

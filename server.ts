@@ -1350,6 +1350,48 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
   }
 }
 
+function resolvePostDcaTakeProfit(
+  newAvgRate: number,
+  isShort: boolean,
+  mtf?: ReturnType<typeof analyzeMultiTimeframe> | null
+): number {
+  const defaultMove = 0.008;
+  const fallbackTp = roundPrice(
+    isShort ? newAvgRate * (1 - defaultMove) : newAvgRate * (1 + defaultMove)
+  );
+  if (!(newAvgRate > 0) || !mtf) return fallbackTp;
+
+  if (!isShort) {
+    const minTp = newAvgRate * 1.008;
+    const maxTp = newAvgRate * 1.018;
+    const candidates = [
+      mtf.recommended_tp_long,
+      mtf.local_1h_resistance * 0.998,
+      mtf.key_4h_resistance * 0.998,
+      ...(mtf.institutional_levels || []).map((l) =>
+        l.zone_low && l.zone_low > newAvgRate ? l.zone_low * 0.999 : l.price * 0.998
+      ),
+    ]
+      .filter((p) => Number.isFinite(p) && p >= minTp && p <= maxTp)
+      .sort((a, b) => a - b);
+    return candidates.length > 0 ? roundPrice(candidates[0]) : fallbackTp;
+  } else {
+    const minTp = newAvgRate * 0.992;
+    const maxTp = newAvgRate * 0.982;
+    const candidates = [
+      mtf.recommended_tp_short,
+      mtf.local_1h_support * 1.002,
+      mtf.key_4h_support * 1.002,
+      ...(mtf.institutional_levels || []).map((l) =>
+        l.zone_high && l.zone_high < newAvgRate ? l.zone_high * 1.001 : l.price * 1.002
+      ),
+    ]
+      .filter((p) => Number.isFinite(p) && p <= minTp && p >= maxTp)
+      .sort((a, b) => b - a);
+    return candidates.length > 0 ? roundPrice(candidates[0]) : fallbackTp;
+  }
+}
+
 const botConfig = {
   version: '2026.9-ScalpBot',
   strategy_version: 'v2.6-MTF-DualStrategy',
@@ -2147,11 +2189,29 @@ async function syncPositionsAndHistoryFromExchanges(
                   forceReanalyzeOpen
                 ).catch(() => [] as BotChartLevel[]);
                 const manualSup = refreshedLvls.find(
-                  (l) => l.role === 'support' && l.manual_override && !l.id.startsWith('lvl-')
+                  (l) =>
+                    l.role === 'support' &&
+                    l.manual_override &&
+                    !l.id.startsWith('lvl-') &&
+                    l.price < existingOpen.open_rate
                 );
                 const manualRes = refreshedLvls.find(
-                  (l) => l.role === 'resistance' && l.manual_override && !l.id.startsWith('lvl-')
+                  (l) =>
+                    l.role === 'resistance' &&
+                    l.manual_override &&
+                    !l.id.startsWith('lvl-') &&
+                    l.price > existingOpen.open_rate
                 );
+                const manualDcaSup =
+                  manualSup &&
+                  (existingOpen.open_rate - manualSup.price) / Math.max(1e-8, existingOpen.open_rate) >= 0.028
+                    ? manualSup
+                    : undefined;
+                const manualDcaRes =
+                  manualRes &&
+                  (manualRes.price - existingOpen.open_rate) / Math.max(1e-8, existingOpen.open_rate) >= 0.028
+                    ? manualRes
+                    : undefined;
                 const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d, undefined, c1w);
                 const strongDca = findStrongestDcaLevel(
                   c4h,
@@ -2172,10 +2232,10 @@ async function syncPositionsAndHistoryFromExchanges(
                 const lev = existingOpen.leverage || pos.leverage || acc.max_leverage || 25;
                 const dcaStake = Math.max(5, existingOpen.stake_amount || 25);
                 const boundDca1 =
-                  !existingOpen.is_short && manualSup
-                    ? roundPrice(manualSup.price)
-                    : existingOpen.is_short && manualRes
-                    ? roundPrice(manualRes.price)
+                  !existingOpen.is_short && manualDcaSup
+                    ? roundPrice(manualDcaSup.price)
+                    : existingOpen.is_short && manualDcaRes
+                    ? roundPrice(manualDcaRes.price)
                     : roundPrice(strongDca.price);
                 const boundDca2 = roundPrice(strongDca.second_price);
 
@@ -2183,14 +2243,14 @@ async function syncPositionsAndHistoryFromExchanges(
                   existingOpen.planned_dca_levels = [
                     {
                       step: 1,
-                      label: `DCA 1 (${strongDca.source})`,
+                      label: `DCA 1 (${(!existingOpen.is_short && manualDcaSup) || (existingOpen.is_short && manualDcaRes) ? 'MANUAL_LVL' : strongDca.source})`,
                       price: boundDca1,
                       stake_amount: dcaStake,
                       amount: Number(((dcaStake * lev) / Math.max(1e-8, boundDca1)).toFixed(4)),
                       distance_pct: Number(
                         (((boundDca1 - existingOpen.open_rate) / existingOpen.open_rate) * 100).toFixed(2)
                       ),
-                      manual_override: Boolean((!existingOpen.is_short && manualSup) || (existingOpen.is_short && manualRes)),
+                      manual_override: Boolean((!existingOpen.is_short && manualDcaSup) || (existingOpen.is_short && manualDcaRes)),
                     },
                     {
                       step: 2,
@@ -2278,10 +2338,30 @@ async function syncPositionsAndHistoryFromExchanges(
               botConfig.timeframe,
               true
             ).catch(() => [] as BotChartLevel[]);
-            const manualSup = refreshedLvls.find((l) => l.role === 'support' && l.manual_override);
-            const manualRes = refreshedLvls.find((l) => l.role === 'resistance' && l.manual_override);
-            hasManualSup = Boolean(manualSup);
-            hasManualRes = Boolean(manualRes);
+            const manualSup = refreshedLvls.find(
+              (l) =>
+                l.role === 'support' &&
+                l.manual_override &&
+                !l.id.startsWith('lvl-') &&
+                l.price < entryRate
+            );
+            const manualRes = refreshedLvls.find(
+              (l) =>
+                l.role === 'resistance' &&
+                l.manual_override &&
+                !l.id.startsWith('lvl-') &&
+                l.price > entryRate
+            );
+            const manualDcaSup =
+              manualSup && (entryRate - manualSup.price) / Math.max(1e-8, entryRate) >= 0.028
+                ? manualSup
+                : undefined;
+            const manualDcaRes =
+              manualRes && (manualRes.price - entryRate) / Math.max(1e-8, entryRate) >= 0.028
+                ? manualRes
+                : undefined;
+            hasManualSup = Boolean(manualDcaSup);
+            hasManualRes = Boolean(manualDcaRes);
 
             if (c4h.length >= 20) {
               const mtf = analyzeMultiTimeframe(pos.pair, c1h, c4h, c1d, undefined, c1w);
@@ -2295,13 +2375,16 @@ async function syncPositionsAndHistoryFromExchanges(
               }
               const strongDca = findStrongestDcaLevel(c4h, c1d, entryRate, pos.is_short, 2.8, 95.0, c1w);
               dcaPrice1 =
-                !pos.is_short && manualSup
-                  ? roundPrice(manualSup.price)
-                  : pos.is_short && manualRes
-                  ? roundPrice(manualRes.price)
+                !pos.is_short && manualDcaSup
+                  ? roundPrice(manualDcaSup.price)
+                  : pos.is_short && manualDcaRes
+                  ? roundPrice(manualDcaRes.price)
                   : roundPrice(strongDca.price);
               dcaPrice2 = roundPrice(strongDca.second_price);
-              dcaSource = strongDca.source;
+              dcaSource =
+                (!pos.is_short && manualDcaSup) || (pos.is_short && manualDcaRes)
+                  ? 'MANUAL_LVL'
+                  : strongDca.source;
             }
           } catch {
             // fallback to structural percentages if offline
@@ -3056,12 +3139,39 @@ async function runScalpBotCycle(waitForActive = false) {
           );
 
           if (riskCheck.allowed) {
-            const noKnifeOrPump = !trade.is_short
-              ? !isKnifeDrop(candles1h)
-              : !isPumpExhaustion(candles1h);
+            const candles1hForDca =
+              (trade.timeframe || botConfig.timeframe) === '1h'
+                ? candles1h
+                : (await fetchRealCandles(trade.pair, '1h', 60)).candles;
+            const dcaEvalCandles = candles1hForDca.length >= 3 ? candles1hForDca : candles1h;
 
-            // Как только цена достигла или пробила целевой уровень DCA 1 (установленный вручную или рассчитанный ботом) и нет вертикального ножа — выполняем усреднение
-            if (noKnifeOrPump) {
+            const pairLvlsForDca =
+              botLevelsStore.get(trade.pair) ||
+              botLevelsStore.get(`${trade.pair}_${botConfig.timeframe}`) ||
+              [];
+            const nearestDcaZoneLvl = pairLvlsForDca.find(
+              (l) =>
+                (l.zone_low || l.zone_high) &&
+                (Math.abs(l.price - nextDcaTarget) / Math.max(1e-8, nextDcaTarget)) * 100 <= 1.2
+            );
+            const zoneBounds = nearestDcaZoneLvl
+              ? { zoneLow: nearestDcaZoneLvl.zone_low, zoneHigh: nearestDcaZoneLvl.zone_high }
+              : undefined;
+
+            const noKnifeOrPump = !trade.is_short
+              ? !isKnifeDrop(dcaEvalCandles)
+              : !isPumpExhaustion(dcaEvalCandles);
+            const rejectionCheck = checkCandleRejection(
+              dcaEvalCandles,
+              nextDcaTarget,
+              trade.is_short,
+              0.9,
+              zoneBounds
+            );
+            const rsiCheck = checkRsiCondition(dcaEvalCandles, trade.is_short);
+
+            // Усредняем только когда цена достигла DCA, нет вертикального ножа/пампа И есть отбой от уровня/зоны или разворот RSI
+            if (noKnifeOrPump && (rejectionCheck.confirmed || rsiCheck.confirmed)) {
               // Find next strongest 1W->1D / 4H DCA level first
               const [{ candles: c1w }, { candles: c4h }, { candles: c1d }] = await Promise.all([
                 fetchRealCandles(trade.pair, '1w', 300),
@@ -3083,7 +3193,12 @@ async function runScalpBotCycle(waitForActive = false) {
                 usedMarginUsdt: usedMargin,
                 otherActiveCoinsCount: otherCoinsCount,
                 maxPairMarginPct: scalpBotConfig.max_pair_margin_pct || 20.0,
+                minStakeUsdt: botConfig.min_stake_amount || 5,
               });
+
+              if (dynamicDca.addAmount <= 0 || dynamicDca.addStake <= 0) {
+                continue;
+              }
 
               let addAmount = dynamicDca.addAmount;
               const addStake = dynamicDca.addStake;
@@ -3164,7 +3279,15 @@ async function runScalpBotCycle(waitForActive = false) {
                 }
               }
 
-              const tpTargetMove = 0.008;
+              const postDcaMtf =
+                c4h.length >= 20
+                  ? analyzeMultiTimeframe(trade.pair, dcaEvalCandles, c4h, c1d, undefined, c1w)
+                  : null;
+              const resolvedMasterPostDcaTp = resolvePostDcaTakeProfit(
+                newAvgOpenRate,
+                trade.is_short,
+                postDcaMtf
+              );
               sqliteDb.runInTransaction(() => {
                 if (siblingToClose) {
                   const sibClosePrice =
@@ -3213,11 +3336,9 @@ async function runScalpBotCycle(waitForActive = false) {
                 trade.trade_state = 'DCA_ACTIVE';
                 trade.enter_tag = `${trade.is_short ? 'Short' : 'Long'} (DCA ×${nextStep})`;
 
-                // Fast Scalp TP after DCA (+0.8% from new average entry = +20% gross / ~+17% net ROI on 25x) unless manually fixed by user
+                // Level-aware post-DCA TP (+0.8%..+1.8% targeting nearest confirmed S/R) unless manually fixed by user
                 if (!trade.tp_manual_override) {
-                  trade.take_profit_abs = roundPrice(
-                    trade.is_short ? newAvgOpenRate * (1 - tpTargetMove) : newAvgOpenRate * (1 + tpTargetMove)
-                  );
+                  trade.take_profit_abs = resolvedMasterPostDcaTp;
                 }
                 const existingNextPlanned = (trade.planned_dca_levels || []).find(
                   (l) => l.step === nextStep + 1 && l.manual_override && l.price > 0
@@ -3372,11 +3493,23 @@ async function runScalpBotCycle(waitForActive = false) {
                   ct.trade_state = 'DCA_ACTIVE';
                   ct.enter_tag = trade.enter_tag;
                   if (!ct.tp_manual_override) {
-                    ct.take_profit_abs = roundPrice(
-                      ct.is_short ? clientNewAvgRate * (1 - tpTargetMove) : clientNewAvgRate * (1 + tpTargetMove)
+                    ct.take_profit_abs = resolvePostDcaTakeProfit(
+                      clientNewAvgRate,
+                      ct.is_short,
+                      postDcaMtf
                     );
                   }
                   ct.next_dca_price = trade.next_dca_price;
+                  const clientLev = ct.leverage || 25;
+                  ct.planned_dca_levels = (trade.planned_dca_levels || []).map((lvl) => ({
+                    ...lvl,
+                    stake_amount: clientAddStake,
+                    amount: Number(((clientAddStake * clientLev) / Math.max(1e-8, lvl.price)).toFixed(4)),
+                    distance_pct: Number(
+                      (((lvl.price - clientNewAvgRate) / Math.max(1e-8, clientNewAvgRate)) * 100).toFixed(2)
+                    ),
+                  }));
+                  ct.dca_manual_override = Boolean(trade.dca_manual_override);
                   ct.orders.push({
                     id: clientDcaRes?.order_id || `ord-${ct.trade_id}-${nextStep}`,
                     step: nextStep,
@@ -3388,7 +3521,7 @@ async function runScalpBotCycle(waitForActive = false) {
                     timestamp: now,
                     date: nowStr,
                   });
-                  recalculateTradeMetrics(ct, true);
+                  recalculateTradeMetrics(ct, false);
                   sqliteDb.upsertTrade(ct);
                   sqliteDb.recordOrder({
                     trade_id: ct.trade_id,
@@ -3580,15 +3713,23 @@ async function runScalpBotCycle(waitForActive = false) {
       const customSup = manualSupLvl?.price || mtf.key_4h_support;
       const customRes = manualResLvl?.price || mtf.key_4h_resistance;
 
-      // СТРАТЕГИЯ №1: ScalpingStrategy (краткосрочный скальпинг Лонг/Шорт от глобальных уровней и по тренду)
-      const sig = evaluateScalpingStrategy(c1h, customSup, customRes);
+      // СТРАТЕГИЯ №1: ScalpingStrategy (краткосрочный скальпинг Лонг/Шорт от глобальных уровней/зон и по тренду)
+      const sig = evaluateScalpingStrategy(c1h, customSup, customRes, mtf.institutional_levels);
 
       // СТРАТЕГИЯ №2 (ОТДЕЛЬНАЯ): GlobalHedgeStrategy (2-сторонние сделки LONG+SHORT в среднесрок 4H и долгосрок 1D)
-      const hedgeEval = evaluateGlobalHedgeStrategy(c1h, c4h, c1d, mtf, btcGuard.isSafe);
+      const hedgeEval = evaluateGlobalHedgeStrategy(c1h, c4h, c1d, mtf, btcGuard.isSafe, c1w);
 
       const last1hCandle = c1h[c1h.length - 1];
       const isRed1h = Boolean(last1hCandle && last1hCandle.close < last1hCandle.open);
       const isGreen1h = Boolean(last1hCandle && last1hCandle.close > last1hCandle.open);
+      const isPullbackToRes = Boolean(
+        last1hCandle &&
+          (last1hCandle.high >= sig.ema_slow * 0.994 || last1hCandle.high >= customRes * 0.992)
+      );
+      const isPullbackToSup = Boolean(
+        last1hCandle &&
+          (last1hCandle.low <= sig.ema_slow * 1.006 || last1hCandle.low <= customSup * 1.008)
+      );
       const effectiveTrend = mtf.market_trend || 'NEUTRAL';
 
       // Record multi-coin market scan in signals table so user sees full market analysis across volatile coins
@@ -3639,9 +3780,12 @@ async function runScalpBotCycle(waitForActive = false) {
                 continue;
               } else if (
                 mtf.allow_short &&
-                mtf.rsi_1h >= 24.0 &&
-                mtf.rsi_1h <= 62.0 &&
-                (isRed1h || livePrice <= sig.ema_slow * 1.003)
+                mtf.dist_to_4h_sup_pct >= 0.85 &&
+                mtf.rsi_1h >= 20.0 &&
+                mtf.rsi_1h <= 65.0 &&
+                isPullbackToRes &&
+                (isRed1h || sig.wt1 <= sig.wt2) &&
+                livePrice <= sig.ema_slow * 1.003
               ) {
                 await createScalpBotPosition(
                   pair,
@@ -3688,9 +3832,12 @@ async function runScalpBotCycle(waitForActive = false) {
               } else if (
                 btcAllowsLong &&
                 mtf.allow_long &&
-                mtf.rsi_1h >= 38.0 &&
-                mtf.rsi_1h <= 62.0 &&
-                (isGreen1h || livePrice >= sig.ema_slow * 0.997)
+                mtf.dist_to_4h_res_pct >= 0.85 &&
+                mtf.rsi_1h >= 35.0 &&
+                mtf.rsi_1h <= 80.0 &&
+                isPullbackToSup &&
+                (isGreen1h || sig.wt1 >= sig.wt2) &&
+                livePrice >= sig.ema_slow * 0.997
               ) {
                 await createScalpBotPosition(
                   pair,
@@ -3754,10 +3901,11 @@ async function runScalpBotCycle(waitForActive = false) {
                 continue;
               } else if (
                 mtf.allow_short &&
-                mtf.rsi_1d >= 32 &&
-                mtf.rsi_4h >= 40 &&
+                mtf.rsi_1d >= 20 &&
+                mtf.rsi_4h >= 35 &&
                 mtf.rsi_1h >= 55 &&
-                mtf.pos_4h_pct >= 55 &&
+                mtf.pos_4h_pct >= 60 &&
+                mtf.dist_to_4h_sup_pct >= 0.85 &&
                 isRed1h
               ) {
                 await createScalpBotPosition(
@@ -3776,10 +3924,11 @@ async function runScalpBotCycle(waitForActive = false) {
               } else if (
                 btcAllowsLong &&
                 mtf.allow_long &&
-                mtf.rsi_1d <= 68 &&
-                mtf.rsi_4h <= 60 &&
+                mtf.rsi_1d <= 80 &&
+                mtf.rsi_4h <= 65 &&
                 mtf.rsi_1h <= 45 &&
-                mtf.pos_4h_pct <= 45 &&
+                mtf.pos_4h_pct <= 40 &&
+                mtf.dist_to_4h_res_pct >= 0.85 &&
                 isGreen1h
               ) {
                 await createScalpBotPosition(
@@ -4129,11 +4278,19 @@ async function createScalpBotPosition(
     customOpts?.preloadedPairLevels ??
     (await getOrComputeMtfBotLevels(cleanPair, botConfig.timeframe));
   const manualSupLvl = activePairLevels.find(
-    (l) => l.role === 'support' && l.manual_override && l.price < entryRate
+    (l) => l.role === 'support' && l.manual_override && !l.id.startsWith('lvl-') && l.price < entryRate
   );
   const manualResLvl = activePairLevels.find(
-    (l) => l.role === 'resistance' && l.manual_override && l.price > entryRate
+    (l) => l.role === 'resistance' && l.manual_override && !l.id.startsWith('lvl-') && l.price > entryRate
   );
+  const manualDcaSupLvl =
+    manualSupLvl && (entryRate - manualSupLvl.price) / Math.max(1e-8, entryRate) >= 0.028
+      ? manualSupLvl
+      : undefined;
+  const manualDcaResLvl =
+    manualResLvl && (manualResLvl.price - entryRate) / Math.max(1e-8, entryRate) >= 0.028
+      ? manualResLvl
+      : undefined;
   const effectiveSup = manualSupLvl ? manualSupLvl.price : roundPrice(mtf.key_4h_support);
   const effectiveRes = manualResLvl ? manualResLvl.price : roundPrice(mtf.key_4h_resistance);
 
@@ -4150,22 +4307,30 @@ async function createScalpBotPosition(
   if (!isShort) {
     if (!hasCustomTp || rawTp <= entryRate * 1.002) {
       const minTpLong = manualResLvl ? entryRate * 1.0035 : entryRate * 1.008;
-      const maxTpLong = manualResLvl || isGlobalHedge ? entryRate * 1.080 : entryRate * 1.015;
+      const maxTpLong = manualResLvl || isGlobalHedge ? entryRate * 1.080 : entryRate * 1.035;
       const structRes = effectiveRes * 0.998;
-      if (structRes >= minTpLong && structRes <= maxTpLong) {
+      if (manualResLvl && structRes >= minTpLong && structRes <= maxTpLong) {
         rawTp = structRes;
-      } else if (rawTp < minTpLong || rawTp > maxTpLong) {
+      } else if (rawTp >= minTpLong && rawTp <= maxTpLong) {
+        // Сохраняем уровневый/зонный recommended_tp_long из analyzeMultiTimeframe
+      } else if (structRes >= minTpLong && structRes <= maxTpLong) {
+        rawTp = structRes;
+      } else {
         rawTp = isGlobalHedge ? Math.max(minTpLong, Math.min(maxTpLong, structRes)) : entryRate * 1.012;
       }
     }
   } else {
     if (!hasCustomTp || rawTp >= entryRate * 0.998) {
       const minTpShort = manualSupLvl ? entryRate * 0.9965 : entryRate * 0.992;
-      const maxTpShort = manualSupLvl || isGlobalHedge ? entryRate * 0.920 : entryRate * 0.985;
+      const maxTpShort = manualSupLvl || isGlobalHedge ? entryRate * 0.920 : entryRate * 0.965;
       const structSup = effectiveSup * 1.002;
-      if (structSup <= minTpShort && structSup >= maxTpShort) {
+      if (manualSupLvl && structSup <= minTpShort && structSup >= maxTpShort) {
         rawTp = structSup;
-      } else if (rawTp > minTpShort || rawTp < maxTpShort) {
+      } else if (rawTp <= minTpShort && rawTp >= maxTpShort) {
+        // Сохраняем уровневый/зонный recommended_tp_short из analyzeMultiTimeframe
+      } else if (structSup <= minTpShort && structSup >= maxTpShort) {
+        rawTp = structSup;
+      } else {
         rawTp = isGlobalHedge ? Math.min(minTpShort, Math.max(maxTpShort, structSup)) : entryRate * 0.988;
       }
     }
@@ -4176,7 +4341,7 @@ async function createScalpBotPosition(
     ((Math.abs(targetTp - entryRate) / Math.max(1e-8, entryRate)) * 100).toFixed(2)
   );
 
-  // Усреднения: DCA 1 строго на уточнённом глобальном уровне 1W->1D SUP/RES (или ручном SUP/RES), DCA 2 строго на абсолютном историческом пике (SHORT) или дне (LONG)
+  // Усреднения: DCA 1 строго на уточнённом глобальном уровне 1W->1D SUP/RES (или ручном SUP/RES >= 2.8%), DCA 2 строго на абсолютном историческом пике/дне (1D+4H)
   const strongestDca = findStrongestDcaLevel(
     candles4h,
     candles1d,
@@ -4187,11 +4352,11 @@ async function createScalpBotPosition(
     customOpts?.candles1w
   );
   const nextDcaPrice = !isShort
-    ? manualSupLvl
-      ? roundPrice(manualSupLvl.price)
+    ? manualDcaSupLvl
+      ? roundPrice(manualDcaSupLvl.price)
       : roundPrice(strongestDca.price)
-    : manualResLvl
-    ? roundPrice(manualResLvl.price)
+    : manualDcaResLvl
+    ? roundPrice(manualDcaResLvl.price)
     : roundPrice(strongestDca.price);
   const secondDcaPrice = roundPrice(
     strongestDca.second_price &&
@@ -4202,7 +4367,7 @@ async function createScalpBotPosition(
       : nextDcaPrice * 0.965
   );
   const dcaSourceLabel =
-    (!isShort && manualSupLvl) || (isShort && manualResLvl) ? 'MANUAL_LVL' : strongestDca.source;
+    (!isShort && manualDcaSupLvl) || (isShort && manualDcaResLvl) ? 'MANUAL_LVL' : strongestDca.source;
 
   const resolvedStrategyName =
     customOpts?.strategyName || (isGlobalHedge ? 'GlobalHedgeStrategy' : 'ScalpingStrategy');
@@ -4281,7 +4446,7 @@ async function createScalpBotPosition(
         stake_amount: stake,
         amount: Number(((stake * leverage) / Math.max(1e-8, nextDcaPrice)).toFixed(4)),
         distance_pct: Number((((nextDcaPrice - entryRate) / entryRate) * 100).toFixed(2)),
-        manual_override: Boolean((!isShort && manualSupLvl) || (isShort && manualResLvl)),
+        manual_override: Boolean((!isShort && manualDcaSupLvl) || (isShort && manualDcaResLvl)),
       },
       {
         step: 2,
@@ -4837,7 +5002,12 @@ async function startServer() {
     const btcGuard = checkBtcMarketHealth(btcCandles);
     const strategyEval =
       c1h.length >= 30
-        ? evaluateScalpingStrategy(c1h, mtf.key_4h_support, mtf.key_4h_resistance)
+        ? evaluateScalpingStrategy(
+            c1h,
+            mtf.key_4h_support,
+            mtf.key_4h_resistance,
+            mtf.institutional_levels
+          )
         : null;
     res.json({
       pair,
@@ -4865,7 +5035,12 @@ async function startServer() {
         const mtf = analyzeMultiTimeframe(pair, c1h, c4h, c1d, undefined, c1w);
         const sig =
           c1h.length >= 30
-            ? evaluateScalpingStrategy(c1h, mtf.key_4h_support, mtf.key_4h_resistance)
+            ? evaluateScalpingStrategy(
+                c1h,
+                mtf.key_4h_support,
+                mtf.key_4h_resistance,
+                mtf.institutional_levels
+              )
             : null;
         const swing24h =
           ticker && ticker.low24h > 0
@@ -5779,6 +5954,16 @@ async function startServer() {
       }
     }
 
+    const postDcaMtf =
+      c4h.length >= 20
+        ? analyzeMultiTimeframe(trade.pair, c1h, c4h, c1d, undefined, c1w)
+        : null;
+    const resolvedManualPostDcaTp = resolvePostDcaTakeProfit(
+      newAvgOpenRate,
+      trade.is_short,
+      postDcaMtf
+    );
+
     sqliteDb.runInTransaction(() => {
       trade.open_rate = newAvgOpenRate;
       trade.amount = newTotalAmount;
@@ -5789,10 +5974,7 @@ async function startServer() {
       trade.pullback_min_profit_pct = 0.4;
       trade.enter_tag = `${trade.is_short ? 'Short' : 'Long'} (DCA ×${nextStep})`;
       if (!trade.tp_manual_override) {
-        const tpTargetMove = 0.008;
-        trade.take_profit_abs = roundPrice(
-          trade.is_short ? newAvgOpenRate * (1 - tpTargetMove) : newAvgOpenRate * (1 + tpTargetMove)
-        );
+        trade.take_profit_abs = resolvedManualPostDcaTp;
       }
       const existingNextPlanned = (trade.planned_dca_levels || []).find(
         (l) => l.step === nextStep + 1 && l.manual_override && l.price > 0
@@ -5912,7 +6094,23 @@ async function startServer() {
           ct.last_dca_date = nowStr;
           ct.trade_state = 'AVERAGED';
           ct.enter_tag = trade.enter_tag;
+          if (!ct.tp_manual_override) {
+            ct.take_profit_abs = resolvePostDcaTakeProfit(
+              clientNewAvgRate,
+              ct.is_short,
+              postDcaMtf
+            );
+          }
           ct.next_dca_price = trade.next_dca_price;
+          ct.planned_dca_levels = (trade.planned_dca_levels || []).map((lvl) => ({
+            ...lvl,
+            stake_amount: clientAddStake,
+            amount: Number(((clientAddStake * clientLev) / Math.max(1e-8, lvl.price)).toFixed(4)),
+            distance_pct: Number(
+              (((lvl.price - clientNewAvgRate) / Math.max(1e-8, clientNewAvgRate)) * 100).toFixed(2)
+            ),
+          }));
+          ct.dca_manual_override = Boolean(trade.dca_manual_override);
           ct.orders.push({
             id: cRes?.order_id || `ord-${ct.trade_id}-${nextStep}`,
             step: nextStep,
@@ -5924,7 +6122,7 @@ async function startServer() {
             timestamp: now,
             date: nowStr,
           });
-          recalculateTradeMetrics(ct, true);
+          recalculateTradeMetrics(ct, false);
           sqliteDb.upsertTrade(ct);
           sqliteDb.recordOrder({
             trade_id: ct.trade_id,

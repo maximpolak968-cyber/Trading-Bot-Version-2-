@@ -1378,10 +1378,14 @@ export function analyzeMultiTimeframe(
   let allowLong = true;
   let rejectionReasonLong = '';
 
-  const maxAllowed1hRsiForLong = marketTrend === 'BULLISH' ? 62.0 : 45.0;
-  if (rsi1d > 68.0 || rsi4h > 62.0 || rsi1h > maxAllowed1hRsiForLong) {
+  const maxAllowedRsiForLong = 80.0;
+  if (
+    rsi1d > maxAllowedRsiForLong ||
+    rsi4h > maxAllowedRsiForLong ||
+    rsi1h > maxAllowedRsiForLong
+  ) {
     allowLong = false;
-    rejectionReasonLong = `MTF RSI фильтр блокирует LONG: 1D RSI=${rsi1d} (макс 68), 4H RSI=${rsi4h} (макс 62), 1H RSI=${rsi1h} (макс ${maxAllowed1hRsiForLong})`;
+    rejectionReasonLong = `MTF RSI фильтр блокирует LONG: 1D RSI=${rsi1d}, 4H RSI=${rsi4h}, 1H RSI=${rsi1h} (макс ${maxAllowedRsiForLong})`;
   } else if ((marketTrend !== 'BULLISH' || hasCustomRes) && distTo4hResPct < 0.85) {
     allowLong = false;
     rejectionReasonLong = `Close to 1W/1D Resistance (${key4hResistance}, only +${distTo4hResPct.toFixed(2)}% room)`;
@@ -1402,17 +1406,15 @@ export function analyzeMultiTimeframe(
   let allowShort = true;
   let rejectionReasonShort = '';
 
-  const minAllowed1hRsiForShort = marketTrend === 'BEARISH' ? 24.0 : 54.0;
-  const minAllowed4hRsiForShort = marketTrend === 'BEARISH' ? 22.0 : 38.0;
-  const minAllowed1dRsiForShort = marketTrend === 'BEARISH' ? 20.0 : 32.0;
+  const minAllowedRsiForShort = 20.0;
 
   if (
-    rsi1d < minAllowed1dRsiForShort ||
-    rsi4h < minAllowed4hRsiForShort ||
-    rsi1h < minAllowed1hRsiForShort
+    rsi1d < minAllowedRsiForShort ||
+    rsi4h < minAllowedRsiForShort ||
+    rsi1h < minAllowedRsiForShort
   ) {
     allowShort = false;
-    rejectionReasonShort = `MTF RSI фильтр блокирует SHORT: 1D RSI=${rsi1d} (мин ${minAllowed1dRsiForShort}), 4H RSI=${rsi4h} (мин ${minAllowed4hRsiForShort}), 1H RSI=${rsi1h} (мин ${minAllowed1hRsiForShort})`;
+    rejectionReasonShort = `MTF RSI фильтр блокирует SHORT: 1D RSI=${rsi1d}, 4H RSI=${rsi4h}, 1H RSI=${rsi1h} (мин ${minAllowedRsiForShort})`;
   } else if (marketTrend !== 'BEARISH' && distTo4hSupPct < 0.85) {
     allowShort = false;
     rejectionReasonShort = `Close to 1W/1D Support (${key4hSupport}, only -${distTo4hSupPct.toFixed(2)}% room)`;
@@ -1427,36 +1429,42 @@ export function analyzeMultiTimeframe(
     rejectionReasonShort = `Бычий тренд рынка (1D=${d1Trend}, 4H=${h4Trend}, 1H=${h1Trend}) — вход в SHORT против тренда заблокирован`;
   }
 
-  // Long Fast Scalp TP
+  // Long TP: aim for nearest confirmed S/R or consolidation zone edge within +0.8%..+3.5%, fallback +1.2%
   const minTpDistLong = currentPrice * 1.008;
-  const maxTpDistLong = currentPrice * 1.015;
+  const maxTpDistLong = currentPrice * 1.035;
   const defaultScalpTpLong = currentPrice * 1.012;
-  const localResTarget = local1hResistance * 0.998;
-  const keyResTarget = key4hResistance * 0.998;
-  let recTpLong = defaultScalpTpLong;
-  if (localResTarget >= minTpDistLong && localResTarget <= maxTpDistLong) {
-    recTpLong = localResTarget;
-  } else if (keyResTarget >= minTpDistLong && keyResTarget <= maxTpDistLong) {
-    recTpLong = keyResTarget;
-  }
+  const longTargetCandidates = [
+    local1hResistance * 0.998,
+    key4hResistance * 0.998,
+    ...local1d.map((l) => (l.zone_low && l.zone_low > currentPrice ? l.zone_low * 0.999 : l.price * 0.998)),
+    ...structural4hLevels.map((l) => (l.zone_low && l.zone_low > currentPrice ? l.zone_low * 0.999 : l.price * 0.998)),
+    ...refinedGlobal.map((l) => (l.zone_low && l.zone_low > currentPrice ? l.zone_low * 0.999 : l.price * 0.998)),
+  ]
+    .filter((p) => Number.isFinite(p) && p >= minTpDistLong && p <= maxTpDistLong)
+    .sort((a, b) => a - b);
+  const recTpLong = longTargetCandidates.length > 0 ? longTargetCandidates[0] : defaultScalpTpLong;
+
   const safeSupport = Math.min(key4hSupport, local1hSupport);
   let recSlLong = safeSupport * 0.996;
   const slDistPctLong = currentPrice > 0 ? ((currentPrice - recSlLong) / currentPrice) * 100.0 : 0;
   if (slDistPctLong < 0.8) recSlLong = currentPrice * 0.985;
   else if (slDistPctLong > 4.5) recSlLong = currentPrice * 0.96;
 
-  // Short Fast Scalp TP
+  // Short TP: aim for nearest confirmed S/R or consolidation zone edge within -0.8%..-3.5%, fallback -1.2%
   const minTpDistShort = currentPrice * 0.992;
-  const maxTpDistShort = currentPrice * 0.985;
+  const maxTpDistShort = currentPrice * 0.965;
   const defaultScalpTpShort = currentPrice * 0.988;
-  const localSupTarget = local1hSupport * 1.002;
-  const keySupTarget = key4hSupport * 1.002;
-  let recTpShort = defaultScalpTpShort;
-  if (localSupTarget <= minTpDistShort && localSupTarget >= maxTpDistShort) {
-    recTpShort = localSupTarget;
-  } else if (keySupTarget <= minTpDistShort && keySupTarget >= maxTpDistShort) {
-    recTpShort = keySupTarget;
-  }
+  const shortTargetCandidates = [
+    local1hSupport * 1.002,
+    key4hSupport * 1.002,
+    ...local1d.map((l) => (l.zone_high && l.zone_high < currentPrice ? l.zone_high * 1.001 : l.price * 1.002)),
+    ...structural4hLevels.map((l) => (l.zone_high && l.zone_high < currentPrice ? l.zone_high * 1.001 : l.price * 1.002)),
+    ...refinedGlobal.map((l) => (l.zone_high && l.zone_high < currentPrice ? l.zone_high * 1.001 : l.price * 1.002)),
+  ]
+    .filter((p) => Number.isFinite(p) && p <= minTpDistShort && p >= maxTpDistShort)
+    .sort((a, b) => b - a);
+  const recTpShort = shortTargetCandidates.length > 0 ? shortTargetCandidates[0] : defaultScalpTpShort;
+
   const safeResistance = Math.max(key4hResistance, local1hResistance);
   let recSlShort = safeResistance * 1.004;
   const slDistPctShort =
@@ -1606,7 +1614,8 @@ export function checkCandleRejection(
   candles: OhlcvCandle[],
   level: number,
   isShort = false,
-  tolerancePct = 0.8
+  tolerancePct = 0.8,
+  zoneBounds?: { zoneLow?: number; zoneHigh?: number }
 ): { confirmed: boolean; reason: string } {
   if (!candles || candles.length < 2 || level <= 0) {
     return { confirmed: false, reason: 'Insufficient data or invalid level' };
@@ -1621,8 +1630,9 @@ export function checkCandleRejection(
   const body = Math.abs(closeP - openP);
 
   if (!isShort) {
+    const zoneTop = zoneBounds?.zoneHigh && zoneBounds.zoneHigh > level ? zoneBounds.zoneHigh : level;
     const nearLevel =
-      lowP <= level * (1 + tolerancePct / 100.0) || closeP <= level * (1 + tolerancePct / 100.0);
+      lowP <= zoneTop * (1 + tolerancePct / 100.0) || closeP <= zoneTop * (1 + tolerancePct / 100.0);
     if (!nearLevel) {
       return { confirmed: false, reason: `Price ${lowP} not testing support ${level}` };
     }
@@ -1630,20 +1640,21 @@ export function checkCandleRejection(
       return { confirmed: false, reason: 'Knife drop detected (no lower wick, strong dump candle)' };
     }
     const lowerWick = Math.min(openP, closeP) - lowP;
-    const hasRejectionWick = lowerWick / candleRange >= 0.2 || lowerWick >= body * 0.5;
-    const reachedLevelZone = closeP <= level * 1.002 || lowP <= level;
+    const hasRejectionWick = lowerWick / candleRange >= 0.22 || lowerWick >= body * 0.55;
+    const reachedLevelZone = closeP <= zoneTop * 1.003 || lowP <= zoneTop;
     const isGreen = closeP > openP;
     const bullishEngulfing = isGreen && closeP > prevRow.open && prevRow.close < prevRow.open;
-    const confirmed = reachedLevelZone && (hasRejectionWick || isGreen || bullishEngulfing || closeP <= level);
+    const confirmed = reachedLevelZone && (hasRejectionWick || isGreen || bullishEngulfing);
     return {
       confirmed,
       reason: confirmed
-        ? 'Support / DCA level reached and confirmed by price action'
-        : 'Waiting for support bounce confirmation',
+        ? 'Support / DCA level reached and confirmed by bounce candle'
+        : 'Waiting for support bounce / wick rejection confirmation',
     };
   } else {
+    const zoneBot = zoneBounds?.zoneLow && zoneBounds.zoneLow > 0 && zoneBounds.zoneLow < level ? zoneBounds.zoneLow : level;
     const nearLevel =
-      highP >= level * (1 - tolerancePct / 100.0) || closeP >= level * (1 - tolerancePct / 100.0);
+      highP >= zoneBot * (1 - tolerancePct / 100.0) || closeP >= zoneBot * (1 - tolerancePct / 100.0);
     if (!nearLevel) {
       return { confirmed: false, reason: `Price ${highP} not testing resistance ${level}` };
     }
@@ -1651,16 +1662,16 @@ export function checkCandleRejection(
       return { confirmed: false, reason: 'Rocket pump detected (no upper wick, strong pump candle)' };
     }
     const upperWick = highP - Math.max(openP, closeP);
-    const hasRejectionWick = upperWick / candleRange >= 0.2 || upperWick >= body * 0.5;
-    const reachedLevelZone = closeP >= level * 0.998 || highP >= level;
+    const hasRejectionWick = upperWick / candleRange >= 0.22 || upperWick >= body * 0.55;
+    const reachedLevelZone = closeP >= zoneBot * 0.997 || highP >= zoneBot;
     const isRed = closeP < openP;
     const bearishEngulfing = isRed && closeP < prevRow.open && prevRow.close > prevRow.open;
-    const confirmed = reachedLevelZone && (hasRejectionWick || isRed || bearishEngulfing || closeP >= level);
+    const confirmed = reachedLevelZone && (hasRejectionWick || isRed || bearishEngulfing);
     return {
       confirmed,
       reason: confirmed
-        ? 'Resistance / DCA level reached and confirmed by price action'
-        : 'Waiting for resistance rejection confirmation',
+        ? 'Resistance / DCA level reached and confirmed by rejection candle'
+        : 'Waiting for resistance rejection / upper wick confirmation',
     };
   }
 }
@@ -1680,32 +1691,31 @@ export function checkRsiCondition(
 
   if (!isShort) {
     const isOversold = rsiNow <= 45.0;
-    const reversal = isOversold && (rsiNow > rsiPrev || rsiNow <= 32.0);
+    const reversal = isOversold && (rsiNow > rsiPrev || rsiNow <= 20.0);
     return {
       confirmed: reversal,
       rsi: Number(rsiNow.toFixed(2)),
       reason: reversal
-        ? `RSI ${rsiNow.toFixed(1)} oversold and turning up`
-        : `RSI ${rsiNow.toFixed(1)} not in reversal setup for Long (must be <= 45)`,
+        ? `RSI ${rsiNow.toFixed(1)} oversold (<=20 or turning up)`
+        : `RSI ${rsiNow.toFixed(1)} not in reversal setup for Long (must be <= 45 turning up or <= 20)`,
     };
   } else {
     const isOverbought = rsiNow >= 55.0;
-    const reversal = isOverbought && (rsiNow < rsiPrev || rsiNow >= 68.0);
+    const reversal = isOverbought && (rsiNow < rsiPrev || rsiNow >= 80.0);
     return {
       confirmed: reversal,
       rsi: Number(rsiNow.toFixed(2)),
       reason: reversal
-        ? `RSI ${rsiNow.toFixed(1)} overbought and turning down`
-        : `RSI ${rsiNow.toFixed(1)} not in reversal setup for Short (must be >= 55)`,
+        ? `RSI ${rsiNow.toFixed(1)} overbought (>=80 or turning down)`
+        : `RSI ${rsiNow.toFixed(1)} not in reversal setup for Short (must be >= 55 turning down or >= 80)`,
     };
   }
 }
 
 /**
- * Находит уровни усреднения (Smart DCA) СТРОГО по предыдущим историческим максимумам (для SHORT)
- * и предыдущим историческим минимумам (для LONG) на графиках 4H и 1D.
- * Гарантирует минимальную структурную дистанцию (не менее 2.8%–3.5% от точки входа или предыдущего добора),
- * чтобы бот НИКОГДА не лепил несколько усреднений подряд рядом со входом.
+ * Находит уровни усреднения (Smart DCA):
+ * - DCA 1: сильнейший 1W->1D GLOBAL или подтверждённый 1D LOCAL уровень (минимум 2.8% от входа);
+ * - DCA 2: абсолютный исторический максимум (SHORT) / минимум (LONG) по всей истории 1D+4H.
  */
 export function findStrongestDcaLevel(
   candles4h: OhlcvCandle[],
@@ -1738,18 +1748,27 @@ export function findStrongestDcaLevel(
   }
 
   const allCandidates: ClusteredLevelWithHistory[] = [];
-  let absHighest = -Infinity;
-  let absLowest = Infinity;
+  let absHighest1d4h = -Infinity;
+  let absLowest1d4h = Infinity;
 
-  for (const series of [candles1w, candles1d, candles4h]) {
+  // Абсолютный пик/дно для DCA 2 берем по всей доступной истории 1D и 4H (резерв 1W только если 1D/4H пусты)
+  for (const series of [candles1d, candles4h]) {
     if (!series || series.length === 0) continue;
     for (const c of series) {
-      if (c.high > absHighest) absHighest = c.high;
-      if (c.low > 0 && c.low < absLowest) absLowest = c.low;
+      if (c.high > absHighest1d4h) absHighest1d4h = c.high;
+      if (c.low > 0 && c.low < absLowest1d4h) absLowest1d4h = c.low;
     }
   }
+  if (!Number.isFinite(absHighest1d4h) || !Number.isFinite(absLowest1d4h)) {
+    for (const c of candles1w || []) {
+      if (c.high > absHighest1d4h) absHighest1d4h = c.high;
+      if (c.low > 0 && c.low < absLowest1d4h) absLowest1d4h = c.low;
+    }
+  }
+  const absHighest = absHighest1d4h;
+  const absLowest = absLowest1d4h;
 
-  // 1. Top-Down 1W -> 1D уточнённые глобальные уровни и локальные 1D уровни (главный ориентир для DCA 1)
+  // 1. Top-Down 1W -> 1D уточнённые глобальные уровни и подтверждённые локальные 1D уровни (главный ориентир для DCA 1)
   const macro1wLevels =
     candles1w && candles1w.length >= 12
       ? detectMarketStructure(candles1w, candles1w.length, true).all_levels
@@ -1763,13 +1782,14 @@ export function findStrongestDcaLevel(
     for (const g of refinedGlobal) {
       allCandidates.push({
         ...g,
-        strength_score: Number((g.strength_score * 1.4).toFixed(3)),
+        strength_score: Number((g.strength_score * 1.2).toFixed(3)),
         source: g.refined_from_1w ? '1W_1D_GLOBAL' : '1D_GLOBAL',
       });
     }
     for (const l of local1d) {
       allCandidates.push({
         ...l,
+        strength_score: Number((l.strength_score * 0.95).toFixed(3)),
         source: '1D_LOCAL',
       });
     }
@@ -1777,49 +1797,52 @@ export function findStrongestDcaLevel(
     for (const g of macro1wLevels) {
       allCandidates.push({
         ...g,
-        strength_score: Number((g.strength_score * 1.4).toFixed(3)),
+        strength_score: Number((g.strength_score * 1.2).toFixed(3)),
         source: '1W_GLOBAL',
       });
     }
   }
 
-  // 2. Структурные точки 4H (НЕ глобальные уровни, но полезны как ближайший ориентир при отсутствии ближних 1W/1D уровней)
+  // 2. Структурные точки 4H (как ориентир при отсутствии ближних 1W/1D уровней)
   if (candles4h && candles4h.length >= 20) {
     const struct4h = detectMarketStructure(candles4h, Math.min(240, candles4h.length), false);
     for (const lvl of struct4h.all_levels) {
-      allCandidates.push({ ...lvl, source: '4H_STRUCT' });
+      allCandidates.push({
+        ...lvl,
+        strength_score: Number((lvl.strength_score * 0.6).toFixed(3)),
+        source: '4H_STRUCT',
+      });
     }
   }
 
   // Фильтруем кандидатов для DCA 1 по дистанции >= effectiveMinDistPct и <= maxDistPct
   const targetRole: 'support' | 'resistance' = isShort ? 'resistance' : 'support';
-  const validLevels = allCandidates.filter((lvl) => {
-    const distPct = !isShort
-      ? ((referencePrice - lvl.price) / referencePrice) * 100.0
-      : ((lvl.price - referencePrice) / referencePrice) * 100.0;
-    return distPct >= effectiveMinDistPct && distPct <= maxDistPct;
-  }).map((lvl) => ({ ...lvl, type: targetRole }));
+  const validLevels = allCandidates
+    .filter((lvl) => {
+      const distPct = !isShort
+        ? ((referencePrice - lvl.price) / referencePrice) * 100.0
+        : ((lvl.price - referencePrice) / referencePrice) * 100.0;
+      return distPct >= effectiveMinDistPct && distPct <= maxDistPct;
+    })
+    .map((lvl) => ({ ...lvl, type: targetRole }));
 
   if (validLevels.length > 0) {
-    // Для DCA 1 приоритет — сильнейшему уточнённому глобальному уровню 1W->1D / 1D
-    const globalFirst = validLevels.filter((l) => l.source?.includes('GLOBAL'));
-    const bestFirst =
-      globalFirst.length > 0
-        ? globalFirst.reduce((best, cur) => {
-            const distBest = (Math.abs(referencePrice - best.price) / referencePrice) * 100;
-            const distCur = (Math.abs(referencePrice - cur.price) / referencePrice) * 100;
-            const rankBest = best.strength_score / (1 + distBest * 0.02);
-            const rankCur = cur.strength_score / (1 + distCur * 0.02);
-            return rankCur > rankBest ? cur : best;
-          })
-        : [...validLevels].sort((a, b) => {
-            if (Math.abs(b.strength_score - a.strength_score) > 0.4) {
-              return b.strength_score - a.strength_score;
-            }
-            return isShort ? a.price - b.price : b.price - a.price;
-          })[0];
+    // Для DCA 1 балансируем 1W->1D GLOBAL и сильные 1D LOCAL уровни (не перепрыгиваем рабочий 1D уровень ради -55% дальнего)
+    const primaryPool = validLevels.filter(
+      (l) =>
+        l.source?.includes('GLOBAL') ||
+        (l.source === '1D_LOCAL' && (l.strength_score >= 8 || l.bounces >= 2 || (l.mirror_retests || 0) > 0))
+    );
+    const poolToRank = primaryPool.length > 0 ? primaryPool : validLevels;
+    const bestFirst = poolToRank.reduce((best, cur) => {
+      const distBest = (Math.abs(referencePrice - best.price) / referencePrice) * 100;
+      const distCur = (Math.abs(referencePrice - cur.price) / referencePrice) * 100;
+      const rankBest = best.strength_score / (1 + distBest * 0.03);
+      const rankCur = cur.strength_score / (1 + distCur * 0.03);
+      return rankCur > rankBest ? cur : best;
+    });
 
-    // Для DCA 2 берем АБСОЛЮТНЫЙ исторический пик (для SHORT) или АБСОЛЮТНОЕ дно (для LONG) за всю историю 1D+4H
+    // Для DCA 2 берем АБСОЛЮТНЫЙ исторический пик (для SHORT) или АБСОЛЮТНОЕ дно (для LONG) за всю доступную историю 1D+4H
     const absExtreme = isShort ? absHighest : absLowest;
     let secondPrice = 0;
 
@@ -1914,7 +1937,8 @@ export function evaluateGlobalHedgeStrategy(
   candles4h: OhlcvCandle[],
   candles1d: OhlcvCandle[],
   mtf: MultiTimeframeAnalysis,
-  btcIsSafe = true
+  btcIsSafe = true,
+  candles1w?: OhlcvCandle[]
 ): GlobalHedgeEvaluation {
   const currentPrice =
     candles1h.length > 0
@@ -1948,12 +1972,12 @@ export function evaluateGlobalHedgeStrategy(
   const posPct = Number.isFinite(mtf.pos_4h_pct) ? mtf.pos_4h_pct : 50;
   const inEquilibriumZone = posPct >= 25.0 && posPct <= 75.0;
   const safeRsiZone =
-    mtf.rsi_1d >= 26.0 &&
-    mtf.rsi_1d <= 72.0 &&
-    mtf.rsi_4h >= 28.0 &&
-    mtf.rsi_4h <= 70.0 &&
-    mtf.rsi_1h >= 28.0 &&
-    mtf.rsi_1h <= 70.0;
+    mtf.rsi_1d >= 20.0 &&
+    mtf.rsi_1d <= 80.0 &&
+    mtf.rsi_4h >= 20.0 &&
+    mtf.rsi_4h <= 80.0 &&
+    mtf.rsi_1h >= 20.0 &&
+    mtf.rsi_1h <= 80.0;
   const noExtremeImpulse = btcIsSafe && !isKnifeDrop(candles1h) && !isPumpExhaustion(candles1h);
 
   const shouldEnter =
@@ -1969,8 +1993,8 @@ export function evaluateGlobalHedgeStrategy(
     Math.min(currentPrice * 0.982, Math.max(currentPrice * 0.955, rawShortTarget)).toPrecision(7)
   );
 
-  const longDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, false, 3.0);
-  const shortDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, true, 3.0);
+  const longDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, false, 3.0, 95.0, candles1w);
+  const shortDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, true, 3.0, 95.0, candles1w);
   const horizonLabel: 'MEDIUM_TERM_4H' | 'LONG_TERM_1D' =
     channelWidthPct >= 6.0 ? 'LONG_TERM_1D' : 'MEDIUM_TERM_4H';
 
@@ -2119,7 +2143,8 @@ export interface ScalpingSignalEvaluation {
 export function evaluateScalpingStrategy(
   candles: OhlcvCandle[],
   smartSupport: number,
-  smartResistance: number
+  smartResistance: number,
+  extraLevels?: ClusteredLevelWithHistory[]
 ): ScalpingSignalEvaluation {
   const n = candles.length;
   if (n < 30) {
@@ -2161,7 +2186,7 @@ export function evaluateScalpingStrategy(
   const volumeTrendOk =
     c.volume >= volMean[idx] * 0.7 || p.volume >= volMean[prev] * 0.9;
 
-  // Support bounce / Resistance rejection (detect_reversal_patterns / detect_bearish_reversal_patterns)
+  // Support bounce / Resistance rejection
   const body = Math.abs(c.close - c.open);
   const lowerWick = Math.min(c.open, c.close) - c.low;
   const upperWick = c.high - Math.max(c.open, c.close);
@@ -2173,21 +2198,36 @@ export function evaluateScalpingStrategy(
   const trendBearish =
     c.close < emaTrend[idx] * 1.004 && emaSlow[idx] <= emaTrend[idx] * 1.004;
 
+  // Собираем подтвержденные 1W->1D GLOBAL / 1D LOCAL зоны для проверки касания и отбоя
+  const levelZones = (extraLevels || []).filter(
+    (l) => l.timeframe_role === 'GLOBAL_1W_1D' || l.timeframe_role === 'LOCAL_1D'
+  );
+  const inZoneSupport = levelZones.some((l) => {
+    const zHigh = l.zone_high && l.zone_high > l.price ? l.zone_high : l.price * 1.008;
+    const zLow = l.zone_low && l.zone_low < l.price ? l.zone_low : l.price * 0.988;
+    return l.price <= c.close * 1.01 && c.low <= zHigh * 1.004 && c.close >= zLow * 0.995;
+  });
+  const inZoneResistance = levelZones.some((l) => {
+    const zLow = l.zone_low && l.zone_low < l.price ? l.zone_low : l.price * 0.992;
+    const zHigh = l.zone_high && l.zone_high > l.price ? l.zone_high : l.price * 1.012;
+    return l.price >= c.close * 0.99 && c.high >= zLow * 0.996 && c.close <= zHigh * 1.005;
+  });
+
   // --- LONG SIGNALS ---
-  // Mode A: Level Reversal Long (bounce from support in oversold zone)
+  // Mode A: Level Reversal Long (bounce from support/1D zone)
   const supportBounce =
     c.low <= smartSupport * 1.008 &&
     c.close >= smartSupport * 0.995 &&
     (greenCandle || hasLowerWick);
   const nearSupport =
     c.low <= smartSupport * 1.012 && c.close >= smartSupport * 0.985;
-  const supportSignal = supportBounce || nearSupport;
+  const supportSignal = supportBounce || nearSupport || (inZoneSupport && (greenCandle || hasLowerWick));
 
   const waveOversoldCross =
     (wt1[idx] > wt2[idx] && (wt1[prev] <= wt2[prev] || wt2[idx] <= -25)) ||
     (wt2[idx] <= -42 && wt1[idx] > wt1[prev]);
   const rsiOversoldOk =
-    rsiSeries[idx] <= 45.0 && (rsiSeries[idx] <= 38.0 || rsiSeries[idx] > rsiSeries[prev]);
+    rsiSeries[idx] <= 45.0 && (rsiSeries[idx] <= 20.0 || rsiSeries[idx] > rsiSeries[prev]);
 
   const levelReversalEntryLong =
     supportSignal &&
@@ -2199,7 +2239,7 @@ export function evaluateScalpingStrategy(
     !isKnifeDrop(candles) &&
     !isPumpExhaustion(candles);
 
-  // Mode B: Trend Momentum / Pullback Long (trading along an active bullish trend)
+  // Mode B: Trend Momentum / Pullback Long (trading along an active bullish trend, RSI up to 80)
   const emaCrossoverUp =
     emaFast[idx] > emaSlow[idx] && emaFast[prev] <= emaSlow[prev];
   const emaBounceUp =
@@ -2210,10 +2250,9 @@ export function evaluateScalpingStrategy(
     emaCrossoverUp ||
     emaBounceUp ||
     (c.close > emaFast[idx] && emaFast[idx] >= emaSlow[idx] * 0.999);
-  // In an active bullish trend (close > EMA21 >= EMA50), RSI(14) is in the bullish zone [38, 62]
   const momentumRsiUp =
-    rsiSeries[idx] >= 38.0 &&
-    rsiSeries[idx] <= 62.0 &&
+    rsiSeries[idx] >= 35.0 &&
+    rsiSeries[idx] <= 80.0 &&
     (rsiSeries[idx] >= rsiSeries[prev] - 1.5 || wt1[idx] >= wt2[idx]);
   const trendMomentumEntryLong =
     trendBullish &&
@@ -2225,20 +2264,21 @@ export function evaluateScalpingStrategy(
     !isKnifeDrop(candles);
 
   // --- SHORT SIGNALS ---
-  // Mode A: Level Reversal Short (rejection from resistance in overbought zone)
+  // Mode A: Level Reversal Short (rejection from resistance/1D zone)
   const resistanceRejection =
     c.high >= smartResistance * 0.992 &&
     c.close <= smartResistance * 1.005 &&
     (redCandle || hasUpperWick);
   const nearResistance =
     c.high >= smartResistance * 0.988 && c.close <= smartResistance * 1.015;
-  const resistanceSignal = resistanceRejection || nearResistance;
+  const resistanceSignal =
+    resistanceRejection || nearResistance || (inZoneResistance && (redCandle || hasUpperWick));
 
   const waveOverboughtCross =
     (wt1[idx] < wt2[idx] && (wt1[prev] >= wt2[prev] || wt2[idx] >= 25)) ||
     (wt2[idx] >= 42 && wt1[idx] < wt1[prev]);
   const rsiOverboughtOk =
-    rsiSeries[idx] >= 55.0 && (rsiSeries[idx] >= 62.0 || rsiSeries[idx] < rsiSeries[prev]);
+    rsiSeries[idx] >= 55.0 && (rsiSeries[idx] >= 80.0 || rsiSeries[idx] < rsiSeries[prev]);
 
   const levelReversalEntryShort =
     resistanceSignal &&
@@ -2250,7 +2290,7 @@ export function evaluateScalpingStrategy(
     !isPumpExhaustion(candles) &&
     !isKnifeDrop(candles);
 
-  // Mode B: Trend Momentum / Pullback Short (trading along an active bearish trend!)
+  // Mode B: Trend Momentum / Pullback Short (trading along an active bearish trend, RSI >= 20)
   const emaCrossoverDown =
     emaFast[idx] < emaSlow[idx] && emaFast[prev] >= emaSlow[prev];
   const emaBounceDown =
@@ -2261,10 +2301,9 @@ export function evaluateScalpingStrategy(
     emaCrossoverDown ||
     emaBounceDown ||
     (c.close < emaFast[idx] && emaFast[idx] <= emaSlow[idx] * 1.001);
-  // In an active bearish trend (close < EMA21 <= EMA50), RSI(14) is in the bearish zone [25, 62]
   const momentumRsiDown =
-    rsiSeries[idx] >= 25.0 &&
-    rsiSeries[idx] <= 62.0 &&
+    rsiSeries[idx] >= 20.0 &&
+    rsiSeries[idx] <= 65.0 &&
     (rsiSeries[idx] <= rsiSeries[prev] + 1.5 || wt1[idx] <= wt2[idx]);
   const trendMomentumEntryShort =
     trendBearish &&
@@ -2280,13 +2319,13 @@ export function evaluateScalpingStrategy(
   const enterShort =
     (levelReversalEntryShort || trendMomentumEntryShort) && !trendMomentumEntryLong;
 
-  // Exits
+  // Exits (RSI 80 / 20)
   const resistanceTested = c.high >= smartResistance * 0.998;
   const waveTopReversal =
     wt1[idx] < wt2[idx] && wt1[prev] >= wt2[prev] && wt2[idx] >= 45;
   const levelTargetExitLong =
-    resistanceTested && (rsiSeries[idx] >= 68 || waveTopReversal);
-  const rsiExhaustionLong = rsiSeries[idx] >= 78 && redCandle;
+    resistanceTested && (rsiSeries[idx] >= 80 || waveTopReversal);
+  const rsiExhaustionLong = rsiSeries[idx] >= 80 && redCandle;
   const trendBreakLong =
     c.close < emaTrend[idx] && emaFast[idx] < emaSlow[idx] && rsiSeries[idx] < 40;
   const exitLong = levelTargetExitLong || rsiExhaustionLong || trendBreakLong;
@@ -2295,8 +2334,8 @@ export function evaluateScalpingStrategy(
   const waveBottomReversal =
     wt1[idx] > wt2[idx] && wt1[prev] <= wt2[prev] && wt2[idx] <= -45;
   const levelTargetExitShort =
-    supportTested && (rsiSeries[idx] <= 32 || waveBottomReversal);
-  const rsiExhaustionShort = rsiSeries[idx] <= 22 && greenCandle;
+    supportTested && (rsiSeries[idx] <= 20 || waveBottomReversal);
+  const rsiExhaustionShort = rsiSeries[idx] <= 20 && greenCandle;
   const trendBreakShort =
     c.close > emaTrend[idx] && emaFast[idx] > emaSlow[idx] && rsiSeries[idx] > 60;
   const exitShort = levelTargetExitShort || rsiExhaustionShort || trendBreakShort;
@@ -2401,19 +2440,23 @@ export function canExecuteDca(
 
   // 4. Portfolio Margin Guard: max margin share on a single coin (<= 20%)
   const lev = Math.max(1, params.leverage || config.leverage);
+  const minDcaStake = Math.max(5, config.min_stake_amount || 5);
   const currentPairNotional = params.currentAmount * params.currentPrice;
   const currentPairMargin = currentPairNotional / lev;
+  const maxPairMarginLimit = (maxPairMarginPct / 100.0) * totalBalance;
+  const remainingPairMargin = Math.max(0, maxPairMarginLimit - currentPairMargin);
+
   const nextAddAmount =
     config.dca_scale_mode === 'linear' ? baseAmt : params.currentAmount;
   const nextAddNotional = nextAddAmount * params.currentPrice;
-  const nextAddMargin = nextAddNotional / lev;
-  const totalPairMarginAfter = currentPairMargin + nextAddMargin;
-  const pairMarginSharePct = (totalPairMarginAfter / totalBalance) * 100.0;
+  const rawNextAddMargin = nextAddNotional / lev;
+  const effectiveNextMargin = Math.max(minDcaStake, Math.min(rawNextAddMargin, remainingPairMargin));
 
-  if (pairMarginSharePct > maxPairMarginPct) {
+  if (remainingPairMargin < minDcaStake) {
+    const curSharePct = (currentPairMargin / totalBalance) * 100.0;
     return {
       allowed: false,
-      reason: `Portfolio Guard: монета ${params.pair} займет ${pairMarginSharePct.toFixed(1)}% маржи депозита (лимит ${maxPairMarginPct}%)`,
+      reason: `Portfolio Guard: монета ${params.pair} уже занимает ${curSharePct.toFixed(1)}% маржи депозита (лимит ${maxPairMarginPct}%)`,
       multiplier: currentMultiplier,
       liquidationDistancePct: 100,
     };
@@ -2421,10 +2464,10 @@ export function canExecuteDca(
 
   // 5. Free balance check
   const availableBalance = Math.max(0, totalBalance - params.usedMarginUsdt);
-  if (availableBalance < nextAddMargin) {
+  if (availableBalance < effectiveNextMargin) {
     return {
       allowed: false,
-      reason: `Не хватает свободной маржи: нужно ~${nextAddMargin.toFixed(2)} USDT, доступно ${availableBalance.toFixed(2)} USDT`,
+      reason: `Не хватает свободной маржи: нужно ~${effectiveNextMargin.toFixed(2)} USDT, доступно ${availableBalance.toFixed(2)} USDT`,
       multiplier: currentMultiplier,
       liquidationDistancePct: 100,
     };
@@ -2466,12 +2509,10 @@ export function canExecuteDca(
 
 /**
  * Calculates the optimal DCA coin volume to pull the average entry price as close
- * to the current market price as possible (within ~0.8%), taking into account:
- * - existing coin count in trade (amount)
- * - total account deposit
- * - available free margin
- * - number of other active coins that may also need margin
- * - single-pair margin cap (max 20% of deposit)
+ * to the current market price as possible (within ~0.8%), strictly respecting:
+ * - remaining single-pair margin quota (max 20% of deposit)
+ * - available free margin & fair share across active coins
+ * - minimum order stake (default $5, never forcing $25 over quota)
  */
 export function calculateDynamicDcaAmount(params: {
   currentAmount: number;
@@ -2483,9 +2524,11 @@ export function calculateDynamicDcaAmount(params: {
   usedMarginUsdt: number;
   otherActiveCoinsCount: number;
   maxPairMarginPct?: number;
+  minStakeUsdt?: number;
 }): { addAmount: number; addStake: number; targetAvgPrice: number; pullDistancePct: number } {
   const lev = Math.max(1, params.leverage);
-  const totalBalance = Math.max(100, params.totalBalanceUsdt);
+  const minStake = Math.max(5, params.minStakeUsdt || 5);
+  const totalBalance = Math.max(minStake, params.totalBalanceUsdt);
   const freeMargin = Math.max(0, totalBalance - params.usedMarginUsdt);
   const maxPairMarginLimit = ((params.maxPairMarginPct || 20.0) / 100) * totalBalance;
 
@@ -2493,21 +2536,25 @@ export function calculateDynamicDcaAmount(params: {
   const currentPairMargin = currentPairNotional / lev;
   const remainingPairMargin = Math.max(0, maxPairMarginLimit - currentPairMargin);
 
-  // Reserve margin for other coins: allocate at most 50% of free margin or fair share
+  // Reserve margin for other coins: allocate at most 50% of free margin or fair share, never exceeding remainingPairMargin
   const fairShareMargin = freeMargin / Math.max(1, params.otherActiveCoinsCount + 1);
-  const maxSafeMarginForThisStep = Math.min(
-    remainingPairMargin,
-    Math.max(25, Math.min(freeMargin * 0.5, fairShareMargin * 1.5))
-  );
+  const budgetPool = Math.min(freeMargin * 0.6, Math.max(minStake, fairShareMargin * 1.5));
+  const maxSafeMarginForThisStep = Math.min(remainingPairMargin, budgetPool, freeMargin);
+
+  if (maxSafeMarginForThisStep < minStake || params.currentPrice <= 0) {
+    return {
+      addAmount: 0,
+      addStake: 0,
+      targetAvgPrice: Number(params.openRate.toPrecision(7)),
+      pullDistancePct: 0,
+    };
+  }
 
   // Desired average entry price: pull within 0.8% towards current reversal price
-  // For LONG (openRate > currentPrice): targetAvgPrice is slightly above currentPrice (currentPrice * 1.008)
-  // For SHORT (openRate < currentPrice): targetAvgPrice is slightly below currentPrice (currentPrice * 0.992)
   const targetAvgPrice = params.isShort
     ? Math.max(params.openRate, params.currentPrice * 0.992)
     : Math.min(params.openRate, params.currentPrice * 1.008);
 
-  // Q_add = Q_old * |P_old - P_target| / |P_target - P_current|
   const priceDiffOld = Math.abs(params.openRate - targetAvgPrice);
   const priceDiffNew = Math.abs(targetAvgPrice - params.currentPrice);
 
@@ -2516,10 +2563,11 @@ export function calculateDynamicDcaAmount(params: {
     desiredAddAmount = Math.min(params.currentAmount * 2.5, params.currentAmount * (priceDiffOld / priceDiffNew));
   }
 
-  // Convert desired amount to margin
   const desiredMargin = (desiredAddAmount * params.currentPrice) / lev;
-  // Bound by safe margin (at least 25 USDT, at most maxSafeMarginForThisStep)
-  const finalStake = Math.max(25, Math.min(desiredMargin, Math.max(25, maxSafeMarginForThisStep)));
+  const finalStake = Math.min(
+    maxSafeMarginForThisStep,
+    Math.max(minStake, desiredMargin)
+  );
   const finalAddAmount = Number(
     ((finalStake * lev) / Math.max(1e-8, params.currentPrice)).toFixed(4)
   );
