@@ -600,7 +600,6 @@ export default function App() {
             const exKey = `${exName}:${tk.pair}`;
             byExAndPair.set(exKey, tk);
             const prevTk = byPairLatest.get(tk.pair);
-            // Prefer Bybit as canonical fallback in byPairLatest so pair prices don't oscillate between two exchanges
             if (
               !prevTk ||
               exName === 'bybit' ||
@@ -615,9 +614,10 @@ export default function App() {
             if (!prev || !Array.isArray(prev.pair_metrics)) return prev;
             let changed = false;
             const nextMetrics = prev.pair_metrics.map((cur) => {
-              const tk = byExAndPair.get(`bybit:${cur.pair}`) || byPairLatest.get(cur.pair);
+              // Strictly use Bybit ticker for canonical pair list so sidebar prices never jump between Bybit & Binance
+              const tk = byExAndPair.get(`bybit:${cur.pair}`);
               const livePx = Number(tk?.markPrice || tk?.price || 0);
-              if (!tk || livePx <= 0) return cur;
+              if (!tk || livePx <= 0 || livePx === cur.price) return cur;
               changed = true;
               const has24hStats = typeof tk.volume24h === 'number' && tk.volume24h > 0;
               return {
@@ -643,13 +643,12 @@ export default function App() {
             if (!prev.length) return prev;
             let anyChanged = false;
             const updated = prev.map((t) => {
-              const trEx = String(t.exchange || '').toLowerCase();
+              const trEx = String(t.exchange || 'bybit').toLowerCase();
+              // Strictly match the trade's own exchange so open position prices/PnL never jump between Binance & Bybit
               const tk =
-                (trEx === 'binance' || trEx === 'bybit'
+                trEx === 'binance' || trEx === 'bybit'
                   ? byExAndPair.get(`${trEx}:${t.pair}`)
-                  : null) ||
-                byExAndPair.get(`bybit:${t.pair}`) ||
-                byPairLatest.get(t.pair);
+                  : byExAndPair.get(`bybit:${t.pair}`) || byPairLatest.get(t.pair);
               if (!tk) return t;
               const liveMark = Number(tk.markPrice > 0 ? tk.markPrice : tk.price || 0);
               if (!Number.isFinite(liveMark) || liveMark <= 0 || liveMark === t.current_rate) {
@@ -659,10 +658,20 @@ export default function App() {
               const gross = (t.is_short ? t.open_rate - liveMark : liveMark - t.open_rate) * t.amount;
               const fees = Number(t.fee_total || 0);
               const net = gross - fees;
-              const stake = Math.max(1e-8, Number(t.stake_amount || 1));
+              const rawStake = Number(t.stake_amount || 0);
+              const notional = Number(t.amount || 0) * Number(t.open_rate || liveMark);
+              const lev = Math.max(1, Number(t.leverage || 10));
+              const safeStake =
+                rawStake > 0 && rawStake < 1e8 && (notional <= 0 || rawStake <= notional * 1.05)
+                  ? rawStake
+                  : notional > 0
+                  ? Number((notional / lev).toFixed(2))
+                  : 1;
+              const stake = Math.max(1e-8, safeStake);
               const pct = (net / stake) * 100;
               return {
                 ...t,
+                stake_amount: safeStake,
                 current_rate: liveMark,
                 gross_profit: Number(gross.toFixed(4)),
                 profit_abs: Number(net.toFixed(3)),

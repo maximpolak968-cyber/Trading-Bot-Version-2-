@@ -249,7 +249,17 @@ export const TradeView: React.FC<TradeViewProps> = ({
   );
 
   const financialSummary = useMemo(() => {
-    const openMarginSum = openTrades.reduce((s, t) => s + Number(t.stake_amount || 0), 0);
+    const sanitizeTradeStake = (t: FreqtradeTrade): number => {
+      const raw = Number(t.stake_amount || 0);
+      const notional =
+        Math.abs(Number(t.amount || 0)) * Number(t.open_rate || t.current_rate || 0);
+      const lev = Math.max(1, Number(t.leverage || 10));
+      const fallback = notional > 0 ? Number((notional / lev).toFixed(2)) : 0;
+      if (!Number.isFinite(raw) || raw <= 0 || raw >= 1e8) return fallback;
+      if (notional > 0 && raw > notional * 1.05) return fallback;
+      return raw;
+    };
+    const openMarginSum = openTrades.reduce((s, t) => s + sanitizeTradeStake(t), 0);
     const openPnlSum = openTrades.reduce(
       (s, t) => s + Number(t.net_profit ?? t.profit_abs ?? 0),
       0
@@ -259,17 +269,27 @@ export const TradeView: React.FC<TradeViewProps> = ({
       0
     );
     const walletBal = Number(balance?.wallet_balance ?? balance?.total ?? 0);
+    const rawUsedMargin = Number(balance?.used_margin ?? 0);
+    const validBalanceUsedMargin =
+      Number.isFinite(rawUsedMargin) &&
+      rawUsedMargin > 0 &&
+      rawUsedMargin < 1e8 &&
+      (walletBal <= 0 || rawUsedMargin <= walletBal * 5 + openMarginSum * 2)
+        ? rawUsedMargin
+        : 0;
     const usedMargin =
-      typeof balance?.used_margin === 'number' && balance.used_margin > 0
+      validBalanceUsedMargin > 0
         ? openTrades.length > 0
-          ? Math.max(balance.used_margin, openMarginSum)
-          : balance.used_margin
+          ? Math.max(validBalanceUsedMargin, openMarginSum)
+          : validBalanceUsedMargin
         : openMarginSum;
+    const rawAvail = Number(balance?.available_balance);
     const freeMargin =
-      typeof balance?.available_balance === 'number' &&
-      balance.available_balance >= 0 &&
-      (usedMargin === 0 || balance.available_balance <= walletBal - usedMargin + 0.5)
-        ? balance.available_balance
+      Number.isFinite(rawAvail) &&
+      rawAvail > 0 &&
+      rawAvail < 1e8 &&
+      (usedMargin === 0 || rawAvail <= walletBal - usedMargin + 0.5)
+        ? rawAvail
         : Math.max(0, walletBal - usedMargin);
     const equityBal = walletBal + openPnlSum;
     return {

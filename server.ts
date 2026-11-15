@@ -53,6 +53,8 @@ import {
   getFuturesExecutionPrice,
   getAllLiveWsTickers,
   getWebSocketEngineStatus,
+  sanitizePositionMarginUsdt,
+  sanitizeWalletUsedMarginUsdt,
   LiveWsTicker,
   WsOrderFillEvent,
   WsPositionClosedEvent,
@@ -984,36 +986,11 @@ async function fetchRealCandles(
     parse: (raw: any) => RawCandle[];
   }
 
-  // Публичные свечи запрашиваем в первую очередь с фьючерсных рынков (Bybit V5 Linear и Binance USD-M Futures),
-  // чтобы исторические свечи 1:1 совпадали с живым фьючерсным WebSocket-потоком без расхождения Spot vs Futures.
+  // Публичные свечи запрашиваем строго с реальных фьючерсных рынков Mainnet (Bybit V5 Linear и Binance USD-M Futures),
+  // чтобы исторические свечи и уровни MTF 1:1 совпадали с живым фьючерсным WebSocket-потоком без скачков цен Testnet vs Mainnet.
   const allProviders: KlineProvider[] = [
     ...(bybitIntervals[interval]
       ? [
-          ...(exchangeAccountsStore.some((a) => a.enabled && a.exchange === 'bybit' && a.is_testnet)
-            ? [
-                {
-                  id: 'bybit' as SupportedExchange,
-                  name: `Bybit Testnet (${interval})`,
-                  url: `https://api-testnet.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=${bybitIntervals[interval]}&limit=${safeLimit}${
-                    endTimeMs ? `&end=${endTimeMs}` : ''
-                  }`,
-                  parse: (raw: any) => {
-                    const list = raw?.result?.list;
-                    if (!Array.isArray(list)) return [];
-                    return list
-                      .map((k: any[]) => ({
-                        timestamp: Number(k[0]),
-                        open: parseFloat(k[1]),
-                        high: parseFloat(k[2]),
-                        low: parseFloat(k[3]),
-                        close: parseFloat(k[4]),
-                        volume: parseFloat(k[5]),
-                      }))
-                      .sort((a, b) => a.timestamp - b.timestamp);
-                  },
-                },
-              ]
-            : []),
           {
             id: 'bybit' as SupportedExchange,
             name: `Bybit Futures (${interval})`,
@@ -1034,27 +1011,6 @@ async function fetchRealCandles(
                 }))
                 .sort((a, b) => a.timestamp - b.timestamp);
             },
-          },
-        ]
-      : []),
-    ...(exchangeAccountsStore.some((a) => a.enabled && a.exchange === 'binance' && a.is_testnet) &&
-    !isBinanceHostRateLimited('https://testnet.binancefuture.com').limited
-      ? [
-          {
-            id: 'binance' as SupportedExchange,
-            name: `Binance Testnet (${interval})`,
-            url: `https://testnet.binancefuture.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${safeLimit}${endTimeParam}`,
-            parse: (raw: any) =>
-              Array.isArray(raw)
-                ? raw.map((k: any[]) => ({
-                    timestamp: Number(k[0]),
-                    open: parseFloat(k[1]),
-                    high: parseFloat(k[2]),
-                    low: parseFloat(k[3]),
-                    close: parseFloat(k[4]),
-                    volume: parseFloat(k[5]),
-                  }))
-                : [],
           },
         ]
       : []),
@@ -1603,6 +1559,26 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
   const openRate = trade.open_rate > 0 ? trade.open_rate : 1;
   const refRate = trade.is_open ? trade.current_rate : (trade.close_rate ?? trade.current_rate);
   const totalAmount = Math.max(1e-8, trade.amount || 0);
+  if (trade.amount > 0 && trade.open_rate > 0) {
+    trade.stake_amount = sanitizePositionMarginUsdt(
+      Number(trade.stake_amount || 0),
+      trade.amount,
+      trade.open_rate,
+      lev
+    );
+    trade.initial_stake = sanitizePositionMarginUsdt(
+      Number(trade.initial_stake || trade.stake_amount || 0),
+      Number(trade.initial_amount || trade.amount),
+      Number(trade.initial_open_rate || trade.open_rate),
+      lev
+    );
+  }
+  if ((trade.dca_count || 0) === 0 && trade.open_rate > 0) {
+    trade.initial_open_rate = trade.open_rate;
+    if (Array.isArray(trade.orders) && trade.orders.length === 1 && Number(trade.orders[0]?.step || 0) === 0) {
+      trade.orders[0].price = trade.open_rate;
+    }
+  }
   const exchangeFeeRate = getExchangeTakerFeeRate(trade.exchange || 'bybit');
 
   // Суммируем комиссию на открытие по всем реально исполненным ордерам (Начальный вход + все шаги DCA) по реальной ставке Taker биржи
@@ -3038,55 +3014,77 @@ async function syncPositionsAndHistoryFromExchanges(
           }
           existingOpen.exchange_unrealized_pnl = Number(pos.unrealized_pnl || 0);
           existingOpen.exchange_synced_at = Date.now();
-          if (
-            Math.abs(existingOpen.amount - pos.size) > 1e-5 ||
-            Math.abs(existingOpen.open_rate - pos.entry_price) / Math.max(1e-8, pos.entry_price) > 0.0005 ||
-            (pos.margin_usdt > 0 && Math.abs((existingOpen.stake_amount || 0) - pos.margin_usdt) > 0.05)
-          ) {
-            const sizeIncreased = pos.size > existingOpen.amount * 1.02;
-            const entryShifted =
-              Math.abs(existingOpen.open_rate - pos.entry_price) / Math.max(1e-8, pos.entry_price) >
+          const sanitizedPosMargin = sanitizePositionMarginUsdt(
+            pos.margin_usdt,
+            pos.size,
+            pos.entry_price > 0 ? pos.entry_price : existingOpen.open_rate,
+            pos.leverage || existingOpen.leverage || 25
+          );
+          if (sanitizedPosMargin > 0) {
+            existingOpen.stake_amount = Number(sanitizedPosMargin.toFixed(2));
+          }
+          existingOpen.leverage = pos.leverage || existingOpen.leverage;
+
+          const sizeIncreased = pos.size > existingOpen.amount * 1.02;
+          const sizeChanged = Math.abs(existingOpen.amount - pos.size) > 1e-5;
+          const entryShifted =
+            pos.entry_price > 0 &&
+            Math.abs(existingOpen.open_rate - pos.entry_price) / Math.max(1e-8, pos.entry_price) >
               0.0003;
+          const isInitialFillAlignment =
+            !sizeIncreased &&
+            (existingOpen.dca_count || 0) === 0 &&
+            pos.entry_price > 0 &&
+            entryShifted &&
+            Date.now() - (existingOpen.open_timestamp || 0) < 120_000;
+
+          if (sizeChanged) {
+            existingOpen.amount = Number(pos.size.toFixed(4));
+          }
+
+          if (isInitialFillAlignment) {
+            const exactEntry = roundPrice(pos.entry_price);
+            existingOpen.open_rate = exactEntry;
+            existingOpen.initial_open_rate = exactEntry;
+            if (Array.isArray(existingOpen.orders) && existingOpen.orders.length === 1) {
+              existingOpen.orders[0].price = exactEntry;
+              existingOpen.orders[0].amount = existingOpen.amount;
+              existingOpen.orders[0].stake_amount = existingOpen.stake_amount;
+            }
+          } else if (sizeIncreased && entryShifted && pos.entry_price > 0) {
             const addedQty = Math.max(0, Number((pos.size - existingOpen.amount).toFixed(4)));
             const addedStake = Math.max(
               0,
-              Number((pos.margin_usdt - (existingOpen.stake_amount || 0)).toFixed(2))
+              Number((sanitizedPosMargin - (existingOpen.stake_amount || 0)).toFixed(2))
             );
             existingOpen.open_rate = roundPrice(pos.entry_price);
-            existingOpen.amount = Number(pos.size.toFixed(4));
-            if (pos.margin_usdt > 0) {
-              existingOpen.stake_amount = Number(pos.margin_usdt.toFixed(2));
-            }
-            existingOpen.leverage = pos.leverage || existingOpen.leverage;
-            if (sizeIncreased && entryShifted) {
-              const nextStep = (existingOpen.dca_count || 0) + 1;
-              existingOpen.dca_count = nextStep;
-              const nowTs = Date.now();
-              const nowDateStr = new Date(nowTs).toISOString().replace('T', ' ').slice(0, 19);
-              existingOpen.last_dca_date = nowDateStr;
-              if (!Array.isArray(existingOpen.orders)) existingOpen.orders = [];
-              existingOpen.orders.push({
-                id: `ord-ex-dca-${existingOpen.trade_id}-${nextStep}-${nowTs}`,
-                step: nextStep,
-                label: `DCA #${nextStep} (Синхр. с биржи ${acc.exchange.toUpperCase()})`,
-                side: existingOpen.is_short ? 'short' : 'long',
-                price: existingOpen.open_rate,
-                amount: addedQty > 0 ? addedQty : existingOpen.amount,
-                stake_amount: addedStake > 0 ? addedStake : existingOpen.stake_amount,
-                timestamp: nowTs,
-                date: nowDateStr,
-              });
-              if (!existingOpen.tp_manual_override) {
-                const newTp =
-                  pos.take_profit && pos.take_profit > 0
-                    ? roundPrice(pos.take_profit)
-                    : roundPrice(
-                        existingOpen.is_short
-                          ? existingOpen.open_rate * (1 - 0.009)
-                          : existingOpen.open_rate * (1 + 0.009)
-                      );
-                existingOpen.take_profit_abs = newTp;
-              }
+            const nextStep = (existingOpen.dca_count || 0) + 1;
+            existingOpen.dca_count = nextStep;
+            const nowTs = Date.now();
+            const nowDateStr = new Date(nowTs).toISOString().replace('T', ' ').slice(0, 19);
+            existingOpen.last_dca_date = nowDateStr;
+            if (!Array.isArray(existingOpen.orders)) existingOpen.orders = [];
+            existingOpen.orders.push({
+              id: `ord-ex-dca-${existingOpen.trade_id}-${nextStep}-${nowTs}`,
+              step: nextStep,
+              label: `DCA #${nextStep} (Синхр. с биржи ${acc.exchange.toUpperCase()})`,
+              side: existingOpen.is_short ? 'short' : 'long',
+              price: existingOpen.open_rate,
+              amount: addedQty > 0 ? addedQty : existingOpen.amount,
+              stake_amount: addedStake > 0 ? addedStake : existingOpen.stake_amount,
+              timestamp: nowTs,
+              date: nowDateStr,
+            });
+            if (!existingOpen.tp_manual_override) {
+              const newTp =
+                pos.take_profit && pos.take_profit > 0
+                  ? roundPrice(pos.take_profit)
+                  : roundPrice(
+                      existingOpen.is_short
+                        ? existingOpen.open_rate * (1 - 0.009)
+                        : existingOpen.open_rate * (1 + 0.009)
+                    );
+              existingOpen.take_profit_abs = newTp;
             }
           }
 
@@ -3358,7 +3356,7 @@ async function syncPositionsAndHistoryFromExchanges(
                   !consumedClosedKeys.has(cKey) &&
                   c.pair === localTrade.pair &&
                   (c.is_short === localTrade.is_short || c.order_id.startsWith('inc-')) &&
-                  c.updated_time >= Math.max(minValidTs, (localTrade.open_timestamp || 0) - 180_000)
+                  c.updated_time >= Math.max(minValidTs, (localTrade.open_timestamp || 0) - 5_000)
                 );
               })
             : undefined;
@@ -3394,7 +3392,7 @@ async function syncPositionsAndHistoryFromExchanges(
           const matchedKey = `${matchedClosed.order_id}:${matchedClosed.updated_time}:${matchedClosed.pair}:${matchedClosed.is_short ? 'S' : 'L'}`;
           consumedClosedKeys.add(matchedKey);
 
-          if (matchedClosed.entry_price > 0 && !matchedClosed.order_id.startsWith('inc-')) {
+          if (!(localTrade.open_rate > 0) && matchedClosed.entry_price > 0 && !matchedClosed.order_id.startsWith('inc-')) {
             localTrade.open_rate = roundPrice(matchedClosed.entry_price);
           }
           if (matchedClosed.qty > 0 && !matchedClosed.order_id.startsWith('inc-')) {
@@ -4313,17 +4311,21 @@ async function runScalpBotCycle(waitForActive = false) {
       scannedCount++;
       if (scannedCount > 24) break;
 
-      // Top-Down Анализ: 1W (300 свечей) -> 1D (вся доступная история) -> 4H (500 свечей) -> 1H (200 свечей)
+      // Top-Down Анализ: 1W (300 свечей) -> 1D (1000 свечей) -> 4H (1000 свечей) -> 1H (500 свечей) — единые ключи кэша с getOrComputeMtfBotLevels
       const [{ candles: c1w }, { candles: c1h }, { candles: c4h }, { candles: c1d }] =
         await Promise.all([
           fetchRealCandles(pair, '1w', 300),
-          fetchRealCandles(pair, botConfig.timeframe, 200),
-          fetchRealCandles(pair, '4h', 500),
+          fetchRealCandles(pair, botConfig.timeframe, 500),
+          fetchRealCandles(pair, '4h', 1000),
           fetchRealCandles(pair, '1d', 1000),
         ]);
       if (c1h.length < 35 || c4h.length < 25) continue;
 
-      const livePrice = c1h[c1h.length - 1].close;
+      const wsRefTick = getFuturesExecutionPrice(pair, false, false, eligibleAccounts[0]?.exchange);
+      const livePrice =
+        wsRefTick && wsRefTick.markPrice > 0
+          ? wsRefTick.markPrice
+          : c1h[c1h.length - 1].close;
       const pairLevels = await getOrComputeMtfBotLevels(pair, botConfig.timeframe);
       const manualSupLvl =
         pairLevels.find((l) => l.role === 'support' && l.manual_override) ||
@@ -4707,7 +4709,19 @@ async function createScalpBotPosition(
 
   const cleanPair = pair.toUpperCase();
   const isShort = side === 'short';
-  let entryRate = roundPrice(entryPrice);
+  const liveExQuote = getFuturesExecutionPrice(
+    cleanPair,
+    isShort,
+    false,
+    targetExchangeAcc.exchange
+  );
+  let entryRate = roundPrice(
+    liveExQuote && liveExQuote.executionPrice > 0
+      ? liveExQuote.executionPrice
+      : liveExQuote && liveExQuote.markPrice > 0
+      ? liveExQuote.markPrice
+      : entryPrice
+  );
   const targetAccId = getTargetAccountIdForRecord(targetExchangeAcc);
   const targetUserId = targetExchangeAcc.user_id || 'owner';
   const accLockKey = getPosLockKey(targetExchangeAcc.id, cleanPair, isShort);
@@ -5380,21 +5394,40 @@ async function startServer() {
       const aTargetId = getTargetAccountIdForRecord(a);
       const aOpen = openTrades.filter((t) => tradeMatchesAccount(t, a, aTargetId));
       const wBal = Number(a.wallet_balance_usdt ?? a.balance_usdt ?? 0);
-      const aLocalUsed = aOpen.reduce((s, t) => s + t.stake_amount, 0);
+      const aLocalUsed = aOpen.reduce(
+        (s, t) =>
+          s +
+          sanitizePositionMarginUsdt(
+            Number(t.stake_amount || 0),
+            Number(t.amount || 0),
+            Number(t.open_rate || 0),
+            Number(t.leverage || a.max_leverage || 25)
+          ),
+        0
+      );
       const aLocalPnl = aOpen.reduce((s, t) => s + t.profit_abs, 0);
+      const sanitizedAccUsed = sanitizeWalletUsedMarginUsdt(
+        Number(a.used_margin_usdt || 0),
+        wBal,
+        aLocalUsed,
+        aOpen.length
+      );
+      if (typeof a.used_margin_usdt === 'number' && Math.abs(a.used_margin_usdt - sanitizedAccUsed) > 1.0) {
+        a.used_margin_usdt = sanitizedAccUsed;
+      }
       const aUsed =
-        aIsReal && typeof a.used_margin_usdt === 'number' && a.used_margin_usdt > 0
+        aIsReal && sanitizedAccUsed > 0
           ? aOpen.length > 0
-            ? Math.max(a.used_margin_usdt, aLocalUsed)
-            : a.used_margin_usdt
+            ? Math.max(sanitizedAccUsed, aLocalUsed)
+            : sanitizedAccUsed
           : aLocalUsed;
       const computedFree = Math.max(0, wBal - aUsed);
       const aFree =
         aIsReal &&
         typeof a.available_balance_usdt === 'number' &&
         Number.isFinite(a.available_balance_usdt) &&
-        a.available_balance_usdt >= 0 &&
-        (aUsed === 0 || a.available_balance_usdt <= wBal - aUsed + 0.5)
+        a.available_balance_usdt > 0 &&
+        a.available_balance_usdt <= wBal - aUsed + 0.5
           ? a.available_balance_usdt
           : computedFree;
       const aPnl =
@@ -7319,25 +7352,43 @@ async function startServer() {
     );
     const accOpenPnl = accOpen.reduce((sum, t) => sum + t.profit_abs, 0);
     const accLocalUsed = Number(
-      accOpen.reduce((sum, t) => sum + t.stake_amount, 0).toFixed(2)
+      accOpen
+        .reduce(
+          (sum, t) =>
+            sum +
+            sanitizePositionMarginUsdt(
+              Number(t.stake_amount || 0),
+              Number(t.amount || 0),
+              Number(t.open_rate || 0),
+              Number(t.leverage || acc.max_leverage || 25)
+            ),
+          0
+        )
+        .toFixed(2)
     );
     const liveUnrealized =
       typeof acc.unrealized_pnl === 'number' && Number.isFinite(acc.unrealized_pnl) && acc.unrealized_pnl !== 0
         ? acc.unrealized_pnl
         : accOpenPnl;
-    const usedMargin =
-      typeof acc.used_margin_usdt === 'number' && acc.used_margin_usdt > 0
-        ? accOpen.length > 0
-          ? Number(Math.max(acc.used_margin_usdt, accLocalUsed).toFixed(2))
-          : Number(acc.used_margin_usdt.toFixed(2))
-        : accLocalUsed;
     const walletBal = Number((acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0).toFixed(2));
+    const sanitizedAccUsed = sanitizeWalletUsedMarginUsdt(
+      Number(acc.used_margin_usdt || 0),
+      walletBal,
+      accLocalUsed,
+      accOpen.length
+    );
+    const usedMargin =
+      sanitizedAccUsed > 0
+        ? accOpen.length > 0
+          ? Number(Math.max(sanitizedAccUsed, accLocalUsed).toFixed(2))
+          : Number(sanitizedAccUsed.toFixed(2))
+        : accLocalUsed;
     const computedAvail = Number(Math.max(0, walletBal - usedMargin).toFixed(2));
     const availBal =
       typeof acc.available_balance_usdt === 'number' &&
       Number.isFinite(acc.available_balance_usdt) &&
-      acc.available_balance_usdt >= 0 &&
-      (usedMargin === 0 || acc.available_balance_usdt <= walletBal - usedMargin + 0.5)
+      acc.available_balance_usdt > 0 &&
+      acc.available_balance_usdt <= walletBal - usedMargin + 0.5
         ? Number(acc.available_balance_usdt.toFixed(2))
         : computedAvail;
     return serializeAccountForClient({
@@ -8444,7 +8495,41 @@ async function startServer() {
   };
 
   onWsExchangeExecution((evt: WsOrderFillEvent) => {
-    if (!evt.isCloseFill) return;
+    if (!evt.isCloseFill) {
+      // Если пришёл приватный WS-отчёт об исполнении начального входа (OPEN), фиксируем точную цену исполнения биржи 1:1
+      if (evt.avgPrice > 0 && evt.qty > 0) {
+        const matchedAcc = exchangeAccountsStore.find(
+          (a) => a.enabled && sanitizeCredentialString(a.api_key_raw) === evt.apiKey
+        );
+        if (matchedAcc) {
+          const targetAccountId = getTargetAccountIdForRecord(matchedAcc);
+          const openTr = tradesStore.find(
+            (t) =>
+              t.is_open &&
+              tradeMatchesAccount(t, matchedAcc, targetAccountId) &&
+              t.pair === evt.pair &&
+              t.is_short === evt.isShort &&
+              (t.dca_count || 0) === 0 &&
+              Date.now() - (t.open_timestamp || 0) < 90_000
+          );
+          if (openTr) {
+            const exactFill = roundPrice(evt.avgPrice);
+            if (Math.abs(openTr.open_rate - exactFill) / Math.max(1e-8, exactFill) > 0.0001) {
+              openTr.open_rate = exactFill;
+              openTr.initial_open_rate = exactFill;
+              if (Array.isArray(openTr.orders) && openTr.orders.length === 1) {
+                openTr.orders[0].price = exactFill;
+              }
+              recalculateTradeMetrics(openTr, false);
+              sqliteDb.upsertTrade(openTr);
+              broadcastTradeLifecycleEvent('trade:updated', openTr);
+              scheduleScopeStateSync(matchedAcc.user_id || 'owner');
+            }
+          }
+        }
+      }
+      return;
+    }
     void handleInstantExchangeCloseFromWs({
       exchange: evt.exchange,
       apiKey: evt.apiKey,
@@ -8486,7 +8571,19 @@ async function startServer() {
           (t) => t.is_open && tradeMatchesAccount(t, acc, targetAccountId)
         );
         const localOpenMargin = Number(
-          accOpenTrades.reduce((s, t) => s + (t.stake_amount || 0), 0).toFixed(2)
+          accOpenTrades
+            .reduce(
+              (s, t) =>
+                s +
+                sanitizePositionMarginUsdt(
+                  Number(t.stake_amount || 0),
+                  Number(t.amount || 0),
+                  Number(t.open_rate || 0),
+                  Number(t.leverage || acc.max_leverage || 25)
+                ),
+              0
+            )
+            .toFixed(2)
         );
 
         acc.balance_usdt = Number(wsState.walletBalanceUsdt.toFixed(4));
@@ -8494,8 +8591,15 @@ async function startServer() {
         acc.unrealized_pnl = Number(wsState.unrealizedPnlUsdt.toFixed(4));
         acc.equity_usdt = Number(wsState.equityUsdt.toFixed(4));
 
-        if (wsState.usedMarginUsdt > 0) {
-          acc.used_margin_usdt = Number(Math.max(wsState.usedMarginUsdt, localOpenMargin).toFixed(2));
+        const sanitizedWsMargin = sanitizeWalletUsedMarginUsdt(
+          wsState.usedMarginUsdt,
+          acc.wallet_balance_usdt,
+          localOpenMargin,
+          wsState.positionsSynced ? wsState.positions.length : accOpenTrades.length
+        );
+
+        if (sanitizedWsMargin > 0) {
+          acc.used_margin_usdt = Number(Math.max(sanitizedWsMargin, localOpenMargin).toFixed(2));
         } else if (wsState.positionsSynced && wsState.positions.length === 0) {
           acc.used_margin_usdt = 0;
         } else if (localOpenMargin > 0) {
@@ -8510,16 +8614,39 @@ async function startServer() {
         }
         acc.status = 'connected';
 
-        // Мгновенно синхронизируем цену входа, объём и маржу открытых позиций по приватным WS-событиям биржи
+        // Мгновенно синхронизируем объём, маржу и PnL открытых позиций по приватным WS-событиям биржи,
+        // НО цену входа (open_rate) обновляем ТОЛЬКО при реальном увеличении объёма (DCA) или первичном выравнивании после открытия!
         let needsFullPositionSync = false;
         for (const pos of wsState.positions) {
           const existing = accOpenTrades.find(
             (t) => t.pair === pos.pair && t.is_short === pos.is_short
           );
           if (existing) {
-            if (pos.entry_price > 0) existing.open_rate = roundPrice(pos.entry_price);
+            const sizeIncreased = pos.size > existing.amount * 1.02;
+            const isInitialFillAlign =
+              !sizeIncreased &&
+              (existing.dca_count || 0) === 0 &&
+              pos.entry_price > 0 &&
+              Date.now() - (existing.open_timestamp || 0) < 120_000 &&
+              Math.abs(existing.open_rate - pos.entry_price) / Math.max(1e-8, pos.entry_price) > 0.0002;
+            if (isInitialFillAlign) {
+              const exactEntry = roundPrice(pos.entry_price);
+              existing.open_rate = exactEntry;
+              existing.initial_open_rate = exactEntry;
+              if (Array.isArray(existing.orders) && existing.orders.length === 1) {
+                existing.orders[0].price = exactEntry;
+              }
+            } else if (sizeIncreased && pos.entry_price > 0) {
+              existing.open_rate = roundPrice(pos.entry_price);
+            }
             if (pos.size > 0) existing.amount = Number(pos.size.toFixed(4));
-            if (pos.margin_usdt > 0) existing.stake_amount = Number(pos.margin_usdt.toFixed(2));
+            const sanitizedPosIm = sanitizePositionMarginUsdt(
+              pos.margin_usdt,
+              pos.size > 0 ? pos.size : existing.amount,
+              existing.open_rate,
+              pos.leverage || existing.leverage || 25
+            );
+            if (sanitizedPosIm > 0) existing.stake_amount = Number(sanitizedPosIm.toFixed(2));
             if (pos.mark_price > 0) {
               existing.current_rate = roundPrice(pos.mark_price);
               existing.exchange_mark_price = pos.mark_price;

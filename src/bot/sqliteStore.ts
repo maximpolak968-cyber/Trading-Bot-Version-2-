@@ -3,6 +3,10 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import crypto from 'crypto';
+import {
+  sanitizePositionMarginUsdt,
+  sanitizeWalletUsedMarginUsdt,
+} from './exchangeWebSocket';
 
 const require = createRequire(import.meta.url);
 // Use Node 22 built-in node:sqlite DatabaseSync
@@ -309,6 +313,8 @@ export class SqliteBotDatabase {
       ['connected_at', 'INTEGER DEFAULT 0'],
       ['is_testnet', 'INTEGER DEFAULT 0'],
       ['user_id', "TEXT DEFAULT 'owner'"],
+      ['used_margin_usdt', 'REAL DEFAULT 0'],
+      ['available_balance_usdt', 'REAL DEFAULT 0'],
     ];
     for (const [col, def] of extraAccCols) {
       try {
@@ -793,7 +799,37 @@ export class SqliteBotDatabase {
         .prepare(`SELECT id, open_date, open_timestamp, close_date, close_timestamp FROM trades WHERE id = ?`)
         .get(trade.trade_id) as any;
 
+      const lev = Math.max(1, Number(trade.leverage || 25));
+      const amt = Math.max(0, Number(trade.amount || 0));
+      const openRate = Math.max(0, Number(trade.open_rate || 0));
+      const dcaCount = Number(trade.dca_count || 0);
+      if (amt > 0 && openRate > 0) {
+        trade.stake_amount = sanitizePositionMarginUsdt(
+          Number(trade.stake_amount || 0),
+          amt,
+          openRate,
+          lev
+        );
+        const initAmt = Math.max(0, Number(trade.initial_amount || amt));
+        const initRate = Math.max(0, Number(trade.initial_open_rate || openRate));
+        trade.initial_stake = sanitizePositionMarginUsdt(
+          Number(trade.initial_stake || trade.stake_amount || 0),
+          initAmt,
+          initRate,
+          lev
+        );
+      }
+      if (dcaCount === 0 && openRate > 0) {
+        trade.initial_open_rate = openRate;
+      }
+
       const rawOrders = Array.isArray(trade.orders) ? trade.orders : [];
+      if (dcaCount === 0 && openRate > 0 && rawOrders.length === 1 && Number(rawOrders[0]?.step || 0) === 0) {
+        rawOrders[0].price = openRate;
+        if (trade.stake_amount > 0) {
+          rawOrders[0].stake_amount = trade.stake_amount;
+        }
+      }
       const derivedDcaHistory =
         Array.isArray(trade.dca_history) && trade.dca_history.length > 0
           ? trade.dca_history
@@ -932,6 +968,7 @@ export class SqliteBotDatabase {
             campaign_id = ?, campaign_banked_profit = ?, trade_state = ?,
             next_dca_price = ?, tp_manual_override = ?, sl_manual_override = ?,
             dca_manual_override = ?, planned_dca_json = ?, orders_json = ?,
+            initial_open_rate = ?,
             account_id = ?, account_name = ?, parent_trade_id = ?,
             current_rate = ?, synced_accounts_json = ?, open_timestamp = ?, close_timestamp = ?,
             user_id = ?
@@ -974,6 +1011,7 @@ export class SqliteBotDatabase {
           trade.dca_manual_override ? 1 : 0,
           plannedDcaJson,
           ordersJson,
+          trade.initial_open_rate ?? trade.open_rate,
           trade.account_id || 'master',
           trade.account_name || 'Master',
           trade.parent_trade_id ?? null,
@@ -1111,6 +1149,47 @@ export class SqliteBotDatabase {
             }));
         }
 
+        const rawAmount = Number(r.amount || 0);
+        const rawInitialAmount = Number(r.initial_amount || rawAmount || 0);
+        const rawOpenRate = Number(r.open_rate || 0);
+        const dcaCountNum = Number(r.dca_count || 0);
+        const rawInitialOpenRate =
+          dcaCountNum === 0 && rawOpenRate > 0
+            ? rawOpenRate
+            : Number(r.initial_open_rate || rawOpenRate || 0);
+        const rawLev = Math.max(1, Number(r.leverage || 25));
+        const rawStake = Number(r.stake_amount || 0);
+        const sanitizedStake =
+          rawAmount > 0 && rawOpenRate > 0
+            ? sanitizePositionMarginUsdt(rawStake, rawAmount, rawOpenRate, rawLev)
+            : rawStake;
+        const rawInitialStake = Number(r.initial_stake || sanitizedStake || 0);
+        const sanitizedInitialStake =
+          rawInitialAmount > 0 && rawInitialOpenRate > 0
+            ? sanitizePositionMarginUsdt(rawInitialStake, rawInitialAmount, rawInitialOpenRate, rawLev)
+            : sanitizedStake;
+
+        if (dcaCountNum === 0 && rawOpenRate > 0 && orders.length === 1 && Number(orders[0]?.step || 0) === 0) {
+          orders[0].price = rawOpenRate;
+          orders[0].stake_amount = sanitizedStake;
+        }
+
+        if (
+          Math.abs(rawStake - sanitizedStake) > 1.0 ||
+          Math.abs(rawInitialStake - sanitizedInitialStake) > 1.0 ||
+          (dcaCountNum === 0 && Math.abs(Number(r.initial_open_rate || rawOpenRate) - rawOpenRate) > 1e-8)
+        ) {
+          try {
+            this.db
+              .prepare(
+                `UPDATE trades SET stake_amount = ?, initial_stake = ?, initial_open_rate = ?, orders_json = ? WHERE id = ?`
+              )
+              .run(sanitizedStake, sanitizedInitialStake, rawInitialOpenRate, JSON.stringify(orders), tradeIdNum);
+          } catch {
+            // ignore self-heal error
+          }
+        }
+
         return {
           trade_id: tradeIdNum,
           pair,
@@ -1124,18 +1203,18 @@ export class SqliteBotDatabase {
           user_id: String(r.user_id || 'owner'),
           parent_trade_id: r.parent_trade_id ? Number(r.parent_trade_id) : undefined,
           synced_accounts: syncedAccounts.length > 0 ? syncedAccounts : undefined,
-          amount: Number(r.amount || 0),
-          initial_amount: Number(r.initial_amount || r.amount || 0),
-          stake_amount: Number(r.stake_amount || 0),
-          initial_stake: Number(r.initial_stake || r.stake_amount || 0),
+          amount: rawAmount,
+          initial_amount: rawInitialAmount,
+          stake_amount: sanitizedStake,
+          initial_stake: sanitizedInitialStake,
           strategy: String(r.strategy || 'ScalpingStrategy'),
           timeframe: String(r.timeframe || '1h'),
           enter_tag: String(r.buy_tag || (isShortBool ? 'Short' : 'Long')),
           open_date: openDateStr,
           open_timestamp: openTs,
-          open_rate: Number(r.open_rate || 0),
-          initial_open_rate: Number(r.initial_open_rate || r.open_rate || 0),
-          dca_count: Number(r.dca_count || 0),
+          open_rate: rawOpenRate,
+          initial_open_rate: rawInitialOpenRate,
+          dca_count: dcaCountNum,
           last_dca_date: r.last_dca_date ? String(r.last_dca_date) : null,
           current_rate: Number(r.close_rate || r.current_rate || r.open_rate || 0),
           close_date: closeDateStr,
@@ -1445,45 +1524,74 @@ export class SqliteBotDatabase {
     try {
       this.restoreAccountsFromBackupOrEnvIfEmpty();
       const rows = this.db.prepare(`SELECT * FROM exchange_accounts ORDER BY rowid ASC`).all();
-      return rows.map((r: any) => ({
-        id: String(r.id),
-        name: String(r.name),
-        owner_label: String(r.owner_label || r.name),
-        exchange: String(r.exchange),
-        market_type: r.market_type === 'spot' ? 'spot' : 'futures',
-        api_key_masked: String(r.api_key_masked),
-        api_key_raw: r.api_key_raw ? String(r.api_key_raw) : undefined,
-        api_secret_raw: r.api_secret_raw ? String(r.api_secret_raw) : undefined,
-        passphrase_raw: r.passphrase_raw ? String(r.passphrase_raw) : undefined,
-        connected_at: Number(r.connected_at || 0),
-        has_passphrase: Boolean(r.has_passphrase),
-        is_owner: Boolean(r.is_owner),
-        user_id: String(r.user_id || 'owner'),
-        client_access_code: String(r.client_access_code),
-        enabled: Boolean(r.enabled),
-        copy_trading: Boolean(r.copy_trading),
-        copy_multiplier: Number(r.copy_multiplier || 1.0),
-        max_leverage: Number(r.max_leverage || 25),
-        balance_usdt: Number(r.balance_usdt || 1000),
-        unrealized_pnl: 0,
-        open_trades_count: 0,
-        status: r.status === 'paused' ? 'paused' : r.status === 'error' ? 'error' : 'connected',
-        last_sync: String(r.last_sync),
-        is_testnet: Boolean(r.is_testnet),
-      }));
+      return rows.map((r: any) => {
+        const balUsdt = Number(r.balance_usdt || 1000);
+        const rawUsed = Number(r.used_margin_usdt || 0);
+        const usedMargin = sanitizeWalletUsedMarginUsdt(rawUsed, balUsdt, 0, 1);
+        const rawAvail = Number(r.available_balance_usdt || 0);
+        const availBal =
+          rawAvail > 0 && rawAvail <= balUsdt - usedMargin + 0.5
+            ? rawAvail
+            : Math.max(0, balUsdt - usedMargin);
+        return {
+          id: String(r.id),
+          name: String(r.name),
+          owner_label: String(r.owner_label || r.name),
+          exchange: String(r.exchange),
+          market_type: r.market_type === 'spot' ? 'spot' : 'futures',
+          api_key_masked: String(r.api_key_masked),
+          api_key_raw: r.api_key_raw ? String(r.api_key_raw) : undefined,
+          api_secret_raw: r.api_secret_raw ? String(r.api_secret_raw) : undefined,
+          passphrase_raw: r.passphrase_raw ? String(r.passphrase_raw) : undefined,
+          connected_at: Number(r.connected_at || 0),
+          has_passphrase: Boolean(r.has_passphrase),
+          is_owner: Boolean(r.is_owner),
+          user_id: String(r.user_id || 'owner'),
+          client_access_code: String(r.client_access_code),
+          enabled: Boolean(r.enabled),
+          copy_trading: Boolean(r.copy_trading),
+          copy_multiplier: Number(r.copy_multiplier || 1.0),
+          max_leverage: Number(r.max_leverage || 25),
+          balance_usdt: balUsdt,
+          wallet_balance_usdt: balUsdt,
+          used_margin_usdt: usedMargin,
+          available_balance_usdt: availBal,
+          unrealized_pnl: 0,
+          open_trades_count: 0,
+          status: r.status === 'paused' ? 'paused' : r.status === 'error' ? 'error' : 'connected',
+          last_sync: String(r.last_sync),
+          is_testnet: Boolean(r.is_testnet),
+        };
+      });
     } catch {
       return [];
     }
   }
 
   private upsertExchangeAccountInternal(acc: any) {
+    const balUsdt =
+      Number.isFinite(Number(acc.balance_usdt)) && Number(acc.balance_usdt) > 0
+        ? Number(acc.balance_usdt)
+        : 1000;
+    const usedMargin = sanitizeWalletUsedMarginUsdt(
+      Number(acc.used_margin_usdt || 0),
+      balUsdt,
+      0,
+      Number(acc.open_trades_count ?? 1)
+    );
+    const rawAvail = Number(acc.available_balance_usdt || 0);
+    const availBal =
+      rawAvail > 0 && rawAvail <= balUsdt - usedMargin + 0.5
+        ? rawAvail
+        : Math.max(0, balUsdt - usedMargin);
     const stmt = this.db.prepare(`
       INSERT INTO exchange_accounts (
         id, name, owner_label, exchange, market_type, api_key_masked,
         has_passphrase, is_owner, client_access_code, enabled,
         copy_trading, copy_multiplier, max_leverage, balance_usdt,
-        status, last_sync, api_key_raw, api_secret_raw, passphrase_raw, connected_at, is_testnet, user_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        status, last_sync, api_key_raw, api_secret_raw, passphrase_raw, connected_at, is_testnet, user_id,
+        used_margin_usdt, available_balance_usdt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         owner_label = excluded.owner_label,
@@ -1497,6 +1605,8 @@ export class SqliteBotDatabase {
         last_sync = excluded.last_sync,
         is_testnet = excluded.is_testnet,
         user_id = excluded.user_id,
+        used_margin_usdt = excluded.used_margin_usdt,
+        available_balance_usdt = excluded.available_balance_usdt,
         api_key_raw = COALESCE(excluded.api_key_raw, exchange_accounts.api_key_raw),
         api_secret_raw = COALESCE(excluded.api_secret_raw, exchange_accounts.api_secret_raw),
         passphrase_raw = COALESCE(excluded.passphrase_raw, exchange_accounts.passphrase_raw),
@@ -1516,7 +1626,7 @@ export class SqliteBotDatabase {
       acc.copy_trading ? 1 : 0,
       acc.copy_multiplier || 1.0,
       acc.max_leverage || 25,
-      Number.isFinite(Number(acc.balance_usdt)) && Number(acc.balance_usdt) > 0 ? Number(acc.balance_usdt) : 1000,
+      balUsdt,
       acc.status || 'connected',
       acc.last_sync,
       acc.api_key_raw ?? null,
@@ -1524,7 +1634,9 @@ export class SqliteBotDatabase {
       acc.passphrase_raw ?? null,
       acc.connected_at || Date.now(),
       acc.is_testnet ? 1 : 0,
-      acc.user_id || 'owner'
+      acc.user_id || 'owner',
+      usedMargin,
+      availBal
     );
   }
 

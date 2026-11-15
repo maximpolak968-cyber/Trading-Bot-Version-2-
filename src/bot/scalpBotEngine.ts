@@ -1757,10 +1757,13 @@ export function analyzeMultiTimeframe(
   let rejectionReasonLong = '';
 
   const maxAllowedRsiForLong = 80.0;
+  const nearGlobalSupportForBounce = distTo4hSupPct <= 2.5 || pos4hPct <= 25.0;
+  const nearGlobalResistanceForRejection = distTo4hResPct <= 2.5 || pos4hPct >= 75.0;
+
   if (
-    rsi1d > maxAllowedRsiForLong ||
-    rsi4h > maxAllowedRsiForLong ||
-    rsi1h > maxAllowedRsiForLong
+    rsi1h > 85.0 ||
+    (rsi4h > maxAllowedRsiForLong && rsi1d > 75.0) ||
+    (rsi1d > maxAllowedRsiForLong && rsi1h > 75.0)
   ) {
     allowLong = false;
     rejectionReasonLong = `MTF RSI фильтр блокирует LONG: 1D RSI=${rsi1d}, 4H RSI=${rsi4h}, 1H RSI=${rsi1h} (макс ${maxAllowedRsiForLong})`;
@@ -1776,9 +1779,9 @@ export function analyzeMultiTimeframe(
   } else if (isKnifeDrop(candles1h)) {
     allowLong = false;
     rejectionReasonLong = `Falling knife detected on 1H — waiting for reversal`;
-  } else if (marketTrend === 'BEARISH') {
+  } else if (marketTrend === 'BEARISH' && !nearGlobalSupportForBounce) {
     allowLong = false;
-    rejectionReasonLong = `Медвежий тренд рынка (1D=${d1Trend}, 4H=${h4Trend}, 1H=${h1Trend}) — вход в LONG против тренда заблокирован`;
+    rejectionReasonLong = `Медвежий тренд рынка (1D=${d1Trend}, 4H=${h4Trend}, 1H=${h1Trend}) — вход в LONG вне сильной поддержки заблокирован`;
   }
 
   let allowShort = true;
@@ -1787,9 +1790,9 @@ export function analyzeMultiTimeframe(
   const minAllowedRsiForShort = 20.0;
 
   if (
-    rsi1d < minAllowedRsiForShort ||
-    rsi4h < minAllowedRsiForShort ||
-    rsi1h < minAllowedRsiForShort
+    rsi1h < 15.0 ||
+    (rsi4h < minAllowedRsiForShort && rsi1d < 25.0) ||
+    (rsi1d < minAllowedRsiForShort && rsi1h < 25.0)
   ) {
     allowShort = false;
     rejectionReasonShort = `MTF RSI фильтр блокирует SHORT: 1D RSI=${rsi1d}, 4H RSI=${rsi4h}, 1H RSI=${rsi1h} (мин ${minAllowedRsiForShort})`;
@@ -1802,9 +1805,9 @@ export function analyzeMultiTimeframe(
   } else if (isKnifeDrop(candles1h)) {
     allowShort = false;
     rejectionReasonShort = `Cascade knife drop detected on 1H`;
-  } else if (marketTrend === 'BULLISH') {
+  } else if (marketTrend === 'BULLISH' && !nearGlobalResistanceForRejection) {
     allowShort = false;
-    rejectionReasonShort = `Бычий тренд рынка (1D=${d1Trend}, 4H=${h4Trend}, 1H=${h1Trend}) — вход в SHORT против тренда заблокирован`;
+    rejectionReasonShort = `Бычий тренд рынка (1D=${d1Trend}, 4H=${h4Trend}, 1H=${h1Trend}) — вход в SHORT вне сильного сопротивления заблокирован`;
   }
 
   // Chart-Driven TP selection based on trend strength (1H/4H locally in chop/moderate trend, 1D/1W globally in strong trend)
@@ -2409,20 +2412,20 @@ export function evaluateGlobalHedgeStrategy(
   const channelWidthPct =
     globalRes > globalSup ? ((globalRes - globalSup) / currentPrice) * 100.0 : 0;
 
-  // 2-сторонние сделки открываются в среднесрок и долгосрок в широком глобальном коридоре (>= 3.2%)
+  // 2-сторонние сделки открываются в среднесрок и долгосрок в широком глобальном коридоре (>= 2.8%)
   const posPct = Number.isFinite(mtf.pos_4h_pct) ? mtf.pos_4h_pct : 50;
-  const inEquilibriumZone = posPct >= 25.0 && posPct <= 75.0;
+  const inEquilibriumZone = posPct >= 18.0 && posPct <= 82.0;
   const safeRsiZone =
-    mtf.rsi_1d >= 20.0 &&
-    mtf.rsi_1d <= 80.0 &&
-    mtf.rsi_4h >= 20.0 &&
-    mtf.rsi_4h <= 80.0 &&
-    mtf.rsi_1h >= 20.0 &&
-    mtf.rsi_1h <= 80.0;
+    mtf.rsi_1d >= 16.0 &&
+    mtf.rsi_1d <= 84.0 &&
+    mtf.rsi_4h >= 16.0 &&
+    mtf.rsi_4h <= 84.0 &&
+    mtf.rsi_1h >= 16.0 &&
+    mtf.rsi_1h <= 84.0;
   const noExtremeImpulse = btcIsSafe && !isKnifeDrop(candles1h) && !isPumpExhaustion(candles1h);
 
   const shouldEnter =
-    channelWidthPct >= 3.2 && inEquilibriumZone && safeRsiZone && noExtremeImpulse;
+    channelWidthPct >= 2.8 && inEquilibriumZone && safeRsiZone && noExtremeImpulse;
 
   // Цели TP для хеджа по реальным уровням канала 4H/1D (без жёсткого потолка 4.5%, с защитой от микро-цели ниже 0.75%)
   const minSafeLongHedgeTp = currentPrice * 1.0075;
@@ -2682,7 +2685,6 @@ export function evaluateScalpingStrategy(
     rsiOversoldOk &&
     (greenCandle || hasLowerWick) &&
     volumeOk &&
-    !trendBearish &&
     !isKnifeDrop(candles) &&
     !isPumpExhaustion(candles);
 
@@ -2733,7 +2735,6 @@ export function evaluateScalpingStrategy(
     rsiOverboughtOk &&
     (redCandle || hasUpperWick) &&
     volumeOk &&
-    !trendBullish &&
     !isPumpExhaustion(candles) &&
     !isKnifeDrop(candles);
 

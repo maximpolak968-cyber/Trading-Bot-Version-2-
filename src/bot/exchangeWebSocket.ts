@@ -1669,8 +1669,6 @@ export async function ensureBinancePrivateUserStream(
               const entryPrice =
                 Number(rawP.ep || 0) ||
                 prevPos?.entry_price ||
-                liveTick?.markPrice ||
-                liveTick?.price ||
                 0;
 
               if (size <= 0) {
@@ -2101,8 +2099,6 @@ export function ensureBybitPrivateUserStream(
             const entryPrice =
               Number(rawP.entryPrice || rawP.avgPrice || 0) ||
               prevPos?.entry_price ||
-              Number(rawP.markPrice || 0) ||
-              liveTick?.markPrice ||
               0;
 
             if (!(size > 0)) {
@@ -2167,8 +2163,14 @@ export function ensureBybitPrivateUserStream(
           state.unrealizedPnlUsdt = Number(
             state.positions.reduce((s, p) => s + Number(p.unrealized_pnl || 0), 0).toFixed(4)
           );
-          state.usedMarginUsdt = Number(
+          const sumBybitPosMargin = Number(
             state.positions.reduce((s, p) => s + Number(p.margin_usdt || 0), 0).toFixed(2)
+          );
+          state.usedMarginUsdt = sanitizeWalletUsedMarginUsdt(
+            sumBybitPosMargin,
+            state.walletBalanceUsdt,
+            sumBybitPosMargin,
+            state.positions.length
           );
           state.availableBalanceUsdt = Number(
             Math.max(0, state.walletBalanceUsdt - state.usedMarginUsdt).toFixed(2)

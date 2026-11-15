@@ -1394,6 +1394,40 @@ export async function executeExchangeFuturesOrder(
             }
           }
 
+          if (!isClose && avgPrice === params.referencePrice) {
+            try {
+              const pTs = await getBinanceTimestamp(false, baseUrl);
+              const pQuery = `symbol=${symbol}&timestamp=${pTs}&recvWindow=10000`;
+              const pSig = signBinanceFuturesQuery(pQuery, cleanSecret);
+              const pRes = await makeHttpsRequest(
+                `${baseUrl}/fapi/v2/positionRisk?${pQuery}&signature=${pSig}`,
+                {
+                  method: 'GET',
+                  headers: { 'X-MBX-APIKEY': cleanKey },
+                  timeoutMs: 3500,
+                }
+              );
+              if (pRes.statusCode === 200) {
+                const pList = JSON.parse(pRes.data);
+                if (Array.isArray(pList)) {
+                  const matchedPos = pList.find((p: any) => {
+                    const rawAmt = Number(p.positionAmt || 0);
+                    if (!(Math.abs(rawAmt) > 0)) return false;
+                    const ps = String(p.positionSide || '').toUpperCase();
+                    const pShort = ps === 'SHORT' || rawAmt < 0;
+                    return pShort === Boolean(params.isShort);
+                  });
+                  const posEp = Number(matchedPos?.entryPrice || matchedPos?.breakEvenPrice || 0);
+                  if (posEp > 0) {
+                    avgPrice = posEp;
+                  }
+                }
+              }
+            } catch {
+              // ignore positionRisk fallback error
+            }
+          }
+
           return {
             success: true,
             order_id: orderIdStr,
@@ -1632,12 +1666,14 @@ export async function executeExchangeFuturesOrder(
 
             // 1. Сначала мгновенно ждём отчёт об исполнении из приватного Bybit WS (execution/order)
             const wsFill = json.result?.orderId
-              ? await waitForWsOrderFill('bybit', cleanKey, orderId, 280)
+              ? await waitForWsOrderFill('bybit', cleanKey, orderId, 450)
               : null;
 
+            let resolvedRealFillPrice = false;
             if (wsFill && wsFill.avgPrice > 0 && wsFill.qty > 0) {
               actualAvgPrice = wsFill.avgPrice;
               actualExecQty = wsFill.qty;
+              resolvedRealFillPrice = true;
               if (wsFill.fee > 0) {
                 actualExecFee = wsFill.fee;
               }
@@ -1647,7 +1683,7 @@ export async function executeExchangeFuturesOrder(
             } else if (json.result?.orderId) {
               // 2. Fallback на REST API, если приватный WS не успел доставить событие
               try {
-                await new Promise((r) => setTimeout(r, 120));
+                await new Promise((r) => setTimeout(r, 150));
                 const qTs = await getBybitTimestamp(baseUrl, false);
                 const recvWindow = '10000';
                 const qStr = `category=linear&symbol=${symbol}&orderId=${encodeURIComponent(orderId)}`;
@@ -1688,6 +1724,7 @@ export async function executeExchangeFuturesOrder(
                 if (ordItem) {
                   if (Number(ordItem.avgPrice || 0) > 0) {
                     actualAvgPrice = Number(ordItem.avgPrice);
+                    resolvedRealFillPrice = true;
                   }
                   if (Number(ordItem.cumExecQty || 0) > 0) {
                     actualExecQty = Number(ordItem.cumExecQty);
@@ -1702,7 +1739,48 @@ export async function executeExchangeFuturesOrder(
                   }
                 }
               } catch {
-                // fallback to referencePrice if detail lookup times out
+                // fallback to position lookup below
+              }
+            }
+
+            // 3. Если при открытии/усреднении Bybit order/realtime и order/history ещё не вернули avgPrice,
+            // запрашиваем /v5/position/list по символу — Bybit обновляет avgPrice позиции мгновенно после Market-ордера!
+            if (!isClose && !resolvedRealFillPrice) {
+              try {
+                const pTs = await getBybitTimestamp(baseUrl, false);
+                const recvWindow = '10000';
+                const pStr = `category=linear&symbol=${symbol}`;
+                const pSig = signBybitV5(pTs, cleanKey, recvWindow, pStr, cleanSecret);
+                const posRes = await makeHttpsRequest(`${baseUrl}/v5/position/list?${pStr}`, {
+                  method: 'GET',
+                  headers: {
+                    'X-BAPI-API-KEY': cleanKey,
+                    'X-BAPI-TIMESTAMP': pTs,
+                    'X-BAPI-SIGN': pSig,
+                    'X-BAPI-RECV-WINDOW': recvWindow,
+                  },
+                  timeoutMs: 3500,
+                });
+                if (posRes.statusCode === 200) {
+                  const posJson = JSON.parse(posRes.data);
+                  const pList = posJson?.result?.list;
+                  if (Array.isArray(pList)) {
+                    const matchedPos = pList.find((p: any) => {
+                      const sz = Math.abs(Number(p.size || 0));
+                      if (!(sz > 0)) return false;
+                      const sideStr = String(p.side || '').toLowerCase();
+                      const pShort = sideStr === 'sell' || Number(p.positionIdx) === 2;
+                      return pShort === Boolean(params.isShort);
+                    });
+                    const posAvg = Number(matchedPos?.avgPrice || matchedPos?.entryPrice || 0);
+                    if (posAvg > 0) {
+                      actualAvgPrice = posAvg;
+                      actualExecFee = Number((actualAvgPrice * actualExecQty * 0.00055).toFixed(4));
+                    }
+                  }
+                }
+              } catch {
+                // ignore position fallback error
               }
             }
 
@@ -2333,7 +2411,7 @@ export async function testExchangeConnection(
               if (!isSupportedFuturesSymbol(sym)) continue;
               const liveTick = getLiveWsTicker(sym, 'binance');
               const entryPrice = Number(
-                p.entryPrice || p.markPrice || p.breakEvenPrice || liveTick?.markPrice || liveTick?.price || 0
+                p.entryPrice || p.breakEvenPrice || 0
               );
               if (!(entryPrice > 0)) continue;
               const markPrice = Number(
@@ -2791,7 +2869,7 @@ export async function testExchangeConnection(
                     if (!isSupportedFuturesSymbol(sym)) continue;
                     const liveTick = getLiveWsTicker(sym, 'bybit');
                     const entryPrice = Number(
-                      p.avgPrice || p.entryPrice || p.markPrice || liveTick?.markPrice || liveTick?.price || 0
+                      p.avgPrice || p.entryPrice || 0
                     );
                     if (!(entryPrice > 0)) continue;
                     const markPrice = Number(
@@ -3466,7 +3544,7 @@ export async function fetchExchangeOpenPositions(
               if (!isSupportedFuturesSymbol(sym)) continue;
               const liveTick = getLiveWsTicker(sym, 'bybit');
               const entryPrice = Number(
-                p.avgPrice || p.entryPrice || p.markPrice || liveTick?.markPrice || liveTick?.price || 0
+                p.avgPrice || p.entryPrice || 0
               );
               if (!(entryPrice > 0)) continue;
               const markPrice = Number(
@@ -3691,7 +3769,7 @@ export async function fetchExchangeOpenPositions(
             if (!isSupportedFuturesSymbol(sym)) continue;
             const liveTick = getLiveWsTicker(sym, 'binance');
             const entryPrice = Number(
-              p.entryPrice || p.markPrice || p.breakEvenPrice || liveTick?.markPrice || liveTick?.price || 0
+              p.entryPrice || p.breakEvenPrice || 0
             );
             if (!(entryPrice > 0)) continue;
             const markPrice = Number(
@@ -3882,7 +3960,7 @@ export async function fetchExchangeOpenPositions(
               const size = Math.abs(Number(p.total || p.available || 0));
               if (!(size > 0)) continue;
               const sym = String(p.symbol || '');
-              const entryPrice = Number(p.openPriceAvg || p.markPrice || 0);
+              const entryPrice = Number(p.openPriceAvg || 0);
               if (!(entryPrice > 0)) continue;
               const markPrice = Number(p.markPrice || entryPrice);
               const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
