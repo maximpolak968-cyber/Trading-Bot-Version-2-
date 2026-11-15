@@ -11,6 +11,7 @@ import {
   analyzeMultiTimeframe,
   findStrongestDcaLevel,
   detectMarketStructure,
+  extractStrongTimeframeLevels,
   isHedgeEntryCandidate,
   checkBtcMarketHealth,
   evaluateScalpingStrategy,
@@ -1656,7 +1657,7 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     : exactBreakeven * (1 + MIN_NET_PROFIT_PRICE_BUFFER);
   trade.min_profitable_tp = roundPrice(rawMinProfitableTp);
 
-  const tpMove = (trade.dca_count || 0) > 0 ? 0.009 : 0.014;
+  const tpMove = (trade.dca_count || 0) > 0 ? 0.018 : 0.024;
 
   // Защита ручного TP: если пользователь сам перетащил TP (tp_manual_override === true), бот НИКОГДА не сбрасывает его в фоновых циклах!
   if (trade.tp_manual_override && trade.take_profit_abs > 0) {
@@ -1674,7 +1675,12 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
         ? Math.min(defaultTp, trade.min_profitable_tp)
         : Math.max(defaultTp, trade.min_profitable_tp);
     } else if (isTpBelowMinProfitable) {
-      trade.take_profit_abs = trade.min_profitable_tp;
+      const structuralFloorTp = roundPrice(
+        trade.is_short ? openRate * (1 - 0.016) : openRate * (1 + 0.016)
+      );
+      trade.take_profit_abs = trade.is_short
+        ? Math.min(structuralFloorTp, trade.min_profitable_tp)
+        : Math.max(structuralFloorTp, trade.min_profitable_tp);
     }
   }
 
@@ -1697,19 +1703,19 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     return;
   }
 
-  // Минимальная структурная дистанция до уровней усреднения (по предыдущим максимумам/минимумам 4H/1D, не рядом со входом!)
-  const dist1 = (trade.dca_count || 0) > 0 ? 0.035 : 0.032;
+  // Минимальная структурная дистанция до сильных уровней усреднения (по 4H/1D/1W, не рядом со входом!)
+  const dist1 = (trade.dca_count || 0) > 0 ? 0.038 : 0.035;
   const baseStake = trade.initial_stake || trade.stake_amount || scalpBotConfig.stake_amount;
   const nextStep1 = (trade.dca_count || 0) + 1;
   const nextStep2 = (trade.dca_count || 0) + 2;
 
-  // Проверяем, является ли автоматический уровень адекватным: минимум 2.2% от цены входа (чтобы не усреднять вплотную ко входу) и не дальше 25%
+  // Проверяем, является ли автоматический уровень адекватным: минимум 2.8% от цены входа (чтобы не усреднять вплотную ко входу) и не дальше 65%
   const isReasonableAutoDca = (p: number) => {
     if (!(p > 0)) return false;
     if (trade.is_short && p <= openRate) return false;
     if (!trade.is_short && p >= openRate) return false;
     const distPct = (Math.abs(p - openRate) / openRate) * 100;
-    return distPct >= 2.2 && distPct <= 25.0;
+    return distPct >= 2.8 && distPct <= 65.0;
   };
 
   if (resetLevels || !Array.isArray(trade.planned_dca_levels) || trade.planned_dca_levels.length === 0) {
@@ -1724,7 +1730,7 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     if (!resetLevels && prevManualStep1 && prevManualStep1.price > 0) {
       dcaPrice1 = roundPrice(prevManualStep1.price);
       isManual1 = true;
-    } else if (!resetLevels && prevAutoStep1 && prevAutoStep1.price > 0) {
+    } else if (!resetLevels && prevAutoStep1 && prevAutoStep1.price > 0 && isReasonableAutoDca(prevAutoStep1.price)) {
       dcaPrice1 = roundPrice(prevAutoStep1.price);
       isManual1 = false;
     } else if (!resetLevels && trade.dca_manual_override && trade.next_dca_price && trade.next_dca_price > 0) {
@@ -1742,7 +1748,7 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     if (!resetLevels && prevManualStep2 && prevManualStep2.price > 0) {
       dcaPrice2 = roundPrice(prevManualStep2.price);
       isManual2 = true;
-    } else if (!resetLevels && prevAutoStep2 && prevAutoStep2.price > 0) {
+    } else if (!resetLevels && prevAutoStep2 && prevAutoStep2.price > 0 && isReasonableAutoDca(prevAutoStep2.price)) {
       dcaPrice2 = roundPrice(prevAutoStep2.price);
       isManual2 = false;
     } else {
@@ -1806,51 +1812,59 @@ function resolvePostDcaTakeProfit(
             ? newAvgRate * (1 - MIN_NET_PROFIT_PRICE_BUFFER)
             : newAvgRate * (1 + MIN_NET_PROFIT_PRICE_BUFFER)
         );
+  // Минимальная структурная дистанция TP после усреднения — минимум 1.5% от новой средней цены входа
+  const minStructuralDist = 0.015;
   const fallbackTp = roundPrice(
-    isShort ? safeFloor * 0.996 : safeFloor * 1.004
+    isShort
+      ? Math.min(safeFloor * 0.994, newAvgRate * (1 - 0.018))
+      : Math.max(safeFloor * 1.006, newAvgRate * (1 + 0.018))
   );
   if (!(newAvgRate > 0) || !mtf) return fallbackTp;
 
   if (!isShort) {
-    const minTp = Math.max(safeFloor, newAvgRate * (1 + MIN_NET_PROFIT_PRICE_BUFFER));
-    const candidates = [
-      ...(mtf.chart_targets_long || []).map((c) => c.price),
-      mtf.recommended_tp_long,
-      mtf.local_1h_resistance * 0.998,
-      mtf.key_4h_resistance * 0.998,
-      ...(mtf.structural_4h_levels || []).map((l) =>
-        l.zone_low && l.zone_low > newAvgRate ? l.zone_low * 0.9985 : l.price * 0.998
-      ),
-      ...(mtf.local_1d_levels || []).map((l) =>
-        l.zone_low && l.zone_low > newAvgRate ? l.zone_low * 0.9985 : l.price * 0.998
-      ),
-      ...(mtf.institutional_levels || []).map((l) =>
-        l.zone_low && l.zone_low > newAvgRate ? l.zone_low * 0.9985 : l.price * 0.998
-      ),
-    ]
-      .filter((p) => Number.isFinite(p) && p >= minTp)
-      .sort((a, b) => a - b);
-    return candidates.length > 0 ? roundPrice(candidates[0]) : fallbackTp;
+    const minTp = Math.max(safeFloor, newAvgRate * (1 + minStructuralDist));
+    if (Number.isFinite(mtf.recommended_tp_long) && mtf.recommended_tp_long >= minTp) {
+      return roundPrice(mtf.recommended_tp_long);
+    }
+    const scoredCandidates: Array<{ price: number; strength: number }> = [
+      ...(mtf.chart_targets_long || []).map((c) => ({ price: c.price, strength: c.strength + 4 })),
+      { price: mtf.key_4h_resistance * 0.998, strength: (mtf.resistance_history?.strength_score || 6) + 5 },
+      ...(mtf.structural_4h_levels || [])
+        .filter((l) => l.bounces >= 2 && l.bounces >= l.breaks)
+        .map((l) => ({ price: l.price * 0.998, strength: l.strength_score + 3 })),
+      ...(mtf.local_1d_levels || [])
+        .filter((l) => l.bounces >= 2 || (l.consolidation_bars || 0) >= 3)
+        .map((l) => ({ price: l.price * 0.998, strength: l.strength_score + 4 })),
+      ...(mtf.institutional_levels || []).map((l) => ({ price: l.price * 0.998, strength: l.strength_score + 5 })),
+    ].filter((c) => Number.isFinite(c.price) && c.price >= minTp && c.price <= newAvgRate * 1.18);
+
+    scoredCandidates.sort((a, b) => {
+      if (Math.abs(b.strength - a.strength) >= 2.0) return b.strength - a.strength;
+      return a.price - b.price;
+    });
+    return scoredCandidates.length > 0 ? roundPrice(scoredCandidates[0].price) : fallbackTp;
   } else {
-    const minTp = Math.min(safeFloor, newAvgRate * (1 - MIN_NET_PROFIT_PRICE_BUFFER));
-    const candidates = [
-      ...(mtf.chart_targets_short || []).map((c) => c.price),
-      mtf.recommended_tp_short,
-      mtf.local_1h_support * 1.002,
-      mtf.key_4h_support * 1.002,
-      ...(mtf.structural_4h_levels || []).map((l) =>
-        l.zone_high && l.zone_high < newAvgRate ? l.zone_high * 1.0015 : l.price * 1.002
-      ),
-      ...(mtf.local_1d_levels || []).map((l) =>
-        l.zone_high && l.zone_high < newAvgRate ? l.zone_high * 1.0015 : l.price * 1.002
-      ),
-      ...(mtf.institutional_levels || []).map((l) =>
-        l.zone_high && l.zone_high < newAvgRate ? l.zone_high * 1.0015 : l.price * 1.002
-      ),
-    ]
-      .filter((p) => Number.isFinite(p) && p <= minTp)
-      .sort((a, b) => b - a);
-    return candidates.length > 0 ? roundPrice(candidates[0]) : fallbackTp;
+    const minTp = Math.min(safeFloor, newAvgRate * (1 - minStructuralDist));
+    if (Number.isFinite(mtf.recommended_tp_short) && mtf.recommended_tp_short <= minTp) {
+      return roundPrice(mtf.recommended_tp_short);
+    }
+    const scoredCandidates: Array<{ price: number; strength: number }> = [
+      ...(mtf.chart_targets_short || []).map((c) => ({ price: c.price, strength: c.strength + 4 })),
+      { price: mtf.key_4h_support * 1.002, strength: (mtf.support_history?.strength_score || 6) + 5 },
+      ...(mtf.structural_4h_levels || [])
+        .filter((l) => l.bounces >= 2 && l.bounces >= l.breaks)
+        .map((l) => ({ price: l.price * 1.002, strength: l.strength_score + 3 })),
+      ...(mtf.local_1d_levels || [])
+        .filter((l) => l.bounces >= 2 || (l.consolidation_bars || 0) >= 3)
+        .map((l) => ({ price: l.price * 1.002, strength: l.strength_score + 4 })),
+      ...(mtf.institutional_levels || []).map((l) => ({ price: l.price * 1.002, strength: l.strength_score + 5 })),
+    ].filter((c) => Number.isFinite(c.price) && c.price <= minTp && c.price >= newAvgRate * 0.82);
+
+    scoredCandidates.sort((a, b) => {
+      if (Math.abs(b.strength - a.strength) >= 2.0) return b.strength - a.strength;
+      return b.price - a.price;
+    });
+    return scoredCandidates.length > 0 ? roundPrice(scoredCandidates[0].price) : fallbackTp;
   }
 }
 
@@ -2354,94 +2368,78 @@ async function getOrComputeMtfBotLevels(
       }
     }
 
-    // Add up to 2 key intermediate 1D LOCAL levels (3-5+ day consolidations, 1D mirror retests — like DOT ~5.18)
     const isFarFromExisting = (p: number, minDistPct: number) =>
       generated.every(
         (existing) =>
           (Math.abs(existing.price - p) / Math.max(1e-8, existing.price)) * 100 >= minDistPct
       );
 
-    const local1dCandidates = (mtf.local_1d_levels || []).filter((l) => {
-      if (liveRefPrice <= 0) return true;
-      const ratio = l.price / liveRefPrice;
-      return ratio >= 0.55 && ratio <= 1.65;
-    });
+    // На дневном (1D) и недельном (1W) графике отображаем СТРОГО 2 главных уровня (1 глобальная поддержка SUP и 1 глобальное сопротивление RES) без нагромождения лишних линий.
+    // На младших/рабочих таймфреймах (15m, 30m, 1h, 4h) добавляем максимум 1 сильнейший уровень поддержки и 1 сильнейший уровень сопротивления выбранного таймфрейма,
+    // и только если он отстоит от глобального уровня минимум на 2.5%–4.0% (чтобы плашки и линии никогда не слипались).
+    if (normTf !== '1d' && normTf !== '1w' && activeCandles.length >= 30 && liveRefPrice > 0) {
+      const tfStrong = extractStrongTimeframeLevels(activeCandles, normTf, liveRefPrice, 1);
+      const tfLabelPrefix = normTf.toUpperCase();
+      const minSepForTf = normTf === '4h' || normTf === '6h' || normTf === '12h' ? 4.0 : normTf === '1h' || normTf === '2h' ? 3.0 : 2.2;
 
-    let addedLocalCount = 0;
-    for (const loc of local1dCandidates) {
-      if (addedLocalCount >= 2) break;
-      const locPrice = roundPrice(loc.price);
-      if (!isFarFromExisting(locPrice, 2.0)) continue;
+      const tfBestSup = tfStrong.supports[0];
+      if (tfBestSup && isFarFromExisting(roundPrice(tfBestSup.price), minSepForTf)) {
+        const tfSupId = `tf-own-sup-${cleanPair}-${normTf}`;
+        const savedTfSup = allForPair.find((l) => l.id === tfSupId);
+        if (!savedTfSup?.deleted && !savedTfSup?.manual_override) {
+          const mirrorTxt = tfBestSup.mirror_retests && tfBestSup.mirror_retests > 0 ? ' ⇄S/R' : '';
+          const lvl: BotChartLevel = {
+            id: tfSupId,
+            pair: cleanPair,
+            label: `${tfLabelPrefix} SUP ${tfBestSup.strength_score.toFixed(1)}★${mirrorTxt}`,
+            role: 'support',
+            price: roundPrice(tfBestSup.price),
+            touches: tfBestSup.touches,
+            bounces: tfBestSup.bounces,
+            breaks: tfBestSup.breaks,
+            strength_score: tfBestSup.strength_score,
+            source: `${tfLabelPrefix}_STRONG`,
+            manual_override: false,
+            updated_at: nowStr,
+            zone_low: tfBestSup.zone_low ? roundPrice(tfBestSup.zone_low) : undefined,
+            zone_high: tfBestSup.zone_high ? roundPrice(tfBestSup.zone_high) : undefined,
+            mirror_retests: tfBestSup.mirror_retests || 0,
+            false_breakouts: tfBestSup.false_breakouts || 0,
+            consolidation_bars: tfBestSup.consolidation_bars || 0,
+            timeframe_role: 'STRUCT_4H',
+          };
+          syncAutoLevel(lvl, savedTfSup);
+        }
+      }
 
-      const slotIdx = addedLocalCount + 1;
-      const locId = `tf-local${slotIdx}-${cleanPair}-${normTf}`;
-      const savedLoc = allForPair.find((l) => l.id === locId);
-      if (savedLoc?.deleted || savedLoc?.manual_override) continue;
-
-      const role: 'support' | 'resistance' =
-        liveRefPrice > 0 && locPrice > liveRefPrice ? 'resistance' : 'support';
-      const mirrorTxt = loc.mirror_retests && loc.mirror_retests > 0 ? ' ⇄S/R' : '';
-      const lvl: BotChartLevel = {
-        id: locId,
-        pair: cleanPair,
-        label: `1D LOCAL ${role === 'resistance' ? 'RES' : 'SUP'} ${loc.strength_score.toFixed(1)}★${mirrorTxt}`,
-        role,
-        price: locPrice,
-        touches: loc.touches,
-        bounces: loc.bounces,
-        breaks: loc.breaks,
-        strength_score: loc.strength_score,
-        source: '1D_LOCAL',
-        manual_override: false,
-        updated_at: nowStr,
-        zone_low: loc.zone_low ? roundPrice(loc.zone_low) : undefined,
-        zone_high: loc.zone_high ? roundPrice(loc.zone_high) : undefined,
-        mirror_retests: loc.mirror_retests || 0,
-        false_breakouts: loc.false_breakouts || 0,
-        consolidation_bars: loc.consolidation_bars || 0,
-        timeframe_role: 'LOCAL_1D',
-      };
-      syncAutoLevel(lvl, savedLoc);
-      addedLocalCount++;
-    }
-
-    // On lower timeframes (< 1D), optionally show nearest 4H structural point (NOT global level) if distinct
-    if (normTf !== '1d' && normTf !== '1w' && mtf.structural_4h_levels?.length) {
-      const nearestStructSup = mtf.structural_4h_levels
-        .filter((l) => liveRefPrice > 0 && l.price < liveRefPrice * 0.992 && l.price >= liveRefPrice * 0.85)
-        .sort((a, b) => b.price - a.price)[0];
-      const nearestStructRes = mtf.structural_4h_levels
-        .filter((l) => liveRefPrice > 0 && l.price > liveRefPrice * 1.008 && l.price <= liveRefPrice * 1.15)
-        .sort((a, b) => a.price - b.price)[0];
-
-      const structItems: Array<{ id: string; role: 'support' | 'resistance'; lvl: typeof nearestStructSup }> = [
-        { id: `tf-struct-sup-${cleanPair}-${normTf}`, role: 'support', lvl: nearestStructSup },
-        { id: `tf-struct-res-${cleanPair}-${normTf}`, role: 'resistance', lvl: nearestStructRes },
-      ];
-      for (const sItem of structItems) {
-        if (!sItem.lvl) continue;
-        const sPrice = roundPrice(sItem.lvl.price);
-        if (!isFarFromExisting(sPrice, 1.5)) continue;
-        const savedS = allForPair.find((l) => l.id === sItem.id);
-        if (savedS?.deleted || savedS?.manual_override) continue;
-        const lvl: BotChartLevel = {
-          id: sItem.id,
-          pair: cleanPair,
-          label: `4H STRUCT ${sItem.role === 'resistance' ? 'RES' : 'SUP'}`,
-          role: sItem.role,
-          price: sPrice,
-          touches: sItem.lvl.touches,
-          bounces: sItem.lvl.bounces,
-          breaks: sItem.lvl.breaks,
-          strength_score: sItem.lvl.strength_score,
-          source: '4H_STRUCT',
-          manual_override: false,
-          updated_at: nowStr,
-          zone_low: sItem.lvl.zone_low ? roundPrice(sItem.lvl.zone_low) : undefined,
-          zone_high: sItem.lvl.zone_high ? roundPrice(sItem.lvl.zone_high) : undefined,
-          timeframe_role: 'STRUCT_4H',
-        };
-        syncAutoLevel(lvl, savedS);
+      const tfBestRes = tfStrong.resistances[0];
+      if (tfBestRes && isFarFromExisting(roundPrice(tfBestRes.price), minSepForTf)) {
+        const tfResId = `tf-own-res-${cleanPair}-${normTf}`;
+        const savedTfRes = allForPair.find((l) => l.id === tfResId);
+        if (!savedTfRes?.deleted && !savedTfRes?.manual_override) {
+          const mirrorTxt = tfBestRes.mirror_retests && tfBestRes.mirror_retests > 0 ? ' ⇄S/R' : '';
+          const lvl: BotChartLevel = {
+            id: tfResId,
+            pair: cleanPair,
+            label: `${tfLabelPrefix} RES ${tfBestRes.strength_score.toFixed(1)}★${mirrorTxt}`,
+            role: 'resistance',
+            price: roundPrice(tfBestRes.price),
+            touches: tfBestRes.touches,
+            bounces: tfBestRes.bounces,
+            breaks: tfBestRes.breaks,
+            strength_score: tfBestRes.strength_score,
+            source: `${tfLabelPrefix}_STRONG`,
+            manual_override: false,
+            updated_at: nowStr,
+            zone_low: tfBestRes.zone_low ? roundPrice(tfBestRes.zone_low) : undefined,
+            zone_high: tfBestRes.zone_high ? roundPrice(tfBestRes.zone_high) : undefined,
+            mirror_retests: tfBestRes.mirror_retests || 0,
+            false_breakouts: tfBestRes.false_breakouts || 0,
+            consolidation_bars: tfBestRes.consolidation_bars || 0,
+            timeframe_role: 'STRUCT_4H',
+          };
+          syncAutoLevel(lvl, savedTfRes);
+        }
       }
     }
 
@@ -2575,6 +2573,38 @@ async function initializeBotTrades() {
   for (const t of tradesStore) {
     if (t.is_open && t.pair) {
       subscribePairKlineStream(t.pair, t.timeframe || '1h');
+      const tpDistRatio =
+        t.open_rate > 0 && t.take_profit_abs > 0
+          ? Math.abs(t.take_profit_abs - t.open_rate) / t.open_rate
+          : 0;
+      const dca1Price = t.planned_dca_levels?.[0]?.price || t.next_dca_price || 0;
+      const dcaDistRatio =
+        t.open_rate > 0 && dca1Price > 0 ? Math.abs(dca1Price - t.open_rate) / t.open_rate : 0;
+      const needsMtfRefresh =
+        (!t.tp_manual_override && tpDistRatio < 0.014) ||
+        (!t.dca_manual_override &&
+          (dcaDistRatio < 0.028 ||
+            Boolean(t.planned_dca_levels?.some((l) => String(l.label || '').includes('PENDING_MTF')))));
+      if (needsMtfRefresh) {
+        const acc =
+          t.account_id && t.account_id !== 'master'
+            ? exchangeAccountsStore.find((a) => a.id === t.account_id)
+            : resolveExchangeAccountRecord('master');
+        const creds = acc ? getAccountCredentialsFromStore(acc) : null;
+        if (acc && creds) {
+          void enrichImportedPositionMtfLevelsAsync(
+            t.trade_id,
+            acc,
+            {
+              pair: t.pair,
+              is_short: t.is_short,
+              entry_price: t.open_rate,
+              take_profit: t.tp_manual_override ? t.take_profit_abs : 0,
+            },
+            creds
+          );
+        }
+      }
     }
   }
 
@@ -2896,14 +2926,23 @@ async function enrichImportedPositionMtfLevelsAsync(
       liveTrade.support_level = manualSup ? roundPrice(manualSup.price) : roundPrice(mtf.key_4h_support);
       liveTrade.resistance_level = manualRes ? roundPrice(manualRes.price) : roundPrice(mtf.key_4h_resistance);
 
-      if (!liveTrade.tp_manual_override && !(posTp > 0)) {
+      const posTpTooClose =
+        posTp > 0 && Math.abs(posTp - entryRate) / Math.max(1e-8, entryRate) < 0.014;
+      const shouldUpdateAutoTp = !liveTrade.tp_manual_override && (!(posTp > 0) || posTpTooClose);
+      if (shouldUpdateAutoTp) {
+        const recommendedTp = liveTrade.is_short ? mtf.recommended_tp_short : mtf.recommended_tp_long;
+        const minStructuralTp = liveTrade.is_short
+          ? entryRate * (1 - 0.015)
+          : entryRate * (1 + 0.015);
         liveTrade.take_profit_abs = roundPrice(
-          liveTrade.is_short ? mtf.recommended_tp_short : mtf.recommended_tp_long
+          liveTrade.is_short
+            ? Math.min(recommendedTp, minStructuralTp)
+            : Math.max(recommendedTp, minStructuralTp)
         );
       }
 
       if (!liveTrade.dca_manual_override) {
-        const strongDca = findStrongestDcaLevel(c4h, c1d, entryRate, liveTrade.is_short, 2.8, 95.0, c1w);
+        const strongDca = findStrongestDcaLevel(c4h, c1d, entryRate, liveTrade.is_short, 3.0, 95.0, c1w);
         const dcaPrice1 =
           !liveTrade.is_short && manualDcaSup
             ? roundPrice(manualDcaSup.price)
@@ -2928,7 +2967,7 @@ async function enrichImportedPositionMtfLevelsAsync(
           },
           {
             step: 2,
-            label: `DCA 2 (${liveTrade.is_short ? 'Abs Peak' : 'Abs Bottom'})`,
+            label: `DCA 2 (${liveTrade.is_short ? 'Strong Res #2' : 'Strong Sup #2'})`,
             price: dcaPrice2,
             stake_amount: stakeUsdt,
             amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice2)).toFixed(4)),
@@ -2937,20 +2976,26 @@ async function enrichImportedPositionMtfLevelsAsync(
           },
         ];
         liveTrade.next_dca_price = dcaPrice1;
-        liveTrade.plan_notes = `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) и проанализирована (1D=${mtf.d1_trend} | SUP=${liveTrade.support_level}$ | RES=${liveTrade.resistance_level}$ | DCA1=${dcaPrice1}$ | DCA2=${dcaPrice2}$)`;
+        liveTrade.plan_notes = `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) и проанализирована (1D=${mtf.d1_trend} | SUP=${liveTrade.support_level}$ | RES=${liveTrade.resistance_level}$ | TP=${liveTrade.take_profit_abs}$ | DCA1=${dcaPrice1}$ | DCA2=${dcaPrice2}$)`;
       }
 
       recalculateTradeMetrics(liveTrade, false);
       if (!liveTrade.tp_manual_override && liveTrade.min_profitable_tp) {
+        const minStructuralFloor = roundPrice(
+          liveTrade.is_short ? entryRate * (1 - 0.015) : entryRate * (1 + 0.015)
+        );
+        const targetFloor = liveTrade.is_short
+          ? Math.min(liveTrade.min_profitable_tp, minStructuralFloor)
+          : Math.max(liveTrade.min_profitable_tp, minStructuralFloor);
         liveTrade.take_profit_abs = liveTrade.is_short
-          ? Math.min(liveTrade.take_profit_abs || liveTrade.min_profitable_tp, liveTrade.min_profitable_tp)
-          : Math.max(liveTrade.take_profit_abs || liveTrade.min_profitable_tp, liveTrade.min_profitable_tp);
+          ? Math.min(liveTrade.take_profit_abs || targetFloor, targetFloor)
+          : Math.max(liveTrade.take_profit_abs || targetFloor, targetFloor);
         recalculateTradeMetrics(liveTrade, false);
       }
 
       sqliteDb.upsertTrade(liveTrade);
 
-      if (!(posTp > 0) && liveTrade.take_profit_abs && liveTrade.take_profit_abs > 0) {
+      if (shouldUpdateAutoTp && liveTrade.take_profit_abs && liveTrade.take_profit_abs > 0) {
         placeOrUpdateExchangeTakeProfitOrder(creds, {
           pair: pos.pair,
           isShort: liveTrade.is_short,
@@ -3076,24 +3121,44 @@ async function syncPositionsAndHistoryFromExchanges(
               date: nowDateStr,
             });
             if (!existingOpen.tp_manual_override) {
-              const newTp =
-                pos.take_profit && pos.take_profit > 0
-                  ? roundPrice(pos.take_profit)
-                  : roundPrice(
-                      existingOpen.is_short
-                        ? existingOpen.open_rate * (1 - 0.009)
-                        : existingOpen.open_rate * (1 + 0.009)
-                    );
+              const exTpValid =
+                pos.take_profit &&
+                pos.take_profit > 0 &&
+                Math.abs(pos.take_profit - existingOpen.open_rate) /
+                  Math.max(1e-8, existingOpen.open_rate) >=
+                  0.015;
+              const newTp = exTpValid
+                ? roundPrice(Number(pos.take_profit))
+                : roundPrice(
+                    existingOpen.is_short
+                      ? existingOpen.open_rate * (1 - 0.018)
+                      : existingOpen.open_rate * (1 + 0.018)
+                  );
               existingOpen.take_profit_abs = newTp;
             }
           }
 
-          // При отсутствии плановых DCA ИЛИ при подключении / восстановлении связи доанализируем асинхронно, не тормозя синхронизацию других позиций
+          // При отсутствии реальных MTF уровней DCA/TP ИЛИ при подключении / восстановлении связи доанализируем асинхронно
           const hasExistingPlannedDca =
             Array.isArray(existingOpen.planned_dca_levels) &&
             existingOpen.planned_dca_levels.length >= 2 &&
-            existingOpen.planned_dca_levels.every((l) => l.price > 0);
-          if (!existingOpen.dca_manual_override && (!hasExistingPlannedDca || forceReanalyzeOpen)) {
+            existingOpen.planned_dca_levels.every(
+              (l) =>
+                l.price > 0 &&
+                !String(l.label || '').includes('PENDING_MTF') &&
+                Math.abs(Number(l.distance_pct || 0)) >= 2.8
+            );
+          const hasTooCloseAutoTp =
+            !existingOpen.tp_manual_override &&
+            existingOpen.take_profit_abs > 0 &&
+            existingOpen.open_rate > 0 &&
+            Math.abs(existingOpen.take_profit_abs - existingOpen.open_rate) /
+              existingOpen.open_rate <
+              0.014;
+          if (
+            !existingOpen.dca_manual_override &&
+            (!hasExistingPlannedDca || hasTooCloseAutoTp || forceReanalyzeOpen)
+          ) {
             void enrichImportedPositionMtfLevelsAsync(existingOpen.trade_id, acc, pos, creds);
           }
           recalculateTradeMetrics(existingOpen, false);
@@ -3133,7 +3198,7 @@ async function syncPositionsAndHistoryFromExchanges(
 
           sqliteDb.upsertTrade(existingOpen);
         } else {
-          // На бирже есть открытая позиция, которой еще нет на сайте — НЕМЕДЛЕННО добавляем её в UI с базовыми уровнями,
+          // На бирже есть открытая позиция, которой еще нет на сайте — НЕМЕДЛЕННО добавляем её в UI с базовыми структурными уровнями,
           // а глубокий 1W->1D->4H анализ запускаем параллельно в фоне (и обновляем карточку по готовности)!
           const id = nextTradeId++;
           const openTs = pos.created_time > 0 ? pos.created_time : Date.now();
@@ -3147,14 +3212,14 @@ async function syncPositionsAndHistoryFromExchanges(
           const posSl = Number(pos.stop_loss || 0);
           const feeRate = getExchangeTakerFeeRate(acc.exchange);
 
-          const analyzedSup = roundPrice(pos.is_short ? entryRate * 0.985 : entryRate * 0.968);
-          const analyzedRes = roundPrice(pos.is_short ? entryRate * 1.032 : entryRate * 1.015);
+          const analyzedSup = roundPrice(pos.is_short ? entryRate * 0.98 : entryRate * 0.965);
+          const analyzedRes = roundPrice(pos.is_short ? entryRate * 1.035 : entryRate * 1.02);
           const analyzedTp =
-            posTp > 0
+            posTp > 0 && Math.abs(posTp - entryRate) / Math.max(1e-8, entryRate) >= 0.015
               ? roundPrice(posTp)
-              : roundPrice(pos.is_short ? entryRate * (1 - 0.012) : entryRate * (1 + 0.012));
-          const dcaPrice1 = roundPrice(pos.is_short ? entryRate * 1.032 : entryRate * 0.968);
-          const dcaPrice2 = roundPrice(pos.is_short ? entryRate * 1.068 : entryRate * 0.935);
+              : roundPrice(pos.is_short ? entryRate * (1 - 0.02) : entryRate * (1 + 0.02));
+          const dcaPrice1 = roundPrice(pos.is_short ? entryRate * 1.035 : entryRate * 0.965);
+          const dcaPrice2 = roundPrice(pos.is_short ? entryRate * 1.072 : entryRate * 0.93);
 
           const importedTrade: FreqtradeTrade = {
             trade_id: id,
@@ -3197,7 +3262,7 @@ async function syncPositionsAndHistoryFromExchanges(
             initial_stop_loss_pct: 0,
             exit_reason: null,
             take_profit_abs: analyzedTp,
-            take_profit_pct: Number((0.012 * lev * 100).toFixed(1)),
+            take_profit_pct: Number((0.02 * lev * 100).toFixed(1)),
             leverage: lev,
             enter_tag: 'EXCHANGE_SYNC_LIVE',
             orders: [
@@ -3216,7 +3281,7 @@ async function syncPositionsAndHistoryFromExchanges(
             planned_dca_levels: [
               {
                 step: 1,
-                label: 'DCA 1 (1D/4H_GLOBAL)',
+                label: 'DCA 1 (PENDING_MTF)',
                 price: dcaPrice1,
                 stake_amount: stakeUsdt,
                 amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice1)).toFixed(4)),
@@ -3225,7 +3290,7 @@ async function syncPositionsAndHistoryFromExchanges(
               },
               {
                 step: 2,
-                label: `DCA 2 (${pos.is_short ? 'Abs Peak' : 'Abs Bottom'})`,
+                label: `DCA 2 (PENDING_MTF)`,
                 price: dcaPrice2,
                 stake_amount: stakeUsdt,
                 amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice2)).toFixed(4)),
@@ -3238,7 +3303,7 @@ async function syncPositionsAndHistoryFromExchanges(
             plan_notes: `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) — выполняется MTF-анализ 1D/4H...`,
             trade_state: 'WAITING_PULLBACK',
             next_dca_price: dcaPrice1,
-            tp_manual_override: posTp > 0,
+            tp_manual_override: false,
             sl_manual_override: posSl > 0,
             dca_manual_override: false,
           };
@@ -3884,9 +3949,74 @@ async function runScalpBotCycle(waitForActive = false) {
         }
       }
 
-      // 1D. Smart Level DCA check (_check_trade_dca)
-      const nextDcaTarget = trade.planned_dca_levels?.[0]?.price || trade.next_dca_price || 0;
+      // 1D. Smart Level DCA check (_check_trade_dca) — строго от сильного уровня поддержки/сопротивления с подтверждением отскока!
+      let nextDcaTarget = trade.planned_dca_levels?.[0]?.price || trade.next_dca_price || 0;
+      const isManualDcaTarget = Boolean(
+        trade.dca_manual_override || trade.planned_dca_levels?.[0]?.manual_override
+      );
       if (botConfig.dca_enabled && nextDcaTarget > 0) {
+        // Если уровень автоматический, но стоит слишком близко ко входу (< 2.8%) или ещё ожидает MTF-расчёта (PENDING_MTF),
+        // сначала пересчитываем его по сильным уровням 1W/1D/4H и НЕ усредняем в воздухе рядом со входом!
+        const dcaDistPctFromEntry =
+          trade.open_rate > 0
+            ? (Math.abs(nextDcaTarget - trade.open_rate) / trade.open_rate) * 100
+            : 0;
+        const isPendingPlaceholderDca = Boolean(
+          trade.planned_dca_levels?.[0] &&
+            String(trade.planned_dca_levels[0].label || '').includes('PENDING_MTF')
+        );
+        if (!isManualDcaTarget && (dcaDistPctFromEntry < 2.8 || isPendingPlaceholderDca)) {
+          const [{ candles: c1wPre }, { candles: c4hPre }, { candles: c1dPre }] = await Promise.all([
+            fetchRealCandles(trade.pair, '1w', 300),
+            fetchRealCandles(trade.pair, '4h', 1000),
+            fetchRealCandles(trade.pair, '1d', 1000),
+          ]);
+          if (c4hPre.length >= 20) {
+            const strongPreDca = findStrongestDcaLevel(
+              c4hPre,
+              c1dPre,
+              trade.open_rate,
+              trade.is_short,
+              3.0,
+              95.0,
+              c1wPre
+            );
+            const updatedDca1 = roundPrice(strongPreDca.price);
+            const updatedDca2 = roundPrice(strongPreDca.second_price);
+            const nextStep1 = (trade.dca_count || 0) + 1;
+            const nextStep2 = (trade.dca_count || 0) + 2;
+            const baseStake = trade.initial_stake || trade.stake_amount || 25;
+            const lev = trade.leverage || botConfig.leverage || 25;
+            trade.next_dca_price = updatedDca1;
+            trade.planned_dca_levels = [
+              {
+                step: nextStep1,
+                label: `DCA ${nextStep1} (${strongPreDca.source})`,
+                price: updatedDca1,
+                stake_amount: baseStake,
+                amount: Number(((baseStake * lev) / Math.max(1e-8, updatedDca1)).toFixed(4)),
+                distance_pct: Number(
+                  (((updatedDca1 - trade.open_rate) / trade.open_rate) * 100).toFixed(2)
+                ),
+                manual_override: false,
+              },
+              {
+                step: nextStep2,
+                label: `DCA ${nextStep2} (${trade.is_short ? 'Strong Res #2' : 'Strong Sup #2'})`,
+                price: updatedDca2,
+                stake_amount: baseStake,
+                amount: Number(((baseStake * lev) / Math.max(1e-8, updatedDca2)).toFixed(4)),
+                distance_pct: Number(
+                  (((updatedDca2 - trade.open_rate) / trade.open_rate) * 100).toFixed(2)
+                ),
+                manual_override: false,
+              },
+            ];
+            sqliteDb.upsertTrade(trade);
+            nextDcaTarget = updatedDca1;
+          }
+        }
+
         const reachedDcaLevel = !trade.is_short
           ? currentPrice <= nextDcaTarget
           : currentPrice >= nextDcaTarget;
@@ -3939,9 +4069,6 @@ async function runScalpBotCycle(waitForActive = false) {
               ? { zoneLow: nearestDcaZoneLvl.zone_low, zoneHigh: nearestDcaZoneLvl.zone_high }
               : undefined;
 
-            const isManualDcaTarget = Boolean(
-              trade.dca_manual_override || trade.planned_dca_levels?.[0]?.manual_override
-            );
             const noKnifeOrPump = !trade.is_short
               ? !isKnifeDrop(dcaEvalCandles)
               : !isPumpExhaustion(dcaEvalCandles);
@@ -3953,16 +4080,27 @@ async function runScalpBotCycle(waitForActive = false) {
               zoneBounds
             );
             const rsiCheck = checkRsiCondition(dcaEvalCandles, trade.is_short);
-            const deepLevelTouch = !trade.is_short
-              ? currentPrice <= nextDcaTarget * 0.997
-              : currentPrice >= nextDcaTarget * 1.003;
+            const lastBar = dcaEvalCandles[dcaEvalCandles.length - 1];
+            const hasBounceOrWickReaction = Boolean(
+              lastBar &&
+                (!trade.is_short
+                  ? lastBar.close >= lastBar.open ||
+                    (Math.min(lastBar.open, lastBar.close) - lastBar.low) /
+                      Math.max(1e-8, lastBar.high - lastBar.low) >=
+                      0.28
+                  : lastBar.close <= lastBar.open ||
+                    (lastBar.high - Math.max(lastBar.open, lastBar.close)) /
+                      Math.max(1e-8, lastBar.high - lastBar.low) >=
+                      0.28)
+            );
 
-            // Усредняем когда цена достигла уровня DCA:
+            // Усредняем ТОЛЬКО когда цена дошла до сильного уровня поддержки/сопротивления:
             // - мгновенно, если уровень DCA выставлен/перетащен пользователем вручную;
-            // - либо по структурному уровню при отсутствии вертикального ножа/пампа (отбой свечи, RSI или прокол уровня >= 0.3%)
+            // - либо по сильному структурному уровню при отсутствии ножа/пампа И подтверждении реакции (свечной отскок или RSI + разворотная/хвостовая реакция на уровне)
             if (
               isManualDcaTarget ||
-              (noKnifeOrPump && (rejectionCheck.confirmed || rsiCheck.confirmed || deepLevelTouch))
+              (noKnifeOrPump &&
+                (rejectionCheck.confirmed || (rsiCheck.confirmed && hasBounceOrWickReaction)))
             ) {
               // Find next strongest 1W->1D / 4H DCA level first
               const [{ candles: c1w }, { candles: c4h }, { candles: c1d }] = await Promise.all([
@@ -4841,7 +4979,10 @@ async function createScalpBotPosition(
 
     if (!hasCustomTp) {
       if (!isShort) {
-        const minSafeLong = entryRate * (1 + MIN_NET_PROFIT_PRICE_BUFFER);
+        const minSafeLong = Math.max(
+          entryRate * (1 + MIN_NET_PROFIT_PRICE_BUFFER),
+          entryRate * 1.015
+        );
         if (manualResLvl && manualResLvl.price * 0.9985 >= minSafeLong) {
           rawTp = manualResLvl.price * 0.9985;
           tpHorizon = 'MANUAL';
@@ -4857,13 +4998,16 @@ async function createScalpBotPosition(
             tpHorizon = '4H';
             tpReason = `4H ключевое сопротивление (${effectiveRes}$)`;
           } else {
-            rawTp = minSafeLong * 1.003;
+            rawTp = Math.max(minSafeLong, entryRate * 1.022);
             tpHorizon = 'SAFE_FLOOR';
-            tpReason = 'Защитный порог чистой прибыли выше комиссий';
+            tpReason = 'Структурная цель прибыли выше входов и комиссий';
           }
         }
       } else {
-        const minSafeShort = entryRate * (1 - MIN_NET_PROFIT_PRICE_BUFFER);
+        const minSafeShort = Math.min(
+          entryRate * (1 - MIN_NET_PROFIT_PRICE_BUFFER),
+          entryRate * 0.985
+        );
         if (manualSupLvl && manualSupLvl.price * 1.0015 <= minSafeShort) {
           rawTp = manualSupLvl.price * 1.0015;
           tpHorizon = 'MANUAL';
@@ -4879,9 +5023,9 @@ async function createScalpBotPosition(
             tpHorizon = '4H';
             tpReason = `4H ключевая поддержка (${effectiveSup}$)`;
           } else {
-            rawTp = minSafeShort * 0.997;
+            rawTp = Math.min(minSafeShort, entryRate * 0.978);
             tpHorizon = 'SAFE_FLOOR';
-            tpReason = 'Защитный порог чистой прибыли выше комиссий';
+            tpReason = 'Структурная цель прибыли выше входов и комиссий';
           }
         }
       }
@@ -4892,13 +5036,13 @@ async function createScalpBotPosition(
       ((Math.abs(targetTp - entryRate) / Math.max(1e-8, entryRate)) * 100).toFixed(2)
     );
 
-    // Усреднения: DCA 1 строго на уточнённом глобальном уровне 1W->1D SUP/RES (или ручном SUP/RES >= 2.8%), DCA 2 строго на абсолютном историческом пике/дне (1D+4H)
+    // Усреднения: DCA 1 и DCA 2 строго на самых сильных подтверждённых уровнях 1W->1D->4H SUP/RES (мин. >= 3.0% от входа)
     const strongestDca = findStrongestDcaLevel(
       candles4h,
       candles1d,
       entryRate,
       isShort,
-      2.8,
+      3.0,
       95.0,
       customOpts?.candles1w
     );

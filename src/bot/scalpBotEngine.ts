@@ -530,20 +530,20 @@ function snapPriceToClusterDensity(
   if (!candles || candles.length === 0 || centerPrice <= 0 || bandAbs <= 0) {
     return centerPrice;
   }
-  const lowBound = Math.max(centerPrice * 0.5, centerPrice - bandAbs * 1.15);
-  const highBound = centerPrice + bandAbs * 1.15;
+  const maxSnapShift = bandAbs * 0.65;
+  const lowBound = Math.max(centerPrice * 0.5, centerPrice - maxSnapShift);
+  const highBound = centerPrice + maxSnapShift;
   const probes: number[] = [centerPrice];
-  const steps = 24;
+  const steps = 20;
   for (let s = 0; s <= steps; s++) {
     const p = lowBound + ((highBound - lowBound) * s) / steps;
     if (p > 0) probes.push(p);
   }
 
-  const touchBand = Math.max(centerPrice * 0.0025, bandAbs * 0.42);
+  const touchBand = Math.max(centerPrice * 0.002, bandAbs * 0.35);
   let bestPrice = centerPrice;
   let bestDensity = -Infinity;
 
-  // Evaluate over closed/historical candles cleanly (exclude last forming candle beyond stable body if desired, keep deterministic)
   for (const probe of probes) {
     let density = 0;
     for (let i = 0; i < candles.length; i++) {
@@ -552,24 +552,29 @@ function snapPriceToClusterDensity(
       const bLow = Math.min(c.open, c.close);
       const volWeight = volMean[i] > 0 && c.volume >= volMean[i] * 1.15 ? 1.3 : 1.0;
 
+      // Penalize probes that cut straight through candle bodies (mid-range chop / распил)
+      if (bLow < probe - touchBand * 0.35 && bHigh > probe + touchBand * 0.35) {
+        density -= 1.45 * volWeight;
+        continue;
+      }
+
       // Exact wick rejection or bounce near probe
       if (Math.abs(c.low - probe) <= touchBand || Math.abs(c.high - probe) <= touchBand) {
-        density += 1.25 * volWeight;
+        density += 1.35 * volWeight;
       }
-      // Body shelf (open/close aligning tightly along the zone)
-      if (Math.abs(bLow - probe) <= touchBand * 0.85 || Math.abs(bHigh - probe) <= touchBand * 0.85) {
-        density += 0.9 * volWeight;
+      // Body shelf (open/close stopping tightly at the boundary)
+      if (Math.abs(bLow - probe) <= touchBand * 0.75 || Math.abs(bHigh - probe) <= touchBand * 0.75) {
+        density += 0.85 * volWeight;
       }
-      // False-breakout recovery: wick swept beyond probe, body closed back across probe
+      // False-breakout recovery: wick swept beyond probe, body closed back inside
       if (
-        (c.low < probe - touchBand && bLow >= probe - touchBand * 0.5) ||
-        (c.high > probe + touchBand && bHigh <= probe + touchBand * 0.5)
+        (c.low < probe - touchBand && bLow >= probe - touchBand * 0.4) ||
+        (c.high > probe + touchBand && bHigh <= probe + touchBand * 0.4)
       ) {
-        density += 1.1;
+        density += 1.15;
       }
     }
-    // Slight preference to stay cohesive with original zone center when tied
-    const centerPenalty = (Math.abs(probe - centerPrice) / Math.max(1e-9, bandAbs)) * 0.35;
+    const centerPenalty = (Math.abs(probe - centerPrice) / Math.max(1e-9, bandAbs)) * 0.85;
     const net = density - centerPenalty;
     if (net > bestDensity) {
       bestDensity = net;
@@ -604,8 +609,8 @@ export function analyzeLevelInteractions(
 
     const tolPct = Math.max(0.25, touchTolerancePct);
     const bandAbs = seedPrice * (tolPct / 100);
-    // Snap seed onto exact max-touch & body-shelf density (ignores single deep false-breakout spike wicks)
-    const price = snapPriceToClusterDensity(candles, seedPrice, bandAbs * 1.35, volMean);
+    // Snap seed onto exact max-touch & body-shelf density without dragging into mid-range chop
+    const price = snapPriceToClusterDensity(candles, seedPrice, bandAbs * 0.9, volMean);
     const tolAbs = price * (tolPct / 100);
     const zoneLow = price - tolAbs;
     const zoneHigh = price + tolAbs;
@@ -613,19 +618,25 @@ export function analyzeLevelInteractions(
     let touches = 0;
     let bounces = 0;
     let breaks = 0;
+    let recentCloseCrossings = 0;
+    let recentStraddles = 0;
+    let recentPivotBounces = 0;
     let supportBounces = 0;
     let resistanceRejections = 0;
     let mirrorRetests = 0;
     let falseBreakouts = 0;
     let reversals = 0;
+    let majorSwingReversals = 0;
     let strongVolumeEvents = 0;
     let lastTouchIndex = raw.indices[0] ?? 0;
 
-    // Regime tracking for Mirror (Impulse Break + Inverse Retest) detection
     let activeRegime: 'ABOVE' | 'BELOW' | 'UNKNOWN' =
       candles[0].close > zoneHigh ? 'ABOVE' : candles[0].close < zoneLow ? 'BELOW' : 'UNKNOWN';
     let flippedFrom: 'ABOVE' | 'BELOW' | null = null;
     let lastEventIdx = -10;
+    const recentStartIdx = Math.max(0, n - Math.min(190, Math.max(60, Math.floor(n * 0.45))));
+    const pivotStartIdx = Math.max(0, n - Math.min(340, Math.max(90, Math.floor(n * 0.7))));
+    let supportViolatingCloses = 0;
 
     for (let i = 0; i < n; i++) {
       const c = candles[i];
@@ -634,12 +645,28 @@ export function analyzeLevelInteractions(
       const range = Math.max(1e-9, c.high - c.low);
       const isStrongVol = volMean[i] > 0 && c.volume >= volMean[i] * 1.15;
 
-      // Track decisive closes well outside the zone (impulse break)
-      const decisiveAbove = c.close > price + Math.max(tolAbs * 0.9, localAtr * 0.45);
-      const decisiveBelow = c.close < price - Math.max(tolAbs * 0.9, localAtr * 0.45);
+      if (i >= pivotStartIdx && c.close < zoneLow) {
+        supportViolatingCloses += 1;
+      }
+      if (i >= recentStartIdx) {
+        const straddleMargin = Math.max(tolAbs * 0.25, localAtr * 0.18);
+        if (c.low < price - straddleMargin && c.high > price + straddleMargin) {
+          recentStraddles += 1;
+        }
+        if (i > recentStartIdx) {
+          const prevClose = candles[i - 1].close;
+          if ((prevClose < price && c.close >= price) || (prevClose >= price && c.close < price)) {
+            recentCloseCrossings += 1;
+          }
+        }
+      }
+
+      // Track decisive closes outside the zone
+      const decisiveAbove = c.close > price + Math.max(tolAbs * 0.75, localAtr * 0.38);
+      const decisiveBelow = c.close < price - Math.max(tolAbs * 0.75, localAtr * 0.38);
 
       if (activeRegime === 'ABOVE' && decisiveBelow) {
-        const isImpulsiveBreak = body >= localAtr * 0.55 || isStrongVol;
+        const isImpulsiveBreak = body >= localAtr * 0.5 || isStrongVol;
         if (isImpulsiveBreak && i - lastEventIdx >= 2) {
           breaks += 1;
           flippedFrom = 'ABOVE';
@@ -647,7 +674,7 @@ export function analyzeLevelInteractions(
         }
         activeRegime = 'BELOW';
       } else if (activeRegime === 'BELOW' && decisiveAbove) {
-        const isImpulsiveBreak = body >= localAtr * 0.55 || isStrongVol;
+        const isImpulsiveBreak = body >= localAtr * 0.5 || isStrongVol;
         if (isImpulsiveBreak && i - lastEventIdx >= 2) {
           breaks += 1;
           flippedFrom = 'BELOW';
@@ -661,24 +688,29 @@ export function analyzeLevelInteractions(
 
       const testsFromAbove =
         c.low <= zoneHigh &&
-        c.low >= price - Math.max(tolAbs * 2.2, localAtr * 1.4) &&
-        c.close >= price - tolAbs * 0.45 &&
-        (activeRegime === 'ABOVE' || c.open >= price - tolAbs * 0.5 || c.close > c.open);
+        c.low >= price - Math.max(tolAbs * 2.0, localAtr * 1.3) &&
+        c.close >= price - tolAbs * 0.4 &&
+        (activeRegime === 'ABOVE' || c.open >= price - tolAbs * 0.45 || c.close > c.open);
 
       const testsFromBelow =
         c.high >= zoneLow &&
-        c.high <= price + Math.max(tolAbs * 2.2, localAtr * 1.4) &&
-        c.close <= price + tolAbs * 0.45 &&
-        (activeRegime === 'BELOW' || c.open <= price + tolAbs * 0.5 || c.close < c.open);
+        c.high <= price + Math.max(tolAbs * 2.0, localAtr * 1.3) &&
+        c.close <= price + tolAbs * 0.4 &&
+        (activeRegime === 'BELOW' || c.open <= price + tolAbs * 0.45 || c.close < c.open);
 
       if (!testsFromAbove && !testsFromBelow) continue;
-      if (i - lastEventIdx < 2) continue;
+      if (i - lastEventIdx < 3) continue;
 
-      // Measure lookahead reaction (1..4 candles ahead)
-      const lookahead = candles.slice(i + 1, Math.min(n, i + 5));
-      const lookback = candles.slice(Math.max(0, i - 6), i);
+      // Measure lookahead reaction (1..5 candles ahead) and lookback (1..8 candles back)
+      const lookahead = candles.slice(i + 1, Math.min(n, i + 6));
+      const lookback = candles.slice(Math.max(0, i - 8), i);
       const maxPrevHigh = lookback.length > 0 ? Math.max(...lookback.map((b) => b.high)) : c.high;
       const minPrevLow = lookback.length > 0 ? Math.min(...lookback.map((b) => b.low)) : c.low;
+
+      // Check if candle i is a local 2-bar extremum so passing drift candles don't inflate bounces
+      const localWin = candles.slice(Math.max(0, i - 2), Math.min(n, i + 3));
+      const isLocalLow = localWin.every((b) => b.low >= c.low - tolAbs * 0.15);
+      const isLocalHigh = localWin.every((b) => b.high <= c.high + tolAbs * 0.15);
 
       let confirmedBounce = false;
       let eventDetected = false;
@@ -688,22 +720,28 @@ export function analyzeLevelInteractions(
           lookahead.length > 0 ? Math.max(...lookahead.map((b) => b.high)) : c.close;
         const minNextClose =
           lookahead.length > 0 ? Math.min(...lookahead.map((b) => b.close)) : c.close;
-        const stayedSupported = minNextClose >= price - tolAbs * 1.1;
-        const bouncedUp = maxNextHigh - price >= Math.max(tolAbs * 0.65, localAtr * 0.45);
+        const stayedSupported = minNextClose >= price - tolAbs * 1.0;
+        const bouncedUp = maxNextHigh - price >= Math.max(tolAbs * 0.75, localAtr * 0.65);
         const falseSweep = c.low < zoneLow && c.close >= price - tolAbs * 0.35;
 
         if (falseSweep && stayedSupported) {
           falseBreakouts += 1;
         }
-        if (bouncedUp && stayedSupported) {
+        if (bouncedUp && stayedSupported && (isLocalLow || maxNextHigh - price >= localAtr * 1.25)) {
           confirmedBounce = true;
           supportBounces += 1;
+          if (i >= pivotStartIdx && isLocalLow) {
+            recentPivotBounces += 1;
+          }
           if (flippedFrom === 'BELOW') {
             mirrorRetests += 1;
             flippedFrom = null;
           }
           if (maxPrevHigh - price >= localAtr * 1.8 && maxNextHigh - price >= localAtr * 1.6) {
             reversals += 1;
+            if (maxPrevHigh - price >= localAtr * 2.6 && maxNextHigh - price >= localAtr * 2.4) {
+              majorSwingReversals += 1;
+            }
           }
         }
         eventDetected = true;
@@ -712,22 +750,28 @@ export function analyzeLevelInteractions(
           lookahead.length > 0 ? Math.min(...lookahead.map((b) => b.low)) : c.close;
         const maxNextClose =
           lookahead.length > 0 ? Math.max(...lookahead.map((b) => b.close)) : c.close;
-        const stayedResisted = maxNextClose <= price + tolAbs * 1.1;
-        const rejectedDown = price - minNextLow >= Math.max(tolAbs * 0.65, localAtr * 0.45);
+        const stayedResisted = maxNextClose <= price + tolAbs * 1.0;
+        const rejectedDown = price - minNextLow >= Math.max(tolAbs * 0.75, localAtr * 0.65);
         const falseSweep = c.high > zoneHigh && c.close <= price + tolAbs * 0.35;
 
         if (falseSweep && stayedResisted) {
           falseBreakouts += 1;
         }
-        if (rejectedDown && stayedResisted) {
+        if (rejectedDown && stayedResisted && (isLocalHigh || price - minNextLow >= localAtr * 1.25)) {
           confirmedBounce = true;
           resistanceRejections += 1;
+          if (i >= pivotStartIdx && isLocalHigh) {
+            recentPivotBounces += 1;
+          }
           if (flippedFrom === 'ABOVE') {
             mirrorRetests += 1;
             flippedFrom = null;
           }
           if (price - minPrevLow >= localAtr * 1.8 && price - minNextLow >= localAtr * 1.6) {
             reversals += 1;
+            if (price - minPrevLow >= localAtr * 2.6 && price - minNextLow >= localAtr * 2.4) {
+              majorSwingReversals += 1;
+            }
           }
         }
         eventDetected = true;
@@ -749,27 +793,52 @@ export function analyzeLevelInteractions(
     const consolidationBars = raw.consolidationBars || 0;
     if (touches === 0 && consolidationBars < 3) continue;
 
-    // Mirror S/R flip verified whenever level held BOTH as support & resistance or had explicit inverse retest
+    // A level crossed >= 6 times or straddled >= 10 times in the active window is a mid-range chop axis (ось распила)!
+    const isChopAxis = recentCloseCrossings >= 6 || recentStraddles >= 10 || breaks >= 4;
     const isTwoSidedMirror =
-      (supportBounces >= 1 && resistanceRejections >= 1) || mirrorRetests >= 1;
-    const effectiveMirrorCount = Math.max(mirrorRetests, isTwoSidedMirror ? 1 : 0);
+      !isChopAxis &&
+      ((supportBounces >= 1 && resistanceRejections >= 1) || mirrorRetests >= 1);
+    const effectiveMirrorCount = isTwoSidedMirror
+      ? Math.min(2, Math.max(mirrorRetests, 1))
+      : 0;
 
     const effTouches = Math.max(1, touches);
     const bounceRate = bounces / effTouches;
     const recencyWeight = 1 - (n - 1 - lastTouchIndex) / Math.max(1, n);
-    const unconfirmedBreaks = Math.max(0, breaks - effectiveMirrorCount * 2);
 
-    // Article-aligned scoring: consolidation + bounces/volume + reversals + mirror S/R flips + false breakout defense
+    // Reward true outer wave boundaries (clean active-window containment + real pivot bounces)
+    const outerBoundaryBonus =
+      !isChopAxis && recentPivotBounces >= 2 && recentCloseCrossings <= 3 && recentStraddles <= 6
+        ? 6.5
+        : !isChopAxis && recentPivotBounces >= 1 && recentCloseCrossings <= 2 && majorSwingReversals >= 1
+        ? 4.5
+        : !isChopAxis && recentCloseCrossings === 0 && bounces >= 2
+        ? 3.2
+        : 0;
+
+    // Penalize mid-range chop where price crosses back and forth or slices through the level repeatedly
+    const chopPenalty =
+      (recentCloseCrossings >= 5 ? (recentCloseCrossings - 4) * 1.65 : 0) +
+      (recentStraddles >= 8 ? (recentStraddles - 7) * 0.9 : 0) +
+      breaks * 0.85 +
+      (currentPrice > 0 && price < currentPrice && supportViolatingCloses >= 8 ? Math.min(8.0, (supportViolatingCloses - 7) * 0.22) : 0);
+
+    const cleanReversals = isChopAxis ? Math.min(2, reversals) : reversals;
+    const cleanMajorReversals = isChopAxis ? Math.min(1, majorSwingReversals) : majorSwingReversals;
+
     const strengthScore =
-      Math.min(3.6, consolidationBars * 0.42) +
-      Math.min(4.5, bounces * 0.55) +
-      Math.min(2.0, strongVolumeEvents * 0.35) +
-      effectiveMirrorCount * 1.45 +
-      Math.min(2.4, reversals * 0.75) +
-      Math.min(2.0, falseBreakouts * 0.65) +
-      bounceRate * 1.2 +
+      Math.min(2.2, consolidationBars * 0.22) +
+      Math.min(4.5, bounces * 0.65) +
+      Math.min(3.6, recentPivotBounces * 1.2) +
+      Math.min(4.0, cleanReversals * 0.9) +
+      Math.min(4.5, cleanMajorReversals * 1.5) +
+      outerBoundaryBonus +
+      Math.min(1.8, strongVolumeEvents * 0.35) +
+      effectiveMirrorCount * 1.25 +
+      Math.min(1.8, falseBreakouts * 0.6) +
+      bounceRate * 1.4 +
       recencyWeight * 0.9 -
-      unconfirmedBreaks * 0.25;
+      chopPenalty;
 
     const currentRole: 'support' | 'resistance' =
       currentPrice > 0
@@ -798,10 +867,10 @@ export function analyzeLevelInteractions(
     });
   }
 
-  // Deduplicate levels within 1.5 * touchTolerancePct, keeping highest strength_score
+  // Deduplicate levels within 1.8 * touchTolerancePct, keeping highest strength_score
   const sorted = levels.sort((a, b) => b.strength_score - a.strength_score);
   const deduped: ClusteredLevelWithHistory[] = [];
-  const mergeDistPct = Math.max(0.85, touchTolerancePct * 1.45);
+  const mergeDistPct = Math.max(1.2, touchTolerancePct * 1.8);
   for (const lvl of sorted) {
     const dup = deduped.some(
       (kept) =>
@@ -828,14 +897,19 @@ export function buildLevelsWithHistory(
   const adaptiveTolPct =
     tolerancePct !== undefined && tolerancePct > 0
       ? tolerancePct
-      : Math.max(0.45, Math.min(4.2, medianAtrPct * 0.34));
+      : Math.max(0.45, Math.min(3.5, medianAtrPct * 0.34));
 
-  const pivots = findPivots(candles, leftBars, rightBars);
-  const clusteredPivots = clusterPivotsIntoLevels(pivots, adaptiveTolPct * 1.2);
+  const pivotsBase = findPivots(candles, leftBars, rightBars);
+  const majorLeft = Math.max(leftBars + 2, 6);
+  const pivotsMajor =
+    candles.length >= majorLeft * 2 + 5 ? findPivots(candles, majorLeft, majorLeft) : [];
+  const clusteredPivots = clusterPivotsIntoLevels(
+    [...pivotsMajor, ...pivotsBase],
+    adaptiveTolPct * 1.15
+  );
   const seeds: LevelCandidateSeed[] = clusteredPivots.map((c) => ({ ...c, consolidationBars: 0 }));
 
-  // Add consolidation box tops/bottoms & tight pause shelves (article core!)
-  const minCBars = options?.minConsolBars ?? (leftBars <= 2 ? 2 : 3);
+  const minCBars = options?.minConsolBars ?? (leftBars <= 2 ? 3 : 4);
   const maxCBars = options?.maxConsolBars ?? 14;
   const atr = calcAtrSeries(candles, Math.min(14, candles.length));
   const zones = detectConsolidationZones(candles, minCBars, maxCBars, atr);
@@ -860,31 +934,25 @@ export function buildLevelsWithHistory(
     };
     pushSeed(z.top, 'high');
     pushSeed(z.bottom, 'low');
-    // Also add body bottom/top in case box had a deep outlier wick sweep (like DOT 3.55 vs 4.04)
-    if ((Math.abs(z.bodyBottom - z.bottom) / Math.max(1e-9, z.bottom)) * 100 > adaptiveTolPct * 0.8) {
-      pushSeed(z.bodyBottom, 'low');
-    }
-    if ((Math.abs(z.top - z.bodyTop) / Math.max(1e-9, z.top)) * 100 > adaptiveTolPct * 0.8) {
-      pushSeed(z.bodyTop, 'high');
-    }
   }
 
   return analyzeLevelInteractions(candles, seeds, adaptiveTolPct, minPivots);
 }
 
 /**
- * Step 2 from the DOT methodology:
- * Takes macro 1W zones and refines their exact price against 1D candle touches, bounces,
- * false-breakout sweeps, and mirror retests. Also extracts intermediate 1D local levels.
+ * Step 2:
+ * Takes macro 1W zones and refines their exact price against 1D swing peaks/troughs
+ * without dragging them into mid-range daily chop. Also extracts strong 1D levels.
  */
 export function refineHigherTimeframeLevels(
   macro1wLevels: ClusteredLevelWithHistory[],
-  candles1d: OhlcvCandle[],
+  rawCandles1d: OhlcvCandle[],
   currentPrice: number
 ): {
   refinedGlobal: ClusteredLevelWithHistory[];
   local1d: ClusteredLevelWithHistory[];
 } {
+  const candles1d = rawCandles1d ? rawCandles1d.slice(-500) : [];
   if (!candles1d || candles1d.length < 15) {
     return {
       refinedGlobal: macro1wLevels.map((l) => ({
@@ -897,100 +965,92 @@ export function refineHigherTimeframeLevels(
   }
 
   const atr1dPct = getMedianAtrPct(candles1d, 14);
-  const dailyTolPct = Math.max(0.85, Math.min(2.6, atr1dPct * 0.35));
-  const dailyVolMean = calcSmaSeries(
-    candles1d.map((c) => c.volume || 0),
-    Math.min(20, candles1d.length)
-  );
+  const dailyTolPct = Math.max(0.85, Math.min(2.4, atr1dPct * 0.34));
 
-  // Build rich 1D level catalog (consolidations 3-16 days + 1D swings + mirror S/R flips)
-  const dailyAll = buildLevelsWithHistory(candles1d, 3, 3, dailyTolPct, 1, {
-    minConsolBars: 3,
-    maxConsolBars: 16,
+  const dailyAll = buildLevelsWithHistory(candles1d, 4, 4, dailyTolPct, 1, {
+    minConsolBars: 4,
+    maxConsolBars: 14,
   });
 
   const refinedGlobal: ClusteredLevelWithHistory[] = [];
-  const searchRadiusPct = Math.max(3.5, Math.min(7.5, dailyTolPct * 3.0));
+  const matchRadiusPct = Math.max(2.0, Math.min(3.8, dailyTolPct * 1.7));
 
   for (const macro of macro1wLevels) {
-    const bandAbs = macro.price * (searchRadiusPct / 100);
-    // 1. Snap macro 1W price onto the exact 1D touch/retest/body density center
-    const snapped1d = snapPriceToClusterDensity(candles1d, macro.price, bandAbs, dailyVolMean);
-    const evaluated = analyzeLevelInteractions(
-      candles1d,
-      [
-        {
-          price: snapped1d,
-          type: macro.type === 'resistance' ? 'high' : 'low',
-          indices: [Math.max(0, candles1d.length - 1)],
-          consolidationBars: macro.consolidation_bars || 0,
-        },
-      ],
-      dailyTolPct,
-      1
-    );
+    const matchedDaily = dailyAll
+      .filter(
+        (d) =>
+          (Math.abs(d.price - macro.price) / Math.max(1e-9, d.price)) * 100 <= matchRadiusPct
+      )
+      .sort((a, b) => b.strength_score - a.strength_score)[0];
 
-    const bestDaily = evaluated[0];
-    const finalPrice = bestDaily ? bestDaily.price : Number(snapped1d.toPrecision(7));
+    const distFromCurrentPct =
+      currentPrice > 0
+        ? (Math.abs(macro.price - currentPrice) / Math.max(1e-9, currentPrice)) * 100
+        : 50;
+
+    // Inside the active daily range (<= 25% from currentPrice), require a real 1D structural match
+    // so 1W body edges from years ago never invent phantom mid-range levels on 1D!
+    if (!matchedDaily && distFromCurrentPct <= 25.0) {
+      continue;
+    }
+
+    const finalPrice = matchedDaily ? matchedDaily.price : Number(macro.price.toPrecision(7));
     const role: 'support' | 'resistance' =
       currentPrice > 0 ? (finalPrice <= currentPrice ? 'support' : 'resistance') : macro.type;
 
-    const combinedScore = bestDaily
-      ? Number((macro.strength_score * 0.75 + bestDaily.strength_score * 0.65).toFixed(3))
-      : Number((macro.strength_score * 1.15).toFixed(3));
+    const combinedScore = matchedDaily
+      ? Number((matchedDaily.strength_score * 0.85 + macro.strength_score * 0.35).toFixed(3))
+      : Number((macro.strength_score * 0.95).toFixed(3));
 
     const dup = refinedGlobal.some(
-      (g) => (Math.abs(g.price - finalPrice) / Math.max(1e-9, g.price)) * 100 <= dailyTolPct * 1.6
+      (g) => (Math.abs(g.price - finalPrice) / Math.max(1e-9, g.price)) * 100 <= Math.max(3.0, dailyTolPct * 2.0)
     );
     if (!dup) {
       refinedGlobal.push({
         price: finalPrice,
         type: role,
-        touches: Math.max(macro.touches, bestDaily?.touches || 0),
-        bounces: Math.max(macro.bounces, bestDaily?.bounces || 0),
-        breaks: bestDaily?.breaks ?? macro.breaks,
-        bounce_rate: bestDaily?.bounce_rate ?? macro.bounce_rate,
-        last_touch_index: bestDaily?.last_touch_index ?? macro.last_touch_index,
+        touches: Math.max(macro.touches, matchedDaily?.touches || 0),
+        bounces: Math.max(macro.bounces, matchedDaily?.bounces || 0),
+        breaks: matchedDaily?.breaks ?? macro.breaks,
+        bounce_rate: matchedDaily?.bounce_rate ?? macro.bounce_rate,
+        last_touch_index: matchedDaily?.last_touch_index ?? macro.last_touch_index,
         strength_score: combinedScore,
         source: '1W->1D',
-        zone_low: bestDaily?.zone_low ?? macro.zone_low,
-        zone_high: bestDaily?.zone_high ?? macro.zone_high,
-        mirror_retests: Math.max(macro.mirror_retests || 0, bestDaily?.mirror_retests || 0),
-        false_breakouts: Math.max(macro.false_breakouts || 0, bestDaily?.false_breakouts || 0),
-        consolidation_bars: Math.max(macro.consolidation_bars || 0, bestDaily?.consolidation_bars || 0),
-        reversals: Math.max(macro.reversals || 0, bestDaily?.reversals || 0),
+        zone_low: matchedDaily?.zone_low ?? macro.zone_low,
+        zone_high: matchedDaily?.zone_high ?? macro.zone_high,
+        mirror_retests: Math.max(macro.mirror_retests || 0, matchedDaily?.mirror_retests || 0),
+        false_breakouts: Math.max(macro.false_breakouts || 0, matchedDaily?.false_breakouts || 0),
+        consolidation_bars: Math.max(macro.consolidation_bars || 0, matchedDaily?.consolidation_bars || 0),
+        reversals: Math.max(macro.reversals || 0, matchedDaily?.reversals || 0),
         refined_from_1w: true,
         timeframe_role: 'GLOBAL_1W_1D',
       });
     }
   }
 
-  // Fallback if 1W had very few bars (e.g. recently listed coin): promote strongest 1D levels to GLOBAL
-  if (refinedGlobal.length < 2) {
-    for (const dLvl of dailyAll) {
-      const exists = refinedGlobal.some(
-        (g) => (Math.abs(g.price - dLvl.price) / Math.max(1e-9, g.price)) * 100 <= dailyTolPct * 1.8
-      );
-      if (!exists) {
-        refinedGlobal.push({
-          ...dLvl,
-          type: currentPrice > 0 ? (dLvl.price <= currentPrice ? 'support' : 'resistance') : dLvl.type,
-          source: '1D_GLOBAL',
-          refined_from_1w: false,
-          timeframe_role: 'GLOBAL_1W_1D',
-        });
-      }
-      if (refinedGlobal.length >= 6) break;
+  for (const dLvl of dailyAll) {
+    if (dLvl.bounces < 2) continue;
+    const exists = refinedGlobal.some(
+      (g) => (Math.abs(g.price - dLvl.price) / Math.max(1e-9, g.price)) * 100 <= Math.max(3.2, dailyTolPct * 2.2)
+    );
+    if (!exists && dLvl.strength_score >= 8.0) {
+      refinedGlobal.push({
+        ...dLvl,
+        type: currentPrice > 0 ? (dLvl.price <= currentPrice ? 'support' : 'resistance') : dLvl.type,
+        source: '1D_GLOBAL',
+        refined_from_1w: false,
+        timeframe_role: 'GLOBAL_1W_1D',
+      });
     }
   }
 
-  // Extract intermediate 1D local levels (3-5+ day consolidations, 1D mirror flips, local highs/lows)
   const local1d: ClusteredLevelWithHistory[] = [];
   for (const dLvl of dailyAll) {
+    if (dLvl.bounces < 2) continue;
     const nearGlobal = refinedGlobal.some(
-      (g) => (Math.abs(g.price - dLvl.price) / Math.max(1e-9, g.price)) * 100 <= dailyTolPct * 1.9
+      (g) => (Math.abs(g.price - dLvl.price) / Math.max(1e-9, g.price)) * 100 <= Math.max(3.5, dailyTolPct * 2.2)
     );
-    if (!nearGlobal && dLvl.strength_score >= 2.2) {
+    if (!nearGlobal && dLvl.strength_score >= 6.5) {
       local1d.push({
         ...dLvl,
         type: currentPrice > 0 ? (dLvl.price <= currentPrice ? 'support' : 'resistance') : dLvl.type,
@@ -1045,7 +1105,7 @@ export function detectMarketStructure(
     if (c.low < globalLow) globalLow = c.low;
   }
 
-  const activeWindow = isGlobal ? subset : subset.slice(-Math.min(subset.length, 48));
+  const activeWindow = isGlobal ? subset : subset.slice(-Math.min(subset.length, 160));
   let rangeHigh = -Infinity;
   let rangeLow = Infinity;
   for (const c of activeWindow) {
@@ -1070,58 +1130,67 @@ export function detectMarketStructure(
     if (isLow) swingLows.push(subset[i].low);
   }
 
-  const minDistPct = 0.8;
-  const maxActiveLevelDistPct = isGlobal ? 95.0 : 15.0;
+  const minDistPct = isGlobal ? 1.8 : 1.3;
+  const maxActiveLevelDistPct = isGlobal ? 95.0 : 25.0;
   const medianAtrPct = getMedianAtrPct(subset, 14);
   const tolPct = isGlobal
-    ? Math.max(0.85, Math.min(3.8, medianAtrPct * 0.34))
-    : Math.max(0.45, Math.min(1.6, medianAtrPct * 0.42));
+    ? Math.max(0.85, Math.min(3.2, medianAtrPct * 0.34))
+    : Math.max(0.45, Math.min(1.6, medianAtrPct * 0.4));
 
   const levelsWithHistory = buildLevelsWithHistory(
     subset,
-    isGlobal && subset.length < 250 ? 2 : 3,
-    isGlobal && subset.length < 250 ? 2 : 3,
+    isGlobal && subset.length < 150 ? 2 : 4,
+    isGlobal && subset.length < 150 ? 2 : 4,
     tolPct,
-    isGlobal ? 1 : 2,
-    { minConsolBars: isGlobal ? 2 : 3, maxConsolBars: isGlobal ? 16 : 12 }
+    1,
+    { minConsolBars: isGlobal ? 3 : 4, maxConsolBars: isGlobal ? 14 : 12 }
   );
+
+  // Strong reliable boundary: confirmed bounces and NOT sawed through (bounces > breaks)
+  const isStrongReliableLevel = (l: ClusteredLevelWithHistory) =>
+    l.bounces >= 2 &&
+    l.bounces > l.breaks &&
+    l.strength_score >= (isGlobal ? 6.0 : 4.5);
 
   const supportsHistAll = levelsWithHistory.filter(
     (l) => l.type === 'support' && ((currentPrice - l.price) / currentPrice) * 100 >= minDistPct
   );
-  const supportsHistNear = supportsHistAll.filter(
+  const supportsStrong = supportsHistAll.filter(isStrongReliableLevel);
+  const supportsBase = supportsStrong.length > 0 ? supportsStrong : supportsHistAll;
+  const supportsHistNear = supportsBase.filter(
     (l) => ((currentPrice - l.price) / currentPrice) * 100 <= maxActiveLevelDistPct
   );
-  const supportsPool = supportsHistNear.length > 0 ? supportsHistNear : supportsHistAll;
+  const supportsPool = supportsHistNear.length > 0 ? supportsHistNear : supportsBase;
 
   const resistancesHistAll = levelsWithHistory.filter(
     (l) => l.type === 'resistance' && ((l.price - currentPrice) / currentPrice) * 100 >= minDistPct
   );
-  const resistancesHistNear = resistancesHistAll.filter(
+  const resistancesStrong = resistancesHistAll.filter(isStrongReliableLevel);
+  const resistancesBase = resistancesStrong.length > 0 ? resistancesStrong : resistancesHistAll;
+  const resistancesHistNear = resistancesBase.filter(
     (l) => ((l.price - currentPrice) / currentPrice) * 100 <= maxActiveLevelDistPct
   );
   const resistancesPool =
-    resistancesHistNear.length > 0 ? resistancesHistNear : resistancesHistAll;
+    resistancesHistNear.length > 0 ? resistancesHistNear : resistancesBase;
 
   const pickBestGlobalOrLocal = (pool: ClusteredLevelWithHistory[]) => {
     if (pool.length === 0) return null;
+    const multiTouch = pool.filter(isStrongReliableLevel);
+    const targetPool = multiTouch.length > 0 ? multiTouch : pool;
     if (!isGlobal) {
-      return pool.reduce((best, cur) => {
+      return targetPool.reduce((best, cur) => {
         const distBest = (Math.abs(currentPrice - best.price) / Math.max(1e-9, currentPrice)) * 100;
         const distCur = (Math.abs(currentPrice - cur.price) / Math.max(1e-9, currentPrice)) * 100;
-        const scoreBest = best.strength_score / (1 + distBest * 0.12);
-        const scoreCur = cur.strength_score / (1 + distCur * 0.12);
+        const scoreBest = best.strength_score / (1 + Math.max(0, distBest - 6.0) * 0.035);
+        const scoreCur = cur.strength_score / (1 + Math.max(0, distCur - 6.0) * 0.035);
         return scoreCur > scoreBest ? cur : best;
       });
     }
-    // Global ranking: favor proven bounces/consolidations/mirror flips, lightly balance extreme unreachable outliers
-    const multiTouch = pool.filter((l) => l.bounces >= 2 || (l.consolidation_bars || 0) >= 3);
-    const targetPool = multiTouch.length > 0 ? multiTouch : pool;
     return targetPool.reduce((best, cur) => {
       const distBest = (Math.abs(currentPrice - best.price) / Math.max(1e-9, currentPrice)) * 100;
       const distCur = (Math.abs(currentPrice - cur.price) / Math.max(1e-9, currentPrice)) * 100;
-      const rankBest = best.strength_score / (1 + Math.max(0, distBest - 18) * 0.012);
-      const rankCur = cur.strength_score / (1 + Math.max(0, distCur - 18) * 0.012);
+      const rankBest = best.strength_score / (1 + Math.max(0, distBest - 24) * 0.015);
+      const rankCur = cur.strength_score / (1 + Math.max(0, distCur - 24) * 0.015);
       return rankCur > rankBest ? cur : best;
     });
   };
@@ -1141,8 +1210,8 @@ export function detectMarketStructure(
       return d >= minDistPct && d <= maxActiveLevelDistPct;
     });
     if (supportsBelow.length > 0) nearestSupport = Math.max(...supportsBelow);
-    else if (rangeLow < currentPrice * 0.992) nearestSupport = rangeLow;
-    else nearestSupport = currentPrice * 0.975;
+    else if (rangeLow < currentPrice * 0.985) nearestSupport = rangeLow;
+    else nearestSupport = currentPrice * 0.97;
   }
 
   let nearestResistance = rangeHigh;
@@ -1157,12 +1226,12 @@ export function detectMarketStructure(
       return d >= minDistPct && d <= maxActiveLevelDistPct;
     });
     if (resistancesAbove.length > 0) nearestResistance = Math.min(...resistancesAbove);
-    else if (rangeHigh > currentPrice * 1.008) nearestResistance = rangeHigh;
-    else nearestResistance = currentPrice * 1.025;
+    else if (rangeHigh > currentPrice * 1.015) nearestResistance = rangeHigh;
+    else nearestResistance = currentPrice * 1.03;
   }
 
-  const rawTp = nearestResistance * 0.998;
-  const recommendedTp = rawTp > currentPrice ? rawTp : currentPrice * 1.02;
+  const rawTp = nearestResistance * 0.9975;
+  const recommendedTp = rawTp > currentPrice * 1.015 ? rawTp : currentPrice * 1.022;
 
   const rawSl = nearestSupport * 0.997;
   const recommendedSl = rawSl < currentPrice ? rawSl : currentPrice * 0.98;
@@ -1181,6 +1250,87 @@ export function detectMarketStructure(
     support_history: supportHistory,
     resistance_history: resistanceHistory,
     all_levels: levelsWithHistory,
+  };
+}
+
+/**
+ * Извлекает ТОЛЬКО самые сильные, нераспиленные уровни поддержки и сопротивления для конкретного таймфрейма (15m, 1h, 4h, 1d, 1w),
+ * отсекая уровни внутри бокового распила и уровни вплотную к текущей цене.
+ */
+export function extractStrongTimeframeLevels(
+  candles: OhlcvCandle[],
+  timeframe: string,
+  currentPrice: number,
+  maxPerSide = 1
+): {
+  supports: ClusteredLevelWithHistory[];
+  resistances: ClusteredLevelWithHistory[];
+} {
+  if (!candles || candles.length < 20 || currentPrice <= 0) {
+    return { supports: [], resistances: [] };
+  }
+  const tf = String(timeframe || '1h').toLowerCase();
+  const isHigherTf = tf === '1d' || tf === '1w';
+  const isMedTf = tf === '4h' || tf === '6h' || tf === '8h' || tf === '12h';
+  const minDistFromPricePct = isHigherTf ? 2.2 : isMedTf ? 1.5 : 1.1;
+  const minSeparationPct = isHigherTf ? 6.0 : isMedTf ? 3.5 : 2.2;
+
+  const struct = detectMarketStructure(
+    candles,
+    Math.min(candles.length, isHigherTf ? 500 : 320),
+    isHigherTf
+  );
+  const strongPool = (struct.all_levels || []).filter(
+    (l) =>
+      l.bounces >= 2 &&
+      l.bounces > l.breaks &&
+      l.strength_score >= (isHigherTf ? 6.5 : 4.5)
+  );
+  const fallbackPool = (struct.all_levels || []).filter(
+    (l) =>
+      l.bounces >= 1 &&
+      l.breaks === 0 &&
+      l.strength_score >= (isHigherTf ? 5.0 : 3.5)
+  );
+
+  const pickTopSide = (role: 'support' | 'resistance'): ClusteredLevelWithHistory[] => {
+    const filterBySide = (pool: ClusteredLevelWithHistory[]) =>
+      pool
+        .filter((l) => {
+          const distPct =
+            role === 'support'
+              ? ((currentPrice - l.price) / currentPrice) * 100
+              : ((l.price - currentPrice) / currentPrice) * 100;
+          return distPct >= minDistFromPricePct && distPct <= (isHigherTf ? 65 : 28);
+        })
+        .sort((a, b) => b.strength_score - a.strength_score);
+
+    let sideCands = filterBySide(strongPool);
+    if (sideCands.length === 0) {
+      sideCands = filterBySide(fallbackPool);
+    }
+
+    const chosen: ClusteredLevelWithHistory[] = [];
+    for (const c of sideCands) {
+      if (chosen.length >= maxPerSide) break;
+      const tooClose = chosen.some(
+        (ex) => (Math.abs(ex.price - c.price) / Math.max(1e-9, ex.price)) * 100 < minSeparationPct
+      );
+      if (!tooClose) {
+        chosen.push({
+          ...c,
+          type: role,
+          source: `${tf.toUpperCase()}_STRONG`,
+          timeframe_role: isHigherTf ? 'LOCAL_1D' : isMedTf ? 'STRUCT_4H' : 'STRUCT_1H',
+        });
+      }
+    }
+    return chosen;
+  };
+
+  return {
+    supports: pickTopSide('support'),
+    resistances: pickTopSide('resistance'),
   };
 }
 
@@ -1335,8 +1485,17 @@ function selectChartDrivenTakeProfit(params: {
   } = params;
 
   const isLong = direction === 'long';
-  // Minimum safe profit distance (~0.60%) above entry so initial TP clears fees (0.12%) + slippage
-  const minSafePrice = isLong ? currentPrice * 1.006 : currentPrice * 0.994;
+  const atr4hPct = candles4h.length >= 14 ? getMedianAtrPct(candles4h, 14) : 0;
+  const atr1hPct = candles1h.length >= 14 ? getMedianAtrPct(candles1h, 14) : 0;
+  const effectiveAtrPct = Math.max(1.2, atr4hPct || atr1hPct * 1.8 || 1.6);
+
+  // Минимальная структурная дистанция до TP (>= 1.5%..3.0% в зависимости от волатильности монеты),
+  // чтобы бот НИКОГДА не ставил тейк-профит вплотную к точке входа (+0.6%..+0.9%)
+  const minStructuralDistPct = Math.max(1.5, Math.min(3.0, effectiveAtrPct * 0.78));
+  const minCandidateDistPct = 1.25;
+  const minSafePrice = isLong
+    ? currentPrice * (1 + minCandidateDistPct / 100)
+    : currentPrice * (1 - minCandidateDistPct / 100);
 
   const horizonRank: Record<'1H' | '4H' | '1D' | '1W', number> = {
     '1W': 4,
@@ -1345,21 +1504,27 @@ function selectChartDrivenTakeProfit(params: {
     '1H': 1,
   };
 
+  // Выставляем TP непосредственно перед самим сильным уровнем (отступ 0.20%..0.35% от ядра уровня),
+  // не позволяя широкой зоне 1D/1W (zoneLow/zoneHigh в 2% от уровня) сдвигать TP вплотную к цене входа!
   const toExecPrice = (
     rawLevel: number,
     zoneLow?: number,
     zoneHigh?: number
   ): number => {
     if (isLong) {
-      if (zoneLow && zoneLow > currentPrice * 1.003) {
-        return zoneLow * 0.9985;
+      const tightFrontRun = rawLevel * 0.9975;
+      if (zoneLow && zoneLow > currentPrice * 1.012) {
+        const clampedZoneLow = Math.max(zoneLow, rawLevel * 0.9955);
+        return Math.min(tightFrontRun, clampedZoneLow);
       }
-      return rawLevel * 0.998;
+      return tightFrontRun;
     } else {
-      if (zoneHigh && zoneHigh < currentPrice * 0.997) {
-        return zoneHigh * 1.0015;
+      const tightFrontRun = rawLevel * 1.0025;
+      if (zoneHigh && zoneHigh < currentPrice * 0.988) {
+        const clampedZoneHigh = Math.min(zoneHigh, rawLevel * 1.0045);
+        return Math.max(tightFrontRun, clampedZoneHigh);
       }
-      return rawLevel * 1.002;
+      return tightFrontRun;
     }
   };
 
@@ -1370,7 +1535,7 @@ function selectChartDrivenTakeProfit(params: {
     horizon: '1H' | '4H' | '1D' | '1W',
     label: string,
     strength: number,
-    bounces = 1,
+    bounces = 2,
     breaks = 0,
     zoneLow?: number,
     zoneHigh?: number
@@ -1392,51 +1557,57 @@ function selectChartDrivenTakeProfit(params: {
   };
 
   if (customLevelTarget && customLevelTarget > 0) {
-    pushLevel(customLevelTarget, '1D', 'Ручной уровень графика', 25, 3, 0);
-  }
-  if (local1hTarget > 0) {
-    pushLevel(local1hTarget, '1H', '1H локальный уровень', 6, 1, 0);
+    pushLevel(customLevelTarget, '1D', 'Ручной уровень графика', 30, 4, 0);
   }
   if (keyGlobalTarget > 0) {
-    pushLevel(keyGlobalTarget, '1D', '1W->1D глобальная зона', 16, 2, 0);
+    pushLevel(keyGlobalTarget, '1D', '1W->1D глобальный уровень', 18, 3, 0);
   }
 
+  // Из 1H берём ТОЛЬКО сильные подтверждённые уровни (минимум 2 отбоя или боковик >= 3 свечей, отбоев >= пробоев)
   for (const l of structure1hLevels) {
+    const isStrong1h =
+      (l.bounces >= 2 || (l.consolidation_bars || 0) >= 3) &&
+      (l.bounces >= l.breaks || (l.mirror_retests || 0) >= 1) &&
+      (l.strength_score || 0) >= 5.5;
+    if (!isStrong1h) continue;
     pushLevel(
       l.price,
       '1H',
-      l.consolidation_bars && l.consolidation_bars >= 3 ? '1H граница боковика' : '1H свинг-уровень',
-      l.strength_score || 5,
-      l.bounces || 1,
+      l.consolidation_bars && l.consolidation_bars >= 3 ? '1H сильная зона консолидации' : '1H сильный уровень',
+      l.strength_score || 6,
+      l.bounces || 2,
       l.breaks || 0,
       l.zone_low,
       l.zone_high
     );
   }
-  for (const sw of swing1hExtremes) {
-    pushLevel(sw, '1H', '1H экстремум', 4, 1, 0);
-  }
+
+  // Из 4H берём подтверждённые структурные уровни (без случайных одиночных экстремумов возле входа)
   for (const l of structural4hLevels) {
+    const isStrong4h =
+      (l.bounces >= 2 || (l.consolidation_bars || 0) >= 3) &&
+      (l.bounces >= l.breaks || (l.mirror_retests || 0) >= 1) &&
+      (l.strength_score || 0) >= 5.0;
+    if (!isStrong4h) continue;
     pushLevel(
       l.price,
       '4H',
-      l.consolidation_bars && l.consolidation_bars >= 3 ? '4H зона консолидации' : '4H структурный уровень',
-      (l.strength_score || 6) * 1.25,
-      l.bounces || 1,
+      l.consolidation_bars && l.consolidation_bars >= 3 ? '4H зона консолидации' : '4H сильный структурный уровень',
+      (l.strength_score || 6.5) * 1.35,
+      l.bounces || 2,
       l.breaks || 0,
       l.zone_low,
       l.zone_high
     );
   }
-  for (const sw of swing4hExtremes) {
-    pushLevel(sw, '4H', '4H свинг-пик/дно', 6.5, 1, 0);
-  }
+
   for (const l of local1d) {
+    if (l.breaks > l.bounces + 1 && (l.mirror_retests || 0) === 0) continue;
     pushLevel(
       l.price,
       '1D',
-      l.consolidation_bars && l.consolidation_bars >= 3 ? '1D зона консолидации' : '1D локальный уровень',
-      (l.strength_score || 8) * 1.4,
+      l.consolidation_bars && l.consolidation_bars >= 3 ? '1D зона консолидации' : '1D сильный уровень',
+      (l.strength_score || 8) * 1.5,
       l.bounces || 2,
       l.breaks || 0,
       l.zone_low,
@@ -1449,15 +1620,15 @@ function selectChartDrivenTakeProfit(params: {
       l.price,
       h,
       l.refined_from_1w ? '1W->1D глобальный уровень' : '1D глобальный уровень',
-      (l.strength_score || 10) * 1.6,
-      l.bounces || 2,
+      (l.strength_score || 10) * 1.75,
+      l.bounces || 3,
       l.breaks || 0,
       l.zone_low,
       l.zone_high
     );
   }
 
-  // Deduplicate candidates clustered within 0.45% (keep highest authority/strength)
+  // Дедупликация близких кандидатов в пределах 0.55% (оставляем самый старший и сильный уровень)
   const deduped: ChartTpCandidate[] = [];
   const sortedByAuth = [...rawCandidates].sort((a, b) => {
     if (horizonRank[b.horizon] !== horizonRank[a.horizon]) {
@@ -1467,85 +1638,116 @@ function selectChartDrivenTakeProfit(params: {
   });
   for (const cand of sortedByAuth) {
     const tooClose = deduped.some(
-      (ex) => (Math.abs(ex.price - cand.price) / Math.max(1e-9, cand.price)) * 100 < 0.45
+      (ex) => (Math.abs(ex.price - cand.price) / Math.max(1e-9, cand.price)) * 100 < 0.55
     );
     if (!tooClose) deduped.push(cand);
   }
 
-  // Order by trajectory from currentPrice outward
+  // Сортируем по траектории движения цены от точки входа
   const ordered = deduped.sort((a, b) => (isLong ? a.price - b.price : b.price - a.price));
 
-  // ATR fallback measured move (used ONLY when chart is in uncharted breakout with zero overhead levels)
-  const atr4hPct = candles4h.length >= 14 ? getMedianAtrPct(candles4h, 14) : 0;
-  const atr1hPct = candles1h.length >= 14 ? getMedianAtrPct(candles1h, 14) : 0;
-  const effectiveAtrPct = Math.max(0.8, atr4hPct || atr1hPct * 1.8 || 1.4);
+  const getDistPct = (p: number) =>
+    (Math.abs(p - currentPrice) / Math.max(1e-9, currentPrice)) * 100;
 
   if (ordered.length === 0) {
-    const mult = regime === 'STRONG_TREND' ? 2.6 : regime === 'MODERATE_TREND' ? 1.8 : 1.1;
-    const movePct = Math.max(0.8, effectiveAtrPct * mult) / 100;
+    const mult = regime === 'STRONG_TREND' ? 2.6 : regime === 'MODERATE_TREND' ? 1.85 : 1.35;
+    const movePct = Math.max(minStructuralDistPct, effectiveAtrPct * mult) / 100;
     const projPrice = Number(
       (isLong ? currentPrice * (1 + movePct) : currentPrice * (1 - movePct)).toPrecision(7)
     );
     return {
       tp: projPrice,
       horizon: regime === 'STRONG_TREND' ? '4H' : '1H',
-      reason: `Проекция волатильности (ATR×${mult}) — свободный ход без близких стен`,
+      reason: `Проекция волатильности (ATR×${mult}) — ход к расчётной зоне сопротивления/поддержки`,
       targets: [],
     };
   }
 
-  // First strong HTF wall (1D/1W) blocking the path — never set TP blindly behind an intact major wall
+  // Первая непробиваемая глобальная стена 1D/1W на пути цены (чтобы не ставить TP за железобетонной преградой)
   const firstMajorHtfWall = ordered.find(
-    (c) => (c.horizon === '1D' || c.horizon === '1W') && c.bounces >= c.breaks
+    (c) =>
+      (c.horizon === '1D' || c.horizon === '1W') &&
+      c.bounces >= Math.max(2, c.breaks) &&
+      c.strength >= 12 &&
+      getDistPct(c.price) >= minStructuralDistPct
   );
+
+  // Отбираем уровни на рабочей структурной дистанции (>= minStructuralDistPct) и не дальше первой капитальной стены 1D/1W
+  const structuralPool = ordered.filter((c) => {
+    const d = getDistPct(c.price);
+    if (d < minStructuralDistPct) return false;
+    if (firstMajorHtfWall) {
+      if (isLong && c.price > firstMajorHtfWall.price * 1.003) return false;
+      if (!isLong && c.price < firstMajorHtfWall.price * 0.997) return false;
+    }
+    return true;
+  });
+
+  const activePool = structuralPool.length > 0 ? structuralPool : ordered;
+
+  // Функция ранжирования цели: выбирает САМЫЙ СИЛЬНЫЙ уровень в целевом диапазоне движения цены
+  const pickStrongestTarget = (
+    pool: ChartTpCandidate[],
+    preferredMaxDistPct: number
+  ): ChartTpCandidate => {
+    const inRange = pool.filter((c) => getDistPct(c.price) <= preferredMaxDistPct);
+    const working = inRange.length > 0 ? inRange : pool;
+    return working.reduce((best, cur) => {
+      const dBest = getDistPct(best.price);
+      const dCur = getDistPct(cur.price);
+      const hMultBest = best.horizon === '1W' ? 1.35 : best.horizon === '1D' ? 1.25 : best.horizon === '4H' ? 1.15 : 1.0;
+      const hMultCur = cur.horizon === '1W' ? 1.35 : cur.horizon === '1D' ? 1.25 : cur.horizon === '4H' ? 1.15 : 1.0;
+      const rankBest =
+        (best.strength * hMultBest * (1 + Math.min(0.6, best.bounces * 0.1))) /
+        (1 + Math.max(0, dBest - 6.0) * 0.05);
+      const rankCur =
+        (cur.strength * hMultCur * (1 + Math.min(0.6, cur.bounces * 0.1))) /
+        (1 + Math.max(0, dCur - 6.0) * 0.05);
+      return rankCur > rankBest ? cur : best;
+    });
+  };
 
   let chosen: ChartTpCandidate | undefined;
 
-  if (regime === 'RANGE_CHOP') {
-    // Weak trend / sideways: take profit at nearest confirmed 1H/4H structure (above safe floor)
+  if (regime === 'STRONG_TREND') {
+    // Сильный тренд: цена идёт к ключевому уровню 1D / 1W / 4H (пробивая мелкие локальные преграды)
+    const htfPool = activePool.filter(
+      (c) =>
+        (c.horizon === '1D' || c.horizon === '1W' || c.horizon === '4H') &&
+        getDistPct(c.price) >= Math.max(2.0, minStructuralDistPct)
+    );
     chosen =
-      ordered.find((c) => (c.horizon === '1H' || c.horizon === '4H') && c.bounces >= 1) ||
-      ordered[0];
+      firstMajorHtfWall ||
+      (htfPool.length > 0 ? pickStrongestTarget(htfPool, 14.0) : pickStrongestTarget(activePool, 12.0));
   } else if (regime === 'MODERATE_TREND') {
-    // Moderate trend: prefer 4H or confirmed 1D structure unless a solid 1H wall has high bounces or major HTF wall is closer
-    const c4hOr1d = ordered.find(
-      (c) =>
-        (c.horizon === '4H' || c.horizon === '1D' || c.horizon === '1W') &&
-        ((Math.abs(c.price - currentPrice) / currentPrice) * 100 >= 0.9 || c.strength >= 8)
+    // Умеренный тренд: целимся в самый сильный уровень 4H или 1D в рабочем коридоре (до 9%)
+    const medPool = activePool.filter(
+      (c) => c.horizon === '4H' || c.horizon === '1D' || c.horizon === '1W'
     );
-    if (firstMajorHtfWall && c4hOr1d && (isLong ? firstMajorHtfWall.price < c4hOr1d.price : firstMajorHtfWall.price > c4hOr1d.price)) {
-      chosen = firstMajorHtfWall;
-    } else {
-      chosen = c4hOr1d || ordered[0];
-    }
+    chosen =
+      medPool.length > 0
+        ? pickStrongestTarget(medPool, 9.0)
+        : pickStrongestTarget(activePool, 7.5);
   } else {
-    // STRONG_TREND: skip weak 1H bumps, aim for major 1D/1W target (or strongest 4H before major 1D/1W)
-    const majorHtf = ordered.find(
-      (c) =>
-        (c.horizon === '1D' || c.horizon === '1W') &&
-        (Math.abs(c.price - currentPrice) / currentPrice) * 100 >= 1.2
+    // Боковик или контртрендовый отбой от сильного уровня: цена идёт к противоположному сильному уровню 4H/1D/1H канала (до 6.5%)
+    const reversalPool = activePool.filter(
+      (c) => c.horizon === '4H' || c.horizon === '1D' || c.strength >= 7.0
     );
-    const strong4h = ordered.find(
-      (c) =>
-        c.horizon === '4H' &&
-        (Math.abs(c.price - currentPrice) / currentPrice) * 100 >= 1.4
-    );
-    if (firstMajorHtfWall) {
-      chosen = firstMajorHtfWall;
-    } else {
-      chosen = majorHtf || strong4h || ordered[ordered.length - 1];
-    }
+    chosen =
+      reversalPool.length > 0
+        ? pickStrongestTarget(reversalPool, 6.5)
+        : pickStrongestTarget(activePool, 6.0);
   }
 
-  if (!chosen) chosen = ordered[0];
+  if (!chosen) chosen = activePool[0] || ordered[0];
 
-  const distPct = ((Math.abs(chosen.price - currentPrice) / Math.max(1e-9, currentPrice)) * 100).toFixed(2);
+  const distPct = getDistPct(chosen.price).toFixed(2);
   const regimeLabel =
     regime === 'STRONG_TREND'
       ? 'сильный тренд'
       : regime === 'MODERATE_TREND'
       ? 'умеренный тренд'
-      : 'боковик/слабый тренд';
+      : 'движение в канале от уровня к уровню';
 
   return {
     tp: chosen.price,
@@ -1654,7 +1856,7 @@ export function analyzeMultiTimeframe(
   // STEP 1 (1W MACRO): Consolidations (1-3+ bars & accumulation ranges), bounces, reversals, mirror flips
   const structure1w =
     candles1w && candles1w.length >= 12
-      ? detectMarketStructure(candles1w, candles1w.length, true)
+      ? detectMarketStructure(candles1w.slice(-200), Math.min(200, candles1w.length), true)
       : null;
 
   // STEP 2 (1D REFINEMENT + 1D LOCAL): Refine 1W macro levels onto 1D dense reactions + find 1D local levels
@@ -1683,26 +1885,32 @@ export function analyzeMultiTimeframe(
   const hasCustomSup = Boolean(customLevels?.support && customLevels.support > 0);
   const hasCustomRes = Boolean(customLevels?.resistance && customLevels.resistance > 0);
 
-  // Primary Global Support & Resistance from 1W->1D refined levels (or high-conviction 1D shelf if distant outlier exists)
-  const minGlobalRoomPct = 0.8;
+  // Primary Global Support & Resistance from 1W->1D refined levels within the active trading channel (1.8%..25%)
+  const atr1dForGlobal = candles1d.length >= 15 ? getMedianAtrPct(candles1d, 14) : 2.5;
+  const minGlobalRoomPct = Math.max(3.5, Math.min(5.8, atr1dForGlobal * 1.35));
   const globalSupports = [
     ...refinedGlobal,
-    ...local1d.filter((l) => l.strength_score >= 10),
+    ...local1d.filter((l) => l.strength_score >= 8.0),
   ].filter((l) => ((currentPrice - l.price) / currentPrice) * 100 >= minGlobalRoomPct);
   const globalResistances = [
     ...refinedGlobal,
-    ...local1d.filter((l) => l.strength_score >= 10),
+    ...local1d.filter((l) => l.strength_score >= 8.0),
   ].filter((l) => ((l.price - currentPrice) / currentPrice) * 100 >= minGlobalRoomPct);
 
   const pickNearestStrongGlobal = (cands: ClusteredLevelWithHistory[]) => {
     if (cands.length === 0) return null;
-    return cands.reduce((best, cur) => {
+    const inActiveChannel = cands.filter((c) => {
+      const d = (Math.abs(currentPrice - c.price) / Math.max(1e-9, currentPrice)) * 100;
+      return d <= 25.0 && c.strength_score >= 5.0 && c.breaks <= 3;
+    });
+    const pool = inActiveChannel.length > 0 ? inActiveChannel : cands;
+    return pool.reduce((best, cur) => {
       const distBest = (Math.abs(currentPrice - best.price) / Math.max(1e-9, currentPrice)) * 100;
       const distCur = (Math.abs(currentPrice - cur.price) / Math.max(1e-9, currentPrice)) * 100;
-      const multBest = best.timeframe_role === 'GLOBAL_1W_1D' ? 1.15 : 0.9;
-      const multCur = cur.timeframe_role === 'GLOBAL_1W_1D' ? 1.15 : 0.9;
-      const scoreBest = (best.strength_score * multBest) / (1 + distBest * 0.025);
-      const scoreCur = (cur.strength_score * multCur) / (1 + distCur * 0.025);
+      const multBest = best.timeframe_role === 'GLOBAL_1W_1D' ? 1.05 : 1.0;
+      const multCur = cur.timeframe_role === 'GLOBAL_1W_1D' ? 1.05 : 1.0;
+      const scoreBest = (best.strength_score * multBest) / (1 + Math.max(0, distBest - 22) * 0.03);
+      const scoreCur = (cur.strength_score * multCur) / (1 + Math.max(0, distCur - 22) * 0.03);
       return scoreCur > scoreBest ? cur : best;
     });
   };
@@ -2166,7 +2374,7 @@ export function findStrongestDcaLevel(
   source: string;
   type: 'support' | 'resistance';
 } {
-  const effectiveMinDistPct = Math.max(2.8, minDistPct);
+  const effectiveMinDistPct = Math.max(3.0, minDistPct);
   if (referencePrice <= 0) {
     return {
       price: 0,
@@ -2214,14 +2422,14 @@ export function findStrongestDcaLevel(
     for (const g of refinedGlobal) {
       allCandidates.push({
         ...g,
-        strength_score: Number((g.strength_score * 1.2).toFixed(3)),
+        strength_score: Number((g.strength_score * 1.35).toFixed(3)),
         source: g.refined_from_1w ? '1W_1D_GLOBAL' : '1D_GLOBAL',
       });
     }
     for (const l of local1d) {
       allCandidates.push({
         ...l,
-        strength_score: Number((l.strength_score * 0.95).toFixed(3)),
+        strength_score: Number((l.strength_score * 1.1).toFixed(3)),
         source: '1D_LOCAL',
       });
     }
@@ -2229,27 +2437,28 @@ export function findStrongestDcaLevel(
     for (const g of macro1wLevels) {
       allCandidates.push({
         ...g,
-        strength_score: Number((g.strength_score * 1.2).toFixed(3)),
+        strength_score: Number((g.strength_score * 1.35).toFixed(3)),
         source: '1W_GLOBAL',
       });
     }
   }
 
-  // 2. Структурные точки 4H (как ориентир при отсутствии ближних 1W/1D уровней)
+  // 2. Сильные структурные уровни 4H (только с подтверждёнными отбоями >= 2 или консолидацией >= 3 свечей)
   if (candles4h && candles4h.length >= 20) {
-    const struct4h = detectMarketStructure(candles4h, Math.min(240, candles4h.length), false);
+    const struct4h = detectMarketStructure(candles4h, Math.min(320, candles4h.length), false);
     for (const lvl of struct4h.all_levels) {
+      if ((lvl.bounces || 0) < 2 && (lvl.consolidation_bars || 0) < 3) continue;
       allCandidates.push({
         ...lvl,
-        strength_score: Number((lvl.strength_score * 0.6).toFixed(3)),
+        strength_score: Number((lvl.strength_score * 0.85).toFixed(3)),
         source: '4H_STRUCT',
       });
     }
   }
 
-  // Фильтруем кандидатов для DCA 1 по дистанции >= effectiveMinDistPct и <= maxDistPct
+  // Фильтруем кандидатов для DCA 1: строго >= effectiveMinDistPct, <= maxDistPct, и уровень НЕ должен быть пробитым чаще, чем отбивал цену
   const targetRole: 'support' | 'resistance' = isShort ? 'resistance' : 'support';
-  const validLevels = allCandidates
+  const allDirectionalLevels = allCandidates
     .filter((lvl) => {
       const distPct = !isShort
         ? ((referencePrice - lvl.price) / referencePrice) * 100.0
@@ -2258,30 +2467,46 @@ export function findStrongestDcaLevel(
     })
     .map((lvl) => ({ ...lvl, type: targetRole }));
 
+  const strongReliableLevels = allDirectionalLevels.filter(
+    (lvl) =>
+      (lvl.bounces >= 2 || (lvl.consolidation_bars || 0) >= 3) &&
+      (lvl.bounces >= lvl.breaks || (lvl.mirror_retests || 0) >= 1)
+  );
+  const validLevels = strongReliableLevels.length > 0 ? strongReliableLevels : allDirectionalLevels;
+
   if (validLevels.length > 0) {
-    // Для DCA 1 в приоритете рабочие уровни в разумной зоне 2.8%..12.5% от точки входа (до зоны ликвидации 25x),
-    // чтобы бот реально усреднял сделку на структурной поддержке/сопротивлении 1D/4H, а не ставил DCA 1 за -45%
+    // Для DCA 1 ищем САМЫЙ СИЛЬНЫЙ уровень поддержки/сопротивления в рабочем коридоре 3.0%..16.0% от входа
     const reachableLevels = validLevels.filter((l) => {
       const dist = (Math.abs(referencePrice - l.price) / referencePrice) * 100;
-      return dist >= effectiveMinDistPct && dist <= 12.5;
+      return dist >= effectiveMinDistPct && dist <= 16.0;
     });
     const candidateLevels = reachableLevels.length > 0 ? reachableLevels : validLevels;
     const primaryPool = candidateLevels.filter(
       (l) =>
-        l.source?.includes('GLOBAL') ||
-        (l.source === '1D_LOCAL' && (l.strength_score >= 6 || l.bounces >= 2 || (l.mirror_retests || 0) > 0)) ||
-        (l.source === '4H_STRUCT' && (l.strength_score >= 5 || l.bounces >= 2))
+        (l.source?.includes('GLOBAL') && l.strength_score >= 6.0) ||
+        (l.source === '1D_LOCAL' &&
+          l.strength_score >= 6.5 &&
+          (l.bounces >= 2 || (l.mirror_retests || 0) > 0)) ||
+        (l.source === '4H_STRUCT' && l.strength_score >= 6.5 && l.bounces >= 3)
     );
     const poolToRank = primaryPool.length > 0 ? primaryPool : candidateLevels;
-    const bestFirst = poolToRank.reduce((best, cur) => {
-      const distBest = (Math.abs(referencePrice - best.price) / referencePrice) * 100;
-      const distCur = (Math.abs(referencePrice - cur.price) / referencePrice) * 100;
-      const rankBest = best.strength_score / (1 + distBest * 0.12);
-      const rankCur = cur.strength_score / (1 + distCur * 0.12);
-      return rankCur > rankBest ? cur : best;
-    });
 
-    // Для DCA 2 ищем следующий сильный уровень 1D/4H дальше DCA 1 (в пределах 2.8%..22% от DCA 1), либо исторический экстремум
+    const scoreDcaLevel = (l: ClusteredLevelWithHistory, refPx: number) => {
+      const dist = (Math.abs(refPx - l.price) / Math.max(1e-9, refPx)) * 100;
+      const bounceBoost = 1 + Math.min(0.7, (l.bounces || 1) * 0.1);
+      const mirrorBoost = (l.mirror_retests || 0) > 0 ? 1.15 : 1.0;
+      // Выбираем самый сильный уровень без искусственного штрафа за дистанцию внутри 3%..8% зоны
+      return (
+        (l.strength_score * bounceBoost * mirrorBoost) /
+        (1 + Math.max(0, dist - 8.0) * 0.05)
+      );
+    };
+
+    const bestFirst = poolToRank.reduce((best, cur) =>
+      scoreDcaLevel(cur, referencePrice) > scoreDcaLevel(best, referencePrice) ? cur : best
+    );
+
+    // Для DCA 2 ищем следующий самый сильный уровень 1W/1D/4H дальше DCA 1 (минимум на 3.2% дальше DCA 1), либо исторический экстремум
     const absExtreme = isShort ? absHighest : absLowest;
     let secondPrice = 0;
 
@@ -2290,15 +2515,9 @@ export function findStrongestDcaLevel(
         const distFromFirst = isShort
           ? ((l.price - bestFirst.price) / bestFirst.price) * 100
           : ((bestFirst.price - l.price) / bestFirst.price) * 100;
-        return distFromFirst >= effectiveMinDistPct && distFromFirst <= 22.0;
+        return distFromFirst >= Math.max(3.2, effectiveMinDistPct) && distFromFirst <= 28.0;
       })
-      .sort((a, b) => {
-        const distA = (Math.abs(bestFirst.price - a.price) / bestFirst.price) * 100;
-        const distB = (Math.abs(bestFirst.price - b.price) / bestFirst.price) * 100;
-        const rankA = a.strength_score / (1 + distA * 0.08);
-        const rankB = b.strength_score / (1 + distB * 0.08);
-        return rankB - rankA;
-      });
+      .sort((a, b) => scoreDcaLevel(b, bestFirst.price) - scoreDcaLevel(a, bestFirst.price));
 
     if (furtherCandidates.length > 0) {
       secondPrice = Number(furtherCandidates[0].price.toPrecision(7));
@@ -2306,15 +2525,15 @@ export function findStrongestDcaLevel(
       Number.isFinite(absExtreme) &&
       absExtreme > 0 &&
       (isShort
-        ? absExtreme > bestFirst.price * 1.015 && absExtreme <= bestFirst.price * 1.25
-        : absExtreme < bestFirst.price * 0.985 && absExtreme >= bestFirst.price * 0.75)
+        ? absExtreme > bestFirst.price * 1.02 && absExtreme <= bestFirst.price * 1.3
+        : absExtreme < bestFirst.price * 0.98 && absExtreme >= bestFirst.price * 0.7)
     ) {
       secondPrice = Number(absExtreme.toPrecision(7));
     } else {
       secondPrice = Number(
         (
           bestFirst.price *
-          (isShort ? 1 + Math.max(0.035, effectiveMinDistPct / 100) : 1 - Math.max(0.035, effectiveMinDistPct / 100))
+          (isShort ? 1 + Math.max(0.04, effectiveMinDistPct / 100) : 1 - Math.max(0.04, effectiveMinDistPct / 100))
         ).toPrecision(7)
       );
     }
