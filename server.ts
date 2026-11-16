@@ -361,7 +361,14 @@ async function processFastWsTradeClose(
               s.trade_id !== trade.trade_id
           );
           if (sibling) {
-            sibling.campaign_banked_profit = trade.net_profit || trade.profit_abs;
+            const addedProfit = Math.max(0, Number((trade.net_profit ?? trade.profit_abs ?? 0).toFixed(4)));
+            sibling.campaign_banked_profit = Number(
+              ((sibling.campaign_banked_profit || 0) + addedProfit).toFixed(4)
+            );
+            if (sibling.campaign_role === 'insurance') {
+              sibling.campaign_role = 'primary';
+            }
+            recalculateTradeMetrics(sibling, false);
             sqliteDb.upsertTrade(sibling);
           }
         }
@@ -417,6 +424,18 @@ function evaluateFastWsTpExit(wsTick: LiveWsTicker): void {
     }
     if (fastTpInFlightIds.has(t.trade_id)) continue;
 
+    // Если открыты обе ноги двустороннего замка (campaign_id), быстрый тик НЕ должен разрывать замок без 3-фазного подтверждения разворота на уровне (Раздел 3 и Сценарии 1/3/5)
+    if (t.campaign_id) {
+      const hasOpenSibling = tradesStore.some(
+        (s) =>
+          s.is_open &&
+          s.campaign_id === t.campaign_id &&
+          s.trade_id !== t.trade_id &&
+          (t.account_id ? s.account_id === t.account_id : !s.account_id || s.account_id === 'master')
+      );
+      if (hasOpenSibling) continue;
+    }
+
     const execInfo = getFuturesExecutionPrice(t.pair, t.is_short, true, t.exchange);
     if (!execInfo || !(execInfo.markPrice > 0)) continue;
 
@@ -443,6 +462,7 @@ function evaluateFastWsTpExit(wsTick: LiveWsTicker): void {
     if (
       t.campaign_banked_profit !== undefined &&
       t.campaign_banked_profit !== null &&
+      t.campaign_banked_profit > 0 &&
       t.min_profitable_tp &&
       t.min_profitable_tp > 0
     ) {
@@ -1751,7 +1771,7 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
   }
 
   const bankedProfitUsdt = Math.max(0, Number(trade.campaign_banked_profit || 0));
-  if (bankedProfitUsdt > 0 || ((trade.dca_count || 0) > 0 && trade.campaign_id)) {
+  if (bankedProfitUsdt > 0 || (trade.dca_count || 0) > 0) {
     const basketBe = calculateBasketConvergenceBreakeven({
       openRate,
       amount: totalAmount,
@@ -1784,8 +1804,8 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
   // Защита ручного TP: если пользователь сам перетащил TP (tp_manual_override === true), бот НИКОГДА не сбрасывает его в фоновых циклах!
   if (trade.tp_manual_override && trade.take_profit_abs > 0) {
     // Оставляем ровно тот TP, который выставил пользователь
-  } else if (bankedProfitUsdt > 0 && (trade.dca_count || 0) >= 1 && trade.min_profitable_tp) {
-    // После разворотного усреднения и фиксации страховочной ноги (Сценарий 3.4 и Раздел 5Б)
+  } else if (((trade.dca_count || 0) >= 1 || bankedProfitUsdt > 0) && trade.min_profitable_tp) {
+    // После разворотного усреднения и/или фиксации страховочной ноги (Сценарий 3.4 и Раздел 5Б/5В)
     // подтягиваем рабочий TP к точке схлопывания корзины P_BE_cycle!
     trade.take_profit_abs = trade.min_profitable_tp;
   } else {
@@ -1829,7 +1849,8 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     trade.planned_dca_levels = [];
     trade.next_dca_price = undefined;
   } else if (Array.isArray(trade.planned_dca_levels) && trade.planned_dca_levels.length > 0) {
-    trade.next_dca_price = trade.planned_dca_levels[0]?.price;
+    const nextUnfilled = trade.planned_dca_levels.find((l) => !l.filled);
+    trade.next_dca_price = nextUnfilled ? nextUnfilled.price : undefined;
   }
 }
 
@@ -2617,7 +2638,8 @@ async function initializeBotTrades() {
         t.planned_dca_levels = [];
         t.next_dca_price = undefined;
       } else if (Array.isArray(t.planned_dca_levels) && t.planned_dca_levels.length > 0) {
-        t.next_dca_price = t.planned_dca_levels[0]?.price;
+        const nextUnfilled = t.planned_dca_levels.find((l) => !l.filled);
+        t.next_dca_price = nextUnfilled ? nextUnfilled.price : undefined;
       }
       const needsMtfRefresh = !t.tp_manual_override && tpDistRatio < 0.014;
       if (needsMtfRefresh) {
@@ -2977,8 +2999,41 @@ async function enrichImportedPositionMtfLevelsAsync(
         );
       }
 
-      liveTrade.planned_dca_levels = [];
-      liveTrade.next_dca_price = undefined;
+      if (liveTrade.campaign_role === 'insurance') {
+        liveTrade.planned_dca_levels = [];
+        liveTrade.next_dca_price = undefined;
+      } else if (!Array.isArray(liveTrade.planned_dca_levels) || liveTrade.planned_dca_levels.length === 0) {
+        const dcaLvl = findStrongestDcaLevel(c4h, c1d, entryRate, liveTrade.is_short, 2.6, 95.0, c1w);
+        const l1Price = roundPrice(dcaLvl.price);
+        const lev = Math.max(1, liveTrade.leverage || 25);
+        const baseStake = Math.max(5, liveTrade.initial_stake || liveTrade.stake_amount || 5);
+        const computedDcaLevels: PlannedDcaLevel[] = [];
+        if (l1Price > 0) {
+          computedDcaLevels.push({
+            step: 1,
+            label: `L1 Усреднение #1 (${dcaLvl.source || '4H/1D S/R'} · сила ${dcaLvl.strength_score || 16}★)`,
+            price: l1Price,
+            stake_amount: Number(baseStake.toFixed(2)),
+            amount: Number(((baseStake * lev) / Math.max(1e-8, l1Price)).toFixed(4)),
+            distance_pct: Number(((Math.abs(l1Price - entryRate) / Math.max(1e-8, entryRate)) * 100).toFixed(2)),
+            filled: (liveTrade.dca_count || 0) >= 1,
+          });
+          const l2Price = roundPrice(dcaLvl.second_price || 0);
+          if (l2Price > 0 && Math.abs(l2Price - l1Price) / Math.max(1e-8, l1Price) >= 0.02) {
+            const l2Stake = Number((baseStake * 1.5).toFixed(2));
+            computedDcaLevels.push({
+              step: 2,
+              label: `L2 Экстренная разгрузка #2 (${dcaLvl.source || '1D/1W S/R'})`,
+              price: l2Price,
+              stake_amount: l2Stake,
+              amount: Number(((l2Stake * lev) / Math.max(1e-8, l2Price)).toFixed(4)),
+              distance_pct: Number(((Math.abs(l2Price - entryRate) / Math.max(1e-8, entryRate)) * 100).toFixed(2)),
+              filled: (liveTrade.dca_count || 0) >= 2,
+            });
+          }
+        }
+        liveTrade.planned_dca_levels = computedDcaLevels;
+      }
       liveTrade.plan_notes = `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) и проанализирована (1D=${mtf.d1_trend} | SUP=${liveTrade.support_level}$ | RES=${liveTrade.resistance_level}$ | TP=${liveTrade.take_profit_abs}$)`;
 
       recalculateTradeMetrics(liveTrade, false);
@@ -2997,7 +3052,12 @@ async function enrichImportedPositionMtfLevelsAsync(
 
       sqliteDb.upsertTrade(liveTrade);
 
-      if (shouldUpdateAutoTp && liveTrade.take_profit_abs && liveTrade.take_profit_abs > 0) {
+      if (
+        shouldUpdateAutoTp &&
+        liveTrade.campaign_role !== 'insurance' &&
+        liveTrade.take_profit_abs &&
+        liveTrade.take_profit_abs > 0
+      ) {
         placeOrUpdateExchangeTakeProfitOrder(creds, {
           pair: pos.pair,
           isShort: liveTrade.is_short,
@@ -3125,6 +3185,7 @@ async function syncPositionsAndHistoryFromExchanges(
           const exPosTp = Number(pos.take_profit || 0);
           if (
             !isSimulatedTestApiKey(creds.apiKey) &&
+            existingOpen.campaign_role !== 'insurance' &&
             existingOpen.take_profit_abs > 0 &&
             (!(exPosTp > 0) ||
               Math.abs(exPosTp - existingOpen.take_profit_abs) / existingOpen.take_profit_abs > 0.002)
@@ -3866,11 +3927,11 @@ async function runScalpBotCycle(waitForActive = false) {
       }
 
       // СЦЕНАРИЙ 4 (Пункт 4.1): Срабатывание защитного стоп-ордера повторного хеджирования (Re-Hedge Stop за тенью разворотной свечи)
+      // Работает как для двухсторонней кампании, так и для одностороннего скальпинга после DCA #1 на L1!
       if (
         trade.rehedge_stop_price &&
         trade.rehedge_stop_price > 0 &&
-        !openSibling &&
-        trade.campaign_id
+        !openSibling
       ) {
         const rehedgeTriggered = trade.is_short
           ? currentPrice >= trade.rehedge_stop_price
@@ -3885,6 +3946,10 @@ async function runScalpBotCycle(waitForActive = false) {
             botConfig.min_stake_amount || 5,
             Number((trade.stake_amount * 0.5).toFixed(2))
           );
+          if (!trade.campaign_id) {
+            trade.campaign_id = `hedge-${trade.pair.split(':')[0].replace('/', '')}-${Date.now()}`;
+          }
+          trade.campaign_role = 'primary';
           trade.rehedge_stop_price = undefined;
           trade.rehedge_stop_qty = undefined;
           sqliteDb.upsertTrade(trade);
@@ -3990,7 +4055,7 @@ async function runScalpBotCycle(waitForActive = false) {
         }
       }
 
-      // СЦЕНАРИЙ 1 и СЦЕНАРИЙ 2: Цена идёт ПО ТРЕНДУ к уровню L1 при открытом асимметричном замке (Primary 1.0x + Insurance 0.5x)
+      // СЦЕНАРИЙ 1 (Варианты А и Б) и СЦЕНАРИЙ 2: Цена идёт ПО ТРЕНДУ к уровню L1 при открытом асимметричном замке (Primary 1.0x + Insurance 0.5x)
       if (
         openSibling &&
         trade.campaign_role === 'primary' &&
@@ -4014,7 +4079,7 @@ async function runScalpBotCycle(waitForActive = false) {
           const combinedCycleNetPnl = Number((primaryNetPnl + insuranceNetPnl).toFixed(4));
 
           if (levelReversalAtTp.confirmed && combinedCycleNetPnl > 0.05 && closeProfitGuard.ok) {
-            // СЦЕНАРИЙ 1: На уровне L1 сформировался разворот -> закрываем ОБЕ позиции одновременно в чистый плюс за счёт перевеса 2:1!
+            // СЦЕНАРИЙ 1 (Вариант А — Прямая фиксация цикла): На уровне L1 сформировался разворот -> закрываем ОБЕ позиции одновременно в чистый плюс за счёт перевеса 2:1!
             for (const leg of [trade, openSibling]) {
               const legLockKey = getPosLockKey(leg.account_id || tradeAccScopeId, leg.pair, leg.is_short);
               await withPositionLock(legLockKey, async () => {
@@ -4053,10 +4118,72 @@ async function runScalpBotCycle(waitForActive = false) {
             appendLog(
               'freqtrade.bot.hedge',
               'INFO',
-              `🏆 [Сценарий 1: Прибыль цикла 2:1] На уровне ${trade.take_profit_abs}$ подтверждён 3-фазный разворот (${levelReversalAtTp.reason}). Обе ноги [${trade.pair}] закрыты одновременно с чистым профитом корзины +${combinedCycleNetPnl}$!`,
+              `🏆 [Сценарий 1А: Прибыль цикла 2:1] На уровне ${trade.take_profit_abs}$ подтверждён 3-фазный разворот (${levelReversalAtTp.reason}). Обе ноги [${trade.pair}] закрыты одновременно с чистым профитом корзины +${combinedCycleNetPnl}$!`,
               { userId: tradeUserId }
             );
             continue;
+          } else if (
+            levelReversalAtTp.confirmed &&
+            combinedCycleNetPnl <= 0.05 &&
+            primaryNetPnl > 0.05 &&
+            closeProfitGuard.ok
+          ) {
+            // СЦЕНАРИЙ 1 (Вариант Б — Отыгрыш отката):
+            // 1. Закрываем плюсовую основную ногу и отправляем её профит в копилку P_bank.
+            // 2. Переводим страховочную ногу в статус основной (primary), усредняем на развороте у уровня и ставим общий стоп за тень разворотной свечи!
+            let closedPrimaryVariantB = false;
+            const primaryLockKey = getPosLockKey(trade.account_id || tradeAccScopeId, trade.pair, trade.is_short);
+            await withPositionLock(primaryLockKey, async () => {
+              if (!trade.is_open) return;
+              const closeRes = await dispatchOrderToExchangeAccount(tradeAcc, {
+                pair: trade.pair,
+                action: 'CLOSE',
+                isShort: trade.is_short,
+                quantity: trade.amount,
+                referencePrice: closeExecPrice,
+                leverage: trade.leverage || 25,
+              });
+              if (tradeAcc && !isSimulatedTestApiKey(tradeAcc.api_key_raw) && !closeRes?.success) return;
+              const actualPrice =
+                closeRes?.success && closeRes.price > 0 ? roundPrice(closeRes.price) : closeExecPrice;
+              const now = Date.now();
+              const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
+              sqliteDb.runInTransaction(() => {
+                trade.is_open = false;
+                trade.close_rate = actualPrice;
+                trade.current_rate = actualPrice;
+                trade.close_date = nowStr;
+                trade.close_timestamp = now;
+                trade.exit_reason = 'scenario1_variant_b_primary_harvest';
+                trade.trade_state = 'CLOSED';
+                trade.planned_dca_levels = [];
+                recalculateTradeMetrics(trade, false);
+                sqliteDb.upsertTrade(trade);
+
+                const harvested = Math.max(0, Number((trade.net_profit ?? trade.profit_abs ?? 0).toFixed(4)));
+                openSibling.campaign_banked_profit = Number(
+                  ((openSibling.campaign_banked_profit || 0) + harvested).toFixed(4)
+                );
+                openSibling.campaign_role = 'primary';
+                openSibling.next_dca_price = currentPrice;
+                // Защитный стоп за макушку разворотной тени (даже если выбьет — цикл в плюсе/безубытке за счёт P_bank!)
+                openSibling.stop_loss_abs = roundPrice(levelReversalAtTp.rehedgeStopPrice);
+                recalculateTradeMetrics(openSibling, false);
+                sqliteDb.upsertTrade(openSibling);
+              });
+              broadcastTradeLifecycleEvent('trade:closed', trade);
+              broadcastTradeLifecycleEvent('trade:updated', openSibling);
+              closedPrimaryVariantB = true;
+            });
+            if (closedPrimaryVariantB) {
+              appendLog(
+                'freqtrade.bot.hedge',
+                'INFO',
+                `🔄 [Сценарий 1Б: Отыгрыш отката] Основная нога #${trade.trade_id} [${trade.pair}] зафиксирована на уровне ${trade.take_profit_abs}$ в банк P_bank (+${openSibling.campaign_banked_profit}$). Вторая нога переведена в основную для усреднения на развороте со стопом за тенью ${openSibling.stop_loss_abs}$!`,
+                { userId: tradeUserId }
+              );
+              continue;
+            }
           }
 
           // СЦЕНАРИЙ 2: Цена уверенно пробивает уровень L1 по тренду без разворота -> тралим стоп за пробитый уровень и переносим цель к L2
@@ -4079,6 +4206,69 @@ async function runScalpBotCycle(waitForActive = false) {
               { userId: tradeUserId }
             );
             broadcastTradeLifecycleEvent('trade:updated', trade);
+          }
+        }
+      }
+
+      // 1A-SL. Исполнение защитного стоп-приказа в безубытке/профите (Сценарий 2 — возврат за пробитый уровень, Сценарий 1Б, Раздел 5Б — стоп в безубыток на отскоке)
+      if (trade.stop_loss_abs > 0 && closeProfitGuard.ok) {
+        const isProfitableStopHit = trade.is_short
+          ? currentPrice >= trade.stop_loss_abs && trade.stop_loss_abs < trade.open_rate
+          : currentPrice <= trade.stop_loss_abs && trade.stop_loss_abs > trade.open_rate;
+        const isBankCoveredStopHit =
+          (trade.campaign_banked_profit || 0) > 0 &&
+          (trade.is_short
+            ? currentPrice >= trade.stop_loss_abs
+            : currentPrice <= trade.stop_loss_abs);
+        if (isProfitableStopHit || isBankCoveredStopHit) {
+          let closedByTrailedSl = false;
+          const legsToClose = openSibling ? [trade, openSibling] : [trade];
+          for (const leg of legsToClose) {
+            if (!leg.is_open) continue;
+            const legLockKey = getPosLockKey(leg.account_id || tradeAccScopeId, leg.pair, leg.is_short);
+            await withPositionLock(legLockKey, async () => {
+              if (!leg.is_open) return;
+              const legExec = getFuturesExecutionPrice(leg.pair, leg.is_short, true, leg.exchange);
+              const legClosePrice =
+                legExec && legExec.executionPrice > 0 ? roundPrice(legExec.executionPrice) : currentPrice;
+              const closeRes = await dispatchOrderToExchangeAccount(tradeAcc, {
+                pair: leg.pair,
+                action: 'CLOSE',
+                isShort: leg.is_short,
+                quantity: leg.amount,
+                referencePrice: legClosePrice,
+                leverage: leg.leverage || 25,
+              });
+              if (tradeAcc && !isSimulatedTestApiKey(tradeAcc.api_key_raw) && !closeRes?.success) return;
+              const actualPrice =
+                closeRes?.success && closeRes.price > 0 ? roundPrice(closeRes.price) : legClosePrice;
+              const now = Date.now();
+              const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
+              sqliteDb.runInTransaction(() => {
+                leg.is_open = false;
+                leg.close_rate = actualPrice;
+                leg.current_rate = actualPrice;
+                leg.close_date = nowStr;
+                leg.close_timestamp = now;
+                leg.exit_reason = 'trailed_breakeven_stop_profit';
+                leg.trade_state = 'CLOSED';
+                leg.planned_dca_levels = [];
+                leg.rehedge_stop_price = undefined;
+                recalculateTradeMetrics(leg, false);
+                sqliteDb.upsertTrade(leg);
+              });
+              broadcastTradeLifecycleEvent('trade:closed', leg);
+              closedByTrailedSl = true;
+            });
+          }
+          if (closedByTrailedSl) {
+            appendLog(
+              'freqtrade.bot.exit',
+              'INFO',
+              `🛡️ [Защитный Стоп в Плюс/БУ] Сработал подтянутый стоп-приказ ${trade.stop_loss_abs}$ по [${trade.pair}] #${trade.trade_id}: позиция закрыта в чистый плюс (+${trade.profit_abs}$, P_bank=${trade.campaign_banked_profit || 0}$)!`,
+              { userId: tradeUserId }
+            );
+            continue;
           }
         }
       }
@@ -4163,6 +4353,9 @@ async function runScalpBotCycle(waitForActive = false) {
                 openSibling.campaign_banked_profit = Number(
                   ((openSibling.campaign_banked_profit || 0) + (trade.net_profit || trade.profit_abs)).toFixed(4)
                 );
+                if (openSibling.campaign_role === 'insurance') {
+                  openSibling.campaign_role = 'primary';
+                }
                 recalculateTradeMetrics(openSibling, false);
                 sqliteDb.upsertTrade(openSibling);
                 appendLog(
@@ -4221,7 +4414,7 @@ async function runScalpBotCycle(waitForActive = false) {
         }
       }
 
-      // 1C. СЦЕНАРИЙ 3 (Пункт 3.4) и РАЗДЕЛ 5 (Иерархия целей L0/L1/L2 + «Откусывание хвоста»)
+      // 1C. СЦЕНАРИЙ 3 (Пункт 3.4) и РАЗДЕЛ 5 (Стоп в безубыток + тейк на отскоке L1, Разгрузка L2 и «Откусывание хвоста»)
       if (
         (trade.campaign_banked_profit !== undefined && trade.campaign_banked_profit !== null && trade.campaign_banked_profit > 0) ||
         (trade.dca_count || 0) >= 1
@@ -4231,6 +4424,42 @@ async function runScalpBotCycle(waitForActive = false) {
             ? currentPrice <= trade.min_profitable_tp && closeExecPrice <= trade.min_profitable_tp
             : currentPrice >= trade.min_profitable_tp && closeExecPrice >= trade.min_profitable_tp;
           if (reachedMinProfit) {
+            // Сразу удаляем отложенный ордер повторного хеджа (Сценарий 3.4: «отложенный ордер страховки удаляется»)
+            trade.rehedge_stop_price = undefined;
+            trade.rehedge_stop_qty = undefined;
+
+            // Раздел 5Б («Закрытие через стоп в безубыток + тейк»):
+            // На 1-м уровне усреднения (dca_count === 1), если свеча отскока идёт сильным импульсом в нашу сторону,
+            // подтягиваем жёсткий стоп в точку безубытка с покрытием комиссий (min_profitable_tp) и даём отскоку шанс пройти ещё +0.6%
+            const lastCandle = candles1h[candles1h.length - 1];
+            const strongBounceImpulse =
+              (trade.dca_count || 0) === 1 &&
+              lastCandle &&
+              (trade.is_short
+                ? lastCandle.close < lastCandle.open && currentPrice <= trade.min_profitable_tp * 0.9985
+                : lastCandle.close > lastCandle.open && currentPrice >= trade.min_profitable_tp * 1.0015);
+            const alreadyLockedBeStop =
+              trade.stop_loss_abs > 0 &&
+              (trade.is_short
+                ? trade.stop_loss_abs <= trade.min_profitable_tp * 1.0005
+                : trade.stop_loss_abs >= trade.min_profitable_tp * 0.9995);
+
+            if (strongBounceImpulse && !alreadyLockedBeStop && !trade.tp_manual_override) {
+              trade.stop_loss_abs = roundPrice(trade.min_profitable_tp);
+              trade.take_profit_abs = roundPrice(
+                currentPrice * (trade.is_short ? 0.994 : 1.006)
+              );
+              sqliteDb.upsertTrade(trade);
+              appendLog(
+                'freqtrade.bot.hedge',
+                'INFO',
+                `🛡️ [Раздел 5Б: Стоп в Безубыток + Тейк] [${trade.pair}] #${trade.trade_id} прошёл точку общего безубытка корзины (${trade.min_profitable_tp}$): отложенный Re-Hedge ордер удалён, защитный стоп переведён в чистый плюс ${trade.stop_loss_abs}$, тейк сдвинут на продолжение отскока ${trade.take_profit_abs}$!`,
+                { userId: tradeUserId }
+              );
+              broadcastTradeLifecycleEvent('trade:updated', trade);
+              continue;
+            }
+
             let closedHedgeInCycle = false;
             const lockKey = getPosLockKey(trade.account_id || tradeAccScopeId, trade.pair, trade.is_short);
             await withPositionLock(lockKey, async () => {
@@ -4823,15 +5052,20 @@ async function runScalpBotCycle(waitForActive = false) {
         };
 
         try {
+          // Единое правило запаса хода (Раздел 2В Регламента) для Скальпинга и Двухсторонки:
+          // запрещено входить в SHORT при запасе хода до сильной поддержки < 1.5% и в LONG при запасе хода до сильного сопротивления < 1.5%
+          const hasScalpAirShort = mtf.dist_to_4h_sup_pct >= 1.5;
+          const hasScalpAirLong = mtf.dist_to_4h_res_pct >= 1.5;
+
           if (effectiveTrend === 'BEARISH') {
-            if (sig.enter_short && mtf.allow_short) {
+            if (sig.enter_short && mtf.allow_short && hasScalpAirShort) {
               await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
               openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
               openedInThisCycle++;
             } else if (
               mtf.allow_short &&
-              mtf.dist_to_4h_sup_pct >= 0.85 &&
-              mtf.rsi_1h >= 20.0 &&
+              hasScalpAirShort &&
+              mtf.rsi_1h >= 24.0 &&
               mtf.rsi_1h <= 65.0 &&
               isPullbackToRes &&
               (isRed1h || sig.wt1 <= sig.wt2) &&
@@ -4851,22 +5085,22 @@ async function runScalpBotCycle(waitForActive = false) {
               });
               openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 2);
               openedInThisCycle += 2;
-            } else if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
+            } else if (sig.enter_long && btcAllowsLong && mtf.allow_long && hasScalpAirLong) {
               await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
               openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
               openedInThisCycle++;
             }
           } else if (effectiveTrend === 'BULLISH') {
-            if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
+            if (sig.enter_long && btcAllowsLong && mtf.allow_long && hasScalpAirLong) {
               await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
               openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
               openedInThisCycle++;
             } else if (
               btcAllowsLong &&
               mtf.allow_long &&
-              mtf.dist_to_4h_res_pct >= 0.85 &&
+              hasScalpAirLong &&
               mtf.rsi_1h >= 35.0 &&
-              mtf.rsi_1h <= 80.0 &&
+              mtf.rsi_1h <= 76.0 &&
               isPullbackToSup &&
               (isGreen1h || sig.wt1 >= sig.wt2) &&
               livePrice >= sig.ema_slow * 0.997
@@ -4885,7 +5119,7 @@ async function runScalpBotCycle(waitForActive = false) {
               });
               openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 2);
               openedInThisCycle += 2;
-            } else if (sig.enter_short && mtf.allow_short) {
+            } else if (sig.enter_short && mtf.allow_short && hasScalpAirShort) {
               await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
               openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
               openedInThisCycle++;
@@ -4902,37 +5136,12 @@ async function runScalpBotCycle(waitForActive = false) {
               });
               openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 2);
               openedInThisCycle += 2;
-            } else if (sig.enter_short && mtf.allow_short) {
+            } else if (sig.enter_short && mtf.allow_short && hasScalpAirShort) {
               await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
               openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
               openedInThisCycle++;
-            } else if (sig.enter_long && btcAllowsLong && mtf.allow_long) {
+            } else if (sig.enter_long && btcAllowsLong && mtf.allow_long && hasScalpAirLong) {
               await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
-              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
-              openedInThisCycle++;
-            } else if (
-              mtf.allow_short &&
-              mtf.rsi_1d >= 20 &&
-              mtf.rsi_4h >= 35 &&
-              mtf.rsi_1h >= 55 &&
-              mtf.pos_4h_pct >= 60 &&
-              mtf.dist_to_4h_sup_pct >= 0.85 &&
-              isRed1h
-            ) {
-              await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, 'Scalp_Overbought_Short', accOpts);
-              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
-              openedInThisCycle++;
-            } else if (
-              btcAllowsLong &&
-              mtf.allow_long &&
-              mtf.rsi_1d <= 80 &&
-              mtf.rsi_4h <= 65 &&
-              mtf.rsi_1h <= 45 &&
-              mtf.pos_4h_pct <= 40 &&
-              mtf.dist_to_4h_res_pct >= 0.85 &&
-              isGreen1h
-            ) {
-              await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, 'Scalp_Oversold_Long', accOpts);
               openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
               openedInThisCycle++;
             }
@@ -5478,9 +5687,14 @@ async function createScalpBotPosition(
       tradesStore.unshift(newTrade);
       sqliteDb.upsertTrade(newTrade);
 
-      // Сразу после открытия позиции выставляем нативный Take-Profit ордер напрямую на биржу (строго не ниже защитного порога безубытка!)
+      // Сразу после открытия позиции выставляем нативный Take-Profit ордер напрямую на биржу (кроме страховочной ноги замка, которая ждёт 3-фазного разворота на уровне!)
       const targetCreds = getAccountCredentialsFromStore(targetExchangeAcc);
-      if (targetCreds && !isSimulatedTestApiKey(targetCreds.apiKey) && newTrade.take_profit_abs > 0) {
+      if (
+        targetCreds &&
+        !isSimulatedTestApiKey(targetCreds.apiKey) &&
+        newTrade.campaign_role !== 'insurance' &&
+        newTrade.take_profit_abs > 0
+      ) {
         const safeExchangeTp =
           !newTrade.tp_manual_override && newTrade.min_profitable_tp
             ? newTrade.is_short

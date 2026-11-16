@@ -2964,32 +2964,74 @@ export function evaluateScalpingStrategy(
     return l.price >= c.close * 0.99 && c.high >= zLow * 0.996 && c.close <= zHigh * 1.005;
   });
 
+  // Раздел 2В («Правило запаса хода» / Запрет на вход у преграды):
+  // Нельзя открывать LONG прямо под сильным сопротивлением и SHORT прямо над сильной поддержкой (минимум 1.5% свободного воздуха до преграды)
+  const airToResistancePct =
+    smartResistance > c.close && c.close > 0
+      ? ((smartResistance - c.close) / c.close) * 100.0
+      : 99.0;
+  const airToSupportPct =
+    smartSupport > 0 && c.close > smartSupport
+      ? ((c.close - smartSupport) / c.close) * 100.0
+      : 99.0;
+  const hasAirForLong = !(smartResistance > 0) || airToResistancePct >= 1.5;
+  const hasAirForShort = !(smartSupport > 0) || airToSupportPct >= 1.5;
+
+  // Раздел 3 (Трёхфазное подтверждение разворота на сильном уровне для скальпинга):
+  // Касание уровня НЕ является сигналом — проверяем 3 фазы (Sweep -> Пин-бар/Поглощение -> ChoCH)
+  const threePhaseSupportBounce =
+    smartSupport > 0 && detectThreePhaseLevelReversal(candles, smartSupport, true, 0.95).confirmed;
+  const threePhaseZoneSupportBounce = levelZones.some(
+    (l) =>
+      l.price <= c.close * 1.015 &&
+      detectThreePhaseLevelReversal(candles, l.price, true, 0.95, {
+        zoneLow: l.zone_low,
+        zoneHigh: l.zone_high,
+      }).confirmed
+  );
+
+  const threePhaseResistanceReject =
+    smartResistance > 0 &&
+    detectThreePhaseLevelReversal(candles, smartResistance, false, 0.95).confirmed;
+  const threePhaseZoneResistanceReject = levelZones.some(
+    (l) =>
+      l.price >= c.close * 0.985 &&
+      detectThreePhaseLevelReversal(candles, l.price, false, 0.95, {
+        zoneLow: l.zone_low,
+        zoneHigh: l.zone_high,
+      }).confirmed
+  );
+
   // --- LONG SIGNALS ---
-  // Mode A: Level Reversal Long (bounce from support/1D zone)
+  // Mode A: Level Reversal Long (отбой от сильного уровня 4H/1D только после 3-фазного подтверждения или схождения 3 фаз + WaveTrend/RSI)
   const supportBounce =
     c.low <= smartSupport * 1.008 &&
-    c.close >= smartSupport * 0.995 &&
+    c.close >= smartSupport * 0.9975 &&
     (greenCandle || hasLowerWick);
-  const nearSupport =
-    c.low <= smartSupport * 1.012 && c.close >= smartSupport * 0.985;
-  const supportSignal = supportBounce || nearSupport || (inZoneSupport && (greenCandle || hasLowerWick));
+  const supportSignal =
+    threePhaseSupportBounce ||
+    threePhaseZoneSupportBounce ||
+    ((supportBounce || (inZoneSupport && greenCandle && hasLowerWick)) &&
+      c.close > p.open &&
+      c.close >= smartSupport * 0.998);
 
   const waveOversoldCross =
     (wt1[idx] > wt2[idx] && (wt1[prev] <= wt2[prev] || wt2[idx] <= -25)) ||
     (wt2[idx] <= -42 && wt1[idx] > wt1[prev]);
   const rsiOversoldOk =
-    rsiSeries[idx] <= 45.0 && (rsiSeries[idx] <= 20.0 || rsiSeries[idx] > rsiSeries[prev]);
+    rsiSeries[idx] <= 48.0 && (rsiSeries[idx] <= 22.0 || rsiSeries[idx] > rsiSeries[prev]);
 
   const levelReversalEntryLong =
+    hasAirForLong &&
     supportSignal &&
-    waveOversoldCross &&
-    rsiOversoldOk &&
+    (threePhaseSupportBounce || threePhaseZoneSupportBounce || (waveOversoldCross && rsiOversoldOk)) &&
     (greenCandle || hasLowerWick) &&
     volumeOk &&
     !isKnifeDrop(candles) &&
-    !isPumpExhaustion(candles);
+    !isPumpExhaustion(candles) &&
+    !isNewsHelicopterVolatility(candles);
 
-  // Mode B: Trend Momentum / Pullback Long (trading along an active bullish trend, RSI up to 80)
+  // Mode B: Trend Momentum / Pullback Long (по доминирующему тренду при наличии запаса хода >= 1.5% до сопротивления)
   const emaCrossoverUp =
     emaFast[idx] > emaSlow[idx] && emaFast[prev] <= emaSlow[prev];
   const emaBounceUp =
@@ -3002,44 +3044,49 @@ export function evaluateScalpingStrategy(
     (c.close > emaFast[idx] && emaFast[idx] >= emaSlow[idx] * 0.999);
   const momentumRsiUp =
     rsiSeries[idx] >= 35.0 &&
-    rsiSeries[idx] <= 80.0 &&
+    rsiSeries[idx] <= 76.0 &&
     (rsiSeries[idx] >= rsiSeries[prev] - 1.5 || wt1[idx] >= wt2[idx]);
   const trendMomentumEntryLong =
+    hasAirForLong &&
     trendBullish &&
     momentumSignalUp &&
     momentumRsiUp &&
     volumeTrendOk &&
     (greenCandle || hasLowerWick) &&
     !isPumpExhaustion(candles) &&
-    !isKnifeDrop(candles);
+    !isKnifeDrop(candles) &&
+    !isNewsHelicopterVolatility(candles);
 
   // --- SHORT SIGNALS ---
-  // Mode A: Level Reversal Short (rejection from resistance/1D zone)
+  // Mode A: Level Reversal Short (отбой от сильного уровня сопротивления 4H/1D после 3-фазного подтверждения)
   const resistanceRejection =
     c.high >= smartResistance * 0.992 &&
-    c.close <= smartResistance * 1.005 &&
+    c.close <= smartResistance * 1.0025 &&
     (redCandle || hasUpperWick);
-  const nearResistance =
-    c.high >= smartResistance * 0.988 && c.close <= smartResistance * 1.015;
   const resistanceSignal =
-    resistanceRejection || nearResistance || (inZoneResistance && (redCandle || hasUpperWick));
+    threePhaseResistanceReject ||
+    threePhaseZoneResistanceReject ||
+    ((resistanceRejection || (inZoneResistance && redCandle && hasUpperWick)) &&
+      c.close < p.open &&
+      c.close <= smartResistance * 1.002);
 
   const waveOverboughtCross =
     (wt1[idx] < wt2[idx] && (wt1[prev] >= wt2[prev] || wt2[idx] >= 25)) ||
     (wt2[idx] >= 42 && wt1[idx] < wt1[prev]);
   const rsiOverboughtOk =
-    rsiSeries[idx] >= 55.0 && (rsiSeries[idx] >= 80.0 || rsiSeries[idx] < rsiSeries[prev]);
+    rsiSeries[idx] >= 52.0 && (rsiSeries[idx] >= 78.0 || rsiSeries[idx] < rsiSeries[prev]);
 
   const levelReversalEntryShort =
+    hasAirForShort &&
     resistanceSignal &&
-    waveOverboughtCross &&
-    rsiOverboughtOk &&
+    (threePhaseResistanceReject || threePhaseZoneResistanceReject || (waveOverboughtCross && rsiOverboughtOk)) &&
     (redCandle || hasUpperWick) &&
     volumeOk &&
     !isPumpExhaustion(candles) &&
-    !isKnifeDrop(candles);
+    !isKnifeDrop(candles) &&
+    !isNewsHelicopterVolatility(candles);
 
-  // Mode B: Trend Momentum / Pullback Short (trading along an active bearish trend, RSI >= 20)
+  // Mode B: Trend Momentum / Pullback Short (по доминирующему тренду при наличии запаса хода >= 1.5% до поддержки)
   const emaCrossoverDown =
     emaFast[idx] < emaSlow[idx] && emaFast[prev] >= emaSlow[prev];
   const emaBounceDown =
@@ -3051,17 +3098,19 @@ export function evaluateScalpingStrategy(
     emaBounceDown ||
     (c.close < emaFast[idx] && emaFast[idx] <= emaSlow[idx] * 1.001);
   const momentumRsiDown =
-    rsiSeries[idx] >= 20.0 &&
+    rsiSeries[idx] >= 24.0 &&
     rsiSeries[idx] <= 65.0 &&
     (rsiSeries[idx] <= rsiSeries[prev] + 1.5 || wt1[idx] <= wt2[idx]);
   const trendMomentumEntryShort =
+    hasAirForShort &&
     trendBearish &&
     momentumSignalDown &&
     momentumRsiDown &&
     volumeTrendOk &&
     (redCandle || hasUpperWick) &&
     !isPumpExhaustion(candles) &&
-    !isKnifeDrop(candles);
+    !isKnifeDrop(candles) &&
+    !isNewsHelicopterVolatility(candles);
 
   const enterLong =
     (levelReversalEntryLong || trendMomentumEntryLong) && !trendMomentumEntryShort;
@@ -3130,10 +3179,71 @@ export function evaluateScalpingStrategy(
 // ============================================================================
 // 7. ASYMMETRIC LEVEL HEDGE WITH REVERSAL AVERAGING:
 //    • 3-Phase Level Reversal Detector (Section 3: Sweep -> Pin-Bar/Engulfing -> ChoCH)
+//    • Anti-News-Helicopter Whipsaw Filter (Section 6.4)
 //    • Basket Convergence Breakeven & Unloading Hierarchy (Section 5A, 5B, 5C)
 //    • Tail-Biting Partial Unloading ("Откусывание хвоста", Section 5C)
 //    • 6-Point DCA Risk & Taboo Guard (Section 6)
 // ============================================================================
+
+/**
+ * Раздел 6.4 регламента — Фильтр новостного «вертолёта» (сбор ликвидности в обе стороны):
+ * Если на текущей или предыдущей свече наблюдается аномальный размах (>= 3.0x ATR14 или >= 4.5%)
+ * с длинными тенями в ОБЕ стороны (>= 28% диапазона сверху и снизу) либо две подряд разнонаправленные
+ * аномальные свечи (> 2.6x ATR14), усреднение и вход откладываются до стабилизации рынка после новости.
+ */
+export function isNewsHelicopterVolatility(candles: OhlcvCandle[]): boolean {
+  if (!candles || candles.length < 15) return false;
+  const n = candles.length;
+  const baselineSlice = candles.slice(Math.max(0, n - 16), n - 2);
+  let trSum = 0;
+  for (let i = 0; i < baselineSlice.length; i++) {
+    const cur = baselineSlice[i];
+    const prevClose = i > 0 ? baselineSlice[i - 1].close : cur.open;
+    const tr = Math.max(
+      cur.high - cur.low,
+      Math.abs(cur.high - prevClose),
+      Math.abs(cur.low - prevClose)
+    );
+    trSum += tr;
+  }
+  const atr = baselineSlice.length > 0 ? trSum / baselineSlice.length : 0;
+  const cNow = candles[n - 1];
+  const cPrev = candles[n - 2];
+
+  for (const c of [cNow, cPrev]) {
+    const range = Math.max(0, c.high - c.low);
+    const rangePct = c.close > 0 ? (range / c.close) * 100.0 : 0;
+    const upperWick = c.high - Math.max(c.open, c.close);
+    const lowerWick = Math.min(c.open, c.close) - c.low;
+    const isAbnormalRange = (atr > 0 && range >= atr * 3.0) || rangePct >= 4.5;
+    if (
+      isAbnormalRange &&
+      range > 1e-8 &&
+      upperWick / range >= 0.28 &&
+      lowerWick / range >= 0.28
+    ) {
+      return true;
+    }
+  }
+
+  // Две подряд гигантские разнонаправленные свечи («качели» на новости)
+  const rNow = Math.max(0, cNow.high - cNow.low);
+  const rPrev = Math.max(0, cPrev.high - cPrev.low);
+  const oppositeDirections =
+    (cNow.close > cNow.open && cPrev.close < cPrev.open) ||
+    (cNow.close < cNow.open && cPrev.close > cPrev.open);
+  if (
+    atr > 0 &&
+    oppositeDirections &&
+    rNow >= atr * 2.6 &&
+    rPrev >= atr * 2.6 &&
+    Math.abs(cNow.close - cPrev.open) <= Math.max(rNow, rPrev) * 0.35
+  ) {
+    return true;
+  }
+
+  return false;
+}
 
 export interface ThreePhaseReversalResult {
   confirmed: boolean;
@@ -3152,7 +3262,7 @@ export interface ThreePhaseReversalResult {
  * разрешено ТОЛЬКО после прохождения 3 фаз:
  *   Фаза 1 (Sweep / Захват ликвидности): тень свечи заходит в зону уровня или прокалывает его (на повышенном объёме / сборе стопов).
  *   Фаза 2 (Возврат и торможение — Пин-бар / Поглощение): тело закрывается обратно внутри уровня с отвергающей тенью, либо формируется поглощение.
- *   Фаза 3 (Локальный слом структуры / ChoCH): закрытая свеча подтверждает импульс отскока, пробивая экстремум/тело тормозящей свечи, при отсутствии вертикального «ножа» (Сценарий 5).
+ *   Фаза 3 (Локальный слом структуры / ChoCH): закрытая свеча подтверждает импульс отскока, пробивая экстремум/тело тормозящей свечи, при отсутствии вертикального «ножа» (Сценарий 5) и новостного «вертолёта» (Раздел 6.4).
  */
 export function detectThreePhaseLevelReversal(
   candles: OhlcvCandle[],
@@ -3174,6 +3284,13 @@ export function detectThreePhaseLevelReversal(
 
   if (!candles || candles.length < 4 || !(level > 0)) {
     return emptyRes('Недостаточно свечей для 3-фазного подтверждения разворота');
+  }
+
+  // Раздел 6.4 (Проверка новостей перед усреднением / Анти-вертолёт):
+  if (isNewsHelicopterVolatility(candles)) {
+    return emptyRes(
+      'Раздел 6.4 (Анти-вертолёт): аномальный новостной разброс ликвидности в обе стороны — ожидание стабилизации после новости'
+    );
   }
 
   // Сценарий 5 (Новостной сквиз / пролёт уровня без торможения):
