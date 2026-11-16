@@ -61,6 +61,7 @@ export interface PlacedOrderResult {
   status: 'FILLED' | 'NEW' | 'PARTIALLY_FILLED' | 'REJECTED';
   exchange_time: number;
   commission_usdt?: number;
+  open_fee_usdt?: number;
   realized_pnl_usdt?: number;
   error?: string;
   error_code?: string | number;
@@ -1662,6 +1663,7 @@ export async function executeExchangeFuturesOrder(
             let actualExecFee = Number(
               (params.referencePrice * Number(formattedQtyStr) * 0.00055).toFixed(4)
             );
+            let actualRealizedPnl: number | undefined;
             let actualExchangeTime = Date.now();
 
             // 1. Сначала мгновенно ждём отчёт об исполнении из приватного Bybit WS (execution/order)
@@ -1677,13 +1679,16 @@ export async function executeExchangeFuturesOrder(
               if (wsFill.fee > 0) {
                 actualExecFee = wsFill.fee;
               }
+              if (typeof wsFill.realizedPnl === 'number') {
+                actualRealizedPnl = Number(wsFill.realizedPnl.toFixed(4));
+              }
               if (wsFill.tradeTime > 0) {
                 actualExchangeTime = wsFill.tradeTime;
               }
             } else if (json.result?.orderId) {
               // 2. Fallback на REST API, если приватный WS не успел доставить событие
               try {
-                await new Promise((r) => setTimeout(r, 150));
+                await new Promise((r) => setTimeout(r, 180));
                 const qTs = await getBybitTimestamp(baseUrl, false);
                 const recvWindow = '10000';
                 const qStr = `category=linear&symbol=${symbol}&orderId=${encodeURIComponent(orderId)}`;
@@ -1739,11 +1744,73 @@ export async function executeExchangeFuturesOrder(
                   }
                 }
               } catch {
-                // fallback to position lookup below
+                // fallback to position/closed-pnl lookup below
               }
             }
 
-            // 3. Если при открытии/усреднении Bybit order/realtime и order/history ещё не вернули avgPrice,
+            // 3A. При закрытии (isClose) запрашиваем /v5/position/closed-pnl по символу, чтобы получить точный realized PnL, цену выхода и комиссию с биржи
+            let actualOpenFee: number | undefined;
+            if (isClose && (actualRealizedPnl === undefined || !resolvedRealFillPrice)) {
+              try {
+                const cTs = await getBybitTimestamp(baseUrl, false);
+                const recvWindow = '10000';
+                const cStr = `category=linear&symbol=${symbol}&limit=5`;
+                const cSig = signBybitV5(cTs, cleanKey, recvWindow, cStr, cleanSecret);
+                const cRes = await makeHttpsRequest(`${baseUrl}/v5/position/closed-pnl?${cStr}`, {
+                  method: 'GET',
+                  headers: {
+                    'X-BAPI-API-KEY': cleanKey,
+                    'X-BAPI-TIMESTAMP': cTs,
+                    'X-BAPI-SIGN': cSig,
+                    'X-BAPI-RECV-WINDOW': recvWindow,
+                  },
+                  timeoutMs: 3500,
+                });
+                if (cRes.statusCode === 200) {
+                  const cJson = JSON.parse(cRes.data);
+                  const cList = cJson?.result?.list;
+                  if (Array.isArray(cList) && cList.length > 0) {
+                    const matchedClose =
+                      cList.find((item: any) => String(item.orderId || '') === orderId) ||
+                      cList.find(
+                        (item: any) =>
+                          Math.abs(Date.now() - Number(item.updatedTime || item.createdTime || 0)) < 15_000
+                      );
+                    if (matchedClose) {
+                      const exitP = Number(matchedClose.avgExitPrice || 0);
+                      if (exitP > 0) {
+                        actualAvgPrice = exitP;
+                        resolvedRealFillPrice = true;
+                      }
+                      const openFee = Math.abs(Number(matchedClose.openFee || 0));
+                      if (openFee > 0) {
+                        actualOpenFee = Number(openFee.toFixed(4));
+                      }
+                      const closeFee = Math.abs(Number(matchedClose.closeFee || 0));
+                      if (closeFee > 0) {
+                        actualExecFee = Number(closeFee.toFixed(4));
+                      }
+                      if (
+                        matchedClose.closedPnl !== undefined &&
+                        matchedClose.closedPnl !== null &&
+                        Number.isFinite(Number(matchedClose.closedPnl))
+                      ) {
+                        const netClosedPnl = Number(matchedClose.closedPnl);
+                        const effOpenFee =
+                          actualOpenFee !== undefined
+                            ? actualOpenFee
+                            : Number((actualAvgPrice * actualExecQty * 0.00055).toFixed(4));
+                        actualRealizedPnl = Number((netClosedPnl + effOpenFee + actualExecFee).toFixed(4));
+                      }
+                    }
+                  }
+                }
+              } catch {
+                // ignore closed-pnl fallback error
+              }
+            }
+
+            // 3B. Если при открытии Bybit order/realtime и order/history ещё не вернули avgPrice,
             // запрашиваем /v5/position/list по символу — Bybit обновляет avgPrice позиции мгновенно после Market-ордера!
             if (!isClose && !resolvedRealFillPrice) {
               try {
@@ -1794,6 +1861,8 @@ export async function executeExchangeFuturesOrder(
               status: 'FILLED',
               exchange_time: actualExchangeTime,
               commission_usdt: actualExecFee,
+              open_fee_usdt: actualOpenFee,
+              realized_pnl_usdt: actualRealizedPnl,
               network_label: netLabel,
             };
           }
@@ -2400,8 +2469,9 @@ export async function testExchangeConnection(
               ? Number(json.totalInitialMargin)
               : stableAssets.reduce((s: number, a: any) => s + Number(a.initialMargin || 0), 0);
 
-          // Кэшируем открытые позиции (USDT и USDC) прямо из /fapi/v2/account / v2/account.status
+          // Кэшируем открытые позиции (USDT и USDC) прямо из /fapi/v2/account / v2/account.status только если все ненулевые позиции содержат entryPrice
           const parsedPositions: ExchangePositionItem[] = [];
+          let rawNonZeroPositionsCount = 0;
           if (Array.isArray(json.positions)) {
             for (const p of json.positions) {
               const rawAmt = Number(p.positionAmt || 0);
@@ -2409,16 +2479,19 @@ export async function testExchangeConnection(
               if (!(size > 0)) continue;
               const sym = String(p.symbol || '').toUpperCase();
               if (!isSupportedFuturesSymbol(sym)) continue;
-              const liveTick = getLiveWsTicker(sym, 'binance');
+              rawNonZeroPositionsCount++;
+              const liveTick = !isTestnetHost ? getLiveWsTicker(sym, 'binance') : undefined;
               const entryPrice = Number(
                 p.entryPrice || p.breakEvenPrice || 0
               );
               if (!(entryPrice > 0)) continue;
+              const restMark = Number(p.markPrice || 0);
               const markPrice = Number(
-                (liveTick && liveTick.markPrice > 0 ? liveTick.markPrice : 0) ||
-                  p.markPrice ||
-                  liveTick?.price ||
-                  entryPrice
+                restMark > 0
+                  ? restMark
+                  : (liveTick && liveTick.markPrice > 0 ? liveTick.markPrice : 0) ||
+                    liveTick?.price ||
+                    entryPrice
               );
               const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
               const posSide = String(p.positionSide || '').toUpperCase();
@@ -2428,10 +2501,17 @@ export async function testExchangeConnection(
               );
               const marginUsdt = sanitizePositionMarginUsdt(initMargin, size, entryPrice, lev);
               const uTime = Number(p.updateTime || Date.now());
-              const liveUnrealPnl =
-                liveTick && liveTick.markPrice > 0
-                  ? Number(((isShort ? entryPrice - markPrice : markPrice - entryPrice) * size).toFixed(4))
-                  : Number(p.unrealizedProfit ?? p.unRealizedProfit ?? 0);
+              const rawExUpl = p.unrealizedProfit ?? p.unRealizedProfit;
+              const hasExactRestUpl =
+                rawExUpl !== undefined &&
+                rawExUpl !== null &&
+                String(rawExUpl).trim() !== '' &&
+                Number.isFinite(Number(rawExUpl));
+              const liveUnrealPnl = hasExactRestUpl
+                ? Number(Number(rawExUpl).toFixed(4))
+                : liveTick && liveTick.markPrice > 0
+                ? Number(((isShort ? entryPrice - markPrice : markPrice - entryPrice) * size).toFixed(4))
+                : 0;
               parsedPositions.push({
                 pair: symbolToFreqtradePair(sym),
                 symbol: sym,
@@ -2454,7 +2534,7 @@ export async function testExchangeConnection(
             usedMargin,
             walletBalance,
             posMarginSum,
-            parsedPositions.length
+            parsedPositions.length || rawNonZeroPositionsCount
           );
           const effectiveAvailableBalance =
             availableBalance > 0 &&
@@ -2463,8 +2543,11 @@ export async function testExchangeConnection(
               ? availableBalance
               : Math.max(0, walletBalance - usedMargin);
 
-          const hasPositionsArray = Array.isArray(json.positions);
-          if (hasPositionsArray) {
+          // Защищаем кэш позиций: если в v2/account были ненулевые позиции без entryPrice (parsedPositions.length < rawNonZeroPositionsCount),
+          // НЕ перезаписываем кэш пустым списком — fetchExchangeOpenPositions запросит полный v2/account.position (/fapi/v2/positionRisk)
+          const hasCompletePositionsArray =
+            Array.isArray(json.positions) && parsedPositions.length === rawNonZeroPositionsCount;
+          if (hasCompletePositionsArray) {
             binancePositionsCache.set(cleanKey, {
               timestamp: Date.now(),
               positions: parsedPositions,
@@ -2473,9 +2556,9 @@ export async function testExchangeConnection(
             });
           }
 
-          const openPositions = parsedPositions.length;
+          const openPositions = Math.max(parsedPositions.length, rawNonZeroPositionsCount);
           // Определяем Hedge Mode прямо из позиций в ответе v2/account (если есть LONG/SHORT positionSide), чтобы не делать лишний REST запрос!
-          const inferredDualSide = hasPositionsArray
+          const inferredDualSide = Array.isArray(json.positions)
             ? json.positions.some((p: any) => {
                 const ps = String(p.positionSide || '').toUpperCase();
                 return ps === 'LONG' || ps === 'SHORT';
@@ -2502,12 +2585,12 @@ export async function testExchangeConnection(
             usedMarginUsdt: Number(usedMargin.toFixed(2)),
             canTrade,
             dualSidePosition: dualSide,
-            positions: hasPositionsArray ? parsedPositions : existingWsState?.positions || [],
+            positions: hasCompletePositionsArray ? parsedPositions : existingWsState?.positions || [],
             closedPnl: existingWsState?.closedPnl || [],
             wsConnected: isPrivateWsStreamOpen('binance', cleanKey),
-            positionsSynced: hasPositionsArray || Boolean(existingWsState?.positionsSynced),
+            positionsSynced: hasCompletePositionsArray || Boolean(existingWsState?.positionsSynced),
             updatedAt: Date.now(),
-            lastRestBootstrapAt: hasPositionsArray ? Date.now() : existingWsState?.lastRestBootstrapAt || 0,
+            lastRestBootstrapAt: hasCompletePositionsArray ? Date.now() : existingWsState?.lastRestBootstrapAt || 0,
           });
           ensureBinancePrivateUserStream(cleanKey, cleanSecret, baseUrl).catch(() => {});
 
@@ -2846,28 +2929,38 @@ export async function testExchangeConnection(
             let posMarginSum = 0;
             let bybitPosFetchOk = false;
             try {
+              let usdtCompletedAllPages = false;
               for (const settleCoin of ['USDT', 'USDC']) {
                 let cursor = '';
+                let settleSuccess = true;
                 for (let page = 0; page < 5; page++) {
                   const qs = `category=linear&settleCoin=${settleCoin}&limit=200${
                     cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''
                   }`;
                   let posRes = await queryBybitEndpoint(baseUrl, `/v5/position/list?${qs}`, false);
-                  if (posRes.statusCode !== 200) break;
+                  if (posRes.statusCode !== 200) {
+                    settleSuccess = false;
+                    break;
+                  }
                   let posJson = JSON.parse(posRes.data);
                   if (posJson.retCode === 10002) {
                     posRes = await queryBybitEndpoint(baseUrl, `/v5/position/list?${qs}`, true);
-                    if (posRes.statusCode !== 200) break;
+                    if (posRes.statusCode !== 200) {
+                      settleSuccess = false;
+                      break;
+                    }
                     posJson = JSON.parse(posRes.data);
                   }
-                  if (posJson.retCode !== 0 || !Array.isArray(posJson.result?.list)) break;
-                  bybitPosFetchOk = true;
+                  if (posJson.retCode !== 0 || !Array.isArray(posJson.result?.list)) {
+                    settleSuccess = false;
+                    break;
+                  }
                   for (const p of posJson.result.list) {
                     const size = Math.abs(Number(p.size || 0));
                     if (!(size > 0)) continue;
                     const sym = String(p.symbol || '').toUpperCase();
                     if (!isSupportedFuturesSymbol(sym)) continue;
-                    const liveTick = getLiveWsTicker(sym, 'bybit');
+                    const liveTick = !isTestnetHost ? getLiveWsTicker(sym, 'bybit') : undefined;
                     const entryPrice = Number(
                       p.avgPrice || p.entryPrice || 0
                     );
@@ -2925,9 +3018,13 @@ export async function testExchangeConnection(
                   if (!nextCursor) break;
                   cursor = nextCursor;
                 }
+                if (settleCoin === 'USDT' && settleSuccess) {
+                  usdtCompletedAllPages = true;
+                }
               }
+              bybitPosFetchOk = usdtCompletedAllPages;
             } catch {
-              // ignore
+              bybitPosFetchOk = false;
             }
             const openPositions = parsedBybitPositions.length;
 
@@ -3467,23 +3564,25 @@ export async function fetchExchangeOpenPositions(
 
   // 1. BYBIT V5 LINEAR FUTURES (WebSocket Private Stream + paginated /v5/position/list bootstrap USDT+USDC)
   if (creds.exchange === 'bybit') {
-    const liveBybitWs = !forceFresh ? getWsAccountLiveState(cleanKey, 60_000) : undefined;
+    const liveBybitWs = !forceFresh ? getWsAccountLiveState(cleanKey, 5_000) : undefined;
     if (
       liveBybitWs &&
       liveBybitWs.exchange === 'bybit' &&
       liveBybitWs.positionsSynced &&
       liveBybitWs.wsConnected &&
       isPrivateWsStreamOpen('bybit', cleanKey) &&
-      Date.now() - liveBybitWs.lastRestBootstrapAt < 90_000
+      Date.now() - liveBybitWs.lastRestBootstrapAt < 5_000
     ) {
-      for (const pos of liveBybitWs.positions) {
-        const tick = getLiveWsTicker(pos.symbol, 'bybit');
-        if (tick && tick.markPrice > 0) {
-          pos.mark_price = tick.markPrice;
-          const diff = pos.is_short
-            ? pos.entry_price - tick.markPrice
-            : tick.markPrice - pos.entry_price;
-          pos.unrealized_pnl = Number((diff * pos.size).toFixed(4));
+      if (!liveBybitWs.isTestnet) {
+        for (const pos of liveBybitWs.positions) {
+          const tick = getLiveWsTicker(pos.symbol, 'bybit');
+          if (tick && tick.markPrice > 0 && tick.updatedAt > pos.updated_time) {
+            pos.mark_price = tick.markPrice;
+            const diff = pos.is_short
+              ? pos.entry_price - tick.markPrice
+              : tick.markPrice - pos.entry_price;
+            pos.unrealized_pnl = Number((diff * pos.size).toFixed(4));
+          }
         }
       }
       return {
@@ -3499,8 +3598,9 @@ export async function fetchExchangeOpenPositions(
       try {
         const positions: ExchangePositionItem[] = [];
         const seenPosKeys = new Set<string>();
-        let hostAuthenticated = false;
+        let usdtAuthenticatedAndComplete = false;
         let invalidKeyOnHost = false;
+        const isTestnetHost = baseUrl !== 'https://api.bybit.com';
 
         const queryBybitPos = async (queryString: string, forceTimeSync = false) => {
           const timestamp = await getBybitTimestamp(baseUrl, forceTimeSync);
@@ -3521,6 +3621,7 @@ export async function fetchExchangeOpenPositions(
 
         for (const settleCoin of ['USDT', 'USDC']) {
           let cursor = '';
+          let coinPagesOk = true;
           for (let page = 0; page < 5; page++) {
             const queryString = `category=linear&settleCoin=${settleCoin}&limit=200${
               cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''
@@ -3528,37 +3629,48 @@ export async function fetchExchangeOpenPositions(
             let res = await queryBybitPos(queryString, false);
             if (res.statusCode === 401 || res.statusCode === 403) {
               invalidKeyOnHost = true;
+              coinPagesOk = false;
               break;
             }
-            if (res.statusCode !== 200) break;
+            if (res.statusCode !== 200) {
+              coinPagesOk = false;
+              break;
+            }
             let json = JSON.parse(res.data);
             if (json.retCode === 10002) {
               res = await queryBybitPos(queryString, true);
-              if (res.statusCode !== 200) break;
+              if (res.statusCode !== 200) {
+                coinPagesOk = false;
+                break;
+              }
               json = JSON.parse(res.data);
             }
             if (json.retCode === 10003 || json.retCode === 10004 || json.retCode === 33004) {
               invalidKeyOnHost = true;
-              hostAuthenticated = false;
+              coinPagesOk = false;
               break;
             }
-            if (json.retCode !== 0 || !Array.isArray(json.result?.list)) break;
-            hostAuthenticated = true;
+            if (json.retCode !== 0 || !Array.isArray(json.result?.list)) {
+              coinPagesOk = false;
+              break;
+            }
 
             for (const p of json.result.list) {
               const size = Math.abs(Number(p.size || 0));
               if (!(size > 0)) continue;
               const sym = String(p.symbol || '').toUpperCase();
               if (!isSupportedFuturesSymbol(sym)) continue;
-              const liveTick = getLiveWsTicker(sym, 'bybit');
+              const liveTick = !isTestnetHost ? getLiveWsTicker(sym, 'bybit') : undefined;
               const entryPrice = Number(
                 p.avgPrice || p.entryPrice || 0
               );
               if (!(entryPrice > 0)) continue;
+              const restMark = Number(p.markPrice || 0);
               const markPrice = Number(
-                (liveTick && liveTick.markPrice > 0 ? liveTick.markPrice : 0) ||
-                  p.markPrice ||
-                  entryPrice
+                restMark > 0
+                  ? restMark
+                  : (liveTick && liveTick.markPrice > 0 ? liveTick.markPrice : 0) ||
+                    entryPrice
               );
               const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
               const sideStr = String(p.side || '').toLowerCase();
@@ -3604,17 +3716,19 @@ export async function fetchExchangeOpenPositions(
             if (!nextCursor) break;
             cursor = nextCursor;
           }
+          if (settleCoin === 'USDT' && coinPagesOk && !invalidKeyOnHost) {
+            usdtAuthenticatedAndComplete = true;
+          }
           if (invalidKeyOnHost) break;
         }
 
-        if (hostAuthenticated) {
+        if (usdtAuthenticatedAndComplete) {
           bybitHostCache.set(cleanKey, baseUrl);
           const netLabel = baseUrl.includes('testnet')
             ? 'Bybit Testnet'
             : baseUrl.includes('demo')
             ? 'Bybit Demo'
             : 'Bybit Mainnet';
-          const isTestnetHost = baseUrl !== 'https://api.bybit.com';
           const existingBybitWs = getWsAccountLiveState(cleanKey, 86_400_000);
           if (existingBybitWs) {
             existingBybitWs.positions = positions;
@@ -3668,23 +3782,25 @@ export async function fetchExchangeOpenPositions(
 
   // 2. BINANCE USDT-M + USDC-M FUTURES (WebSocket User Data Stream + ws-fapi v2/account.position + REST fallback + кэш)
   if (creds.exchange === 'binance') {
-    const liveWsState = !forceFresh ? getWsAccountLiveState(cleanKey, 90_000) : undefined;
+    const liveWsState = !forceFresh ? getWsAccountLiveState(cleanKey, 5_000) : undefined;
     if (
       liveWsState &&
       liveWsState.exchange === 'binance' &&
       liveWsState.positionsSynced &&
       liveWsState.wsConnected &&
       isPrivateWsStreamOpen('binance', cleanKey) &&
-      Date.now() - liveWsState.lastRestBootstrapAt < 90_000
+      Date.now() - liveWsState.lastRestBootstrapAt < 5_000
     ) {
-      for (const pos of liveWsState.positions) {
-        const tick = getLiveWsTicker(pos.symbol, 'binance');
-        if (tick && tick.markPrice > 0) {
-          pos.mark_price = tick.markPrice;
-          const diff = pos.is_short
-            ? pos.entry_price - tick.markPrice
-            : tick.markPrice - pos.entry_price;
-          pos.unrealized_pnl = Number((diff * pos.size).toFixed(4));
+      if (!liveWsState.isTestnet) {
+        for (const pos of liveWsState.positions) {
+          const tick = getLiveWsTicker(pos.symbol, 'binance');
+          if (tick && tick.markPrice > 0 && tick.updatedAt > pos.updated_time) {
+            pos.mark_price = tick.markPrice;
+            const diff = pos.is_short
+              ? pos.entry_price - tick.markPrice
+              : tick.markPrice - pos.entry_price;
+            pos.unrealized_pnl = Number((diff * pos.size).toFixed(4));
+          }
         }
       }
       return {
@@ -3696,15 +3812,17 @@ export async function fetchExchangeOpenPositions(
     }
 
     const cachedPos = binancePositionsCache.get(cleanKey);
-    if (!forceFresh && cachedPos && Date.now() - cachedPos.timestamp < 75_000) {
-      for (const pos of cachedPos.positions) {
-        const tick = getLiveWsTicker(pos.symbol, 'binance');
-        if (tick && tick.markPrice > 0) {
-          pos.mark_price = tick.markPrice;
-          const diff = pos.is_short
-            ? pos.entry_price - tick.markPrice
-            : tick.markPrice - pos.entry_price;
-          pos.unrealized_pnl = Number((diff * pos.size).toFixed(4));
+    if (!forceFresh && cachedPos && Date.now() - cachedPos.timestamp < 5_000) {
+      if (!cachedPos.is_testnet) {
+        for (const pos of cachedPos.positions) {
+          const tick = getLiveWsTicker(pos.symbol, 'binance');
+          if (tick && tick.markPrice > 0 && tick.updatedAt > pos.updated_time) {
+            pos.mark_price = tick.markPrice;
+            const diff = pos.is_short
+              ? pos.entry_price - tick.markPrice
+              : tick.markPrice - pos.entry_price;
+            pos.unrealized_pnl = Number((diff * pos.size).toFixed(4));
+          }
         }
       }
       return {
@@ -4217,11 +4335,11 @@ export async function fetchExchangeClosedPnl(
     return { success: false, closed: [] };
   }
 
-  // 2. BINANCE USDT-M FUTURES (WebSocket ORDER_TRADE_UPDATE + кэш 10 мин, чтобы не вызывать /fapi/v1/income каждые 30 сек)
+  // 2. BINANCE USDT-M FUTURES (WebSocket ORDER_TRADE_UPDATE + короткий кэш 10 сек для мгновенной сверки закрытых сделок с биржей)
   if (creds.exchange === 'binance') {
     const liveWsState = getWsAccountLiveState(cleanKey, 600_000);
     const cachedClosed = !forceRefresh ? binanceClosedPnlCache.get(cleanKey) : undefined;
-    if (cachedClosed && Date.now() - cachedClosed.timestamp < 600_000) {
+    if (cachedClosed && Date.now() - cachedClosed.timestamp < 10_000) {
       const merged = [
         ...(liveWsState?.closedPnl || []),
         ...cachedClosed.closed.filter(
@@ -4229,9 +4347,6 @@ export async function fetchExchangeClosedPnl(
         ),
       ];
       return { success: true, closed: merged };
-    }
-    if (!forceRefresh && liveWsState && liveWsState.closedPnl.length > 0) {
-      return { success: true, closed: liveWsState.closedPnl };
     }
 
     const candidateHosts = getBinanceCandidateHosts(cleanKey, creds.isTestnet);

@@ -176,6 +176,25 @@ const fastTpInFlightIds = new Set<number>();
 
 function refreshTradeLivePriceFromWs(t: FreqtradeTrade): boolean {
   if (!t.is_open) return false;
+  const matchedAcc =
+    t.account_id && t.account_id !== 'master'
+      ? exchangeAccountsStore.find((a) => a.id === t.account_id)
+      : resolveExchangeAccountRecord('master');
+  const isTestnetAccount = Boolean(matchedAcc?.is_testnet);
+
+  // Для Testnet/Demo аккаунтов приоритет всегда у Mark Price и Unrealized PnL самой тестовой/демо биржи,
+  // чтобы публичный Mainnet тикер не искажал PnL и цену входа/выхода
+  if (
+    isTestnetAccount &&
+    t.exchange_mark_price &&
+    t.exchange_mark_price > 0 &&
+    t.exchange_synced_at &&
+    Date.now() - t.exchange_synced_at < 60_000
+  ) {
+    t.current_rate = roundPrice(t.exchange_mark_price);
+    return true;
+  }
+
   const wsTick =
     getLiveWsTicker(t.pair, t.exchange) ||
     exchangeTickerCache.get(`${t.exchange}:${t.pair}`);
@@ -187,7 +206,7 @@ function refreshTradeLivePriceFromWs(t: FreqtradeTrade): boolean {
     const mark = wsTick.markPrice > 0 ? wsTick.markPrice : wsTick.price;
     t.exchange_mark_price = mark;
     t.current_rate = roundPrice(mark);
-    if (t.open_rate > 0 && t.amount > 0) {
+    if (!isTestnetAccount && t.open_rate > 0 && t.amount > 0) {
       const liveUpl = (t.is_short ? t.open_rate - mark : mark - t.open_rate) * t.amount;
       t.exchange_unrealized_pnl = Number(liveUpl.toFixed(4));
       t.exchange_synced_at = wsTick.updatedAt;
@@ -198,7 +217,7 @@ function refreshTradeLivePriceFromWs(t: FreqtradeTrade): boolean {
   const hasFreshRestExchangeMark =
     t.exchange_mark_price &&
     t.exchange_synced_at &&
-    Date.now() - t.exchange_synced_at < 60_000;
+    Date.now() - t.exchange_synced_at < 120_000;
   if (!hasFreshRestExchangeMark) {
     const fallbackTick = tickerCache.get(t.pair);
     if (fallbackTick && fallbackTick.price > 0) {
@@ -296,6 +315,9 @@ async function processFastWsTradeClose(
         trade.current_rate = actualClosePrice;
         trade.close_date = nowStr;
         trade.close_timestamp = now;
+        if (closeOrderRes?.open_fee_usdt && closeOrderRes.open_fee_usdt > 0) {
+          trade.fee_open = Number(closeOrderRes.open_fee_usdt.toFixed(4));
+        }
         if (closeOrderRes?.commission_usdt && closeOrderRes.commission_usdt > 0) {
           trade.fee_close = Number(closeOrderRes.commission_usdt.toFixed(4));
         }
@@ -626,7 +648,61 @@ async function fetchAllMarketPairs(): Promise<string[]> {
     }
   }
 
+  // 1. Сначала пробуем прямой фьючерсный поток Bybit V5 Linear USDT Perpetual (без расхождения со спотом)
+  try {
+    const bybitRes = await fetchWithTimeout('https://api.bybit.com/v5/market/tickers?category=linear', 6000);
+    if (bybitRes.ok) {
+      const bybitJson = await bybitRes.json();
+      const list = bybitJson?.result?.list;
+      if (Array.isArray(list) && list.length > 0) {
+        const usdtLinear = list
+          .filter((t: any) => {
+            const sym = String(t.symbol || '');
+            if (!sym.endsWith('USDT')) return false;
+            const base = sym.slice(0, -4);
+            if (!base || EXCLUDED_BASE_ASSETS.has(base)) return false;
+            const lastPrice = parseFloat(t.lastPrice) || 0;
+            const turnover24h = parseFloat(t.turnover24h) || 0;
+            return lastPrice > 0 && turnover24h > 100_000;
+          })
+          .sort((a: any, b: any) => (parseFloat(b.turnover24h) || 0) - (parseFloat(a.turnover24h) || 0));
+
+        if (usdtLinear.length >= 15) {
+          const discoveredPairs: string[] = [...PINNED_PAIRS];
+          const seen = new Set<string>(PINNED_PAIRS);
+          for (const t of usdtLinear) {
+            const base = String(t.symbol).slice(0, -4);
+            const formattedPair = `${base}/USDT:USDT`;
+            const lastPrice = parseFloat(t.lastPrice) || 0;
+            const markPrice = parseFloat(t.markPrice) || lastPrice;
+            const changePct = (parseFloat(t.price24hPcnt) || 0) * 100;
+            tickerCache.set(formattedPair, {
+              price: markPrice > 0 ? markPrice : lastPrice,
+              change24h: Number(changePct.toFixed(2)),
+              volume24h: parseFloat(t.turnover24h) || 0,
+              high24h: parseFloat(t.highPrice24h) || 0,
+              low24h: parseFloat(t.lowPrice24h) || 0,
+              updatedAt: Date.now(),
+            });
+            if (!seen.has(formattedPair)) {
+              seen.add(formattedPair);
+              discoveredPairs.push(formattedPair);
+            }
+          }
+          marketPairsCache = {
+            timestamp: Date.now(),
+            pairs: discoveredPairs,
+          };
+          return discoveredPairs;
+        }
+      }
+    }
+  } catch {
+    // fallback to Binance Futures / Spot below
+  }
+
   const endpoints = [
+    'https://fapi.binance.com/fapi/v1/ticker/24hr',
     'https://data-api.binance.vision/api/v3/ticker/24hr',
     'https://api.binance.com/api/v3/ticker/24hr',
   ];
@@ -1427,8 +1503,7 @@ const MIN_NET_PROFIT_PRICE_BUFFER = 0.005;
 function roundPrice(val: number): number {
   if (!Number.isFinite(val) || val <= 0) return 0;
   if (val >= 1000) return Number(val.toFixed(2));
-  if (val >= 1) return Number(val.toFixed(4));
-  return Number(val.toFixed(6));
+  return Number(val.toPrecision(8));
 }
 
 function verifySafeProfitableClose(
@@ -1602,11 +1677,11 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
   }
 
   const exitNotional = refRate * totalAmount;
-  if (trade.is_open || !trade.fee_open || trade.fee_open <= 0) {
+  if (trade.is_open || typeof trade.fee_open !== 'number' || !(trade.fee_open >= 0)) {
     trade.fee_open = Number(openFeeSum.toFixed(4));
   }
-  // Если сделка уже закрыта и биржа вернула точную комиссию закрытия, сохраняем её
-  if (trade.is_open || !trade.fee_close || trade.fee_close <= 0) {
+  // Если сделка уже закрыта и биржа вернула точную комиссию закрытия, сохраняем её 1:1
+  if (trade.is_open || typeof trade.fee_close !== 'number' || !(trade.fee_close >= 0)) {
     trade.fee_close = Number((exitNotional * exchangeFeeRate).toFixed(4));
   }
   trade.fee_total = Number((trade.fee_open + trade.fee_close).toFixed(4));
@@ -1615,10 +1690,7 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     trade.is_open &&
     typeof trade.exchange_unrealized_pnl === 'number' &&
     Number.isFinite(trade.exchange_unrealized_pnl) &&
-    trade.exchange_synced_at &&
-    Date.now() - trade.exchange_synced_at < 5_000 &&
-    (!trade.exchange_mark_price ||
-      Math.abs(trade.exchange_mark_price - refRate) / Math.max(1e-8, refRate) < 0.0003);
+    (!trade.exchange_synced_at || Date.now() - trade.exchange_synced_at < 120_000);
 
   if (!trade.is_open && typeof trade.exchange_realized_pnl === 'number' && Number.isFinite(trade.exchange_realized_pnl)) {
     const exactNet = Number(trade.exchange_realized_pnl.toFixed(4));
@@ -1712,105 +1784,9 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
   trade.stop_loss_abs = 0;
   trade.stop_loss_pct = 0;
   trade.pullback_min_profit_pct = 3.0;
-
-  if (!trade.is_open) {
-    trade.planned_dca_levels = [];
-    return;
-  }
-
-  // Минимальная структурная дистанция до сильных уровней усреднения (по 4H/1D/1W, не рядом со входом!)
-  const dist1 = (trade.dca_count || 0) > 0 ? 0.038 : 0.035;
-  const baseStake = trade.initial_stake || trade.stake_amount || scalpBotConfig.stake_amount;
-  const nextStep1 = (trade.dca_count || 0) + 1;
-  const nextStep2 = (trade.dca_count || 0) + 2;
-
-  // Проверяем, является ли автоматический уровень адекватным: минимум 2.8% от цены входа (чтобы не усреднять вплотную ко входу) и не дальше 65%
-  const isReasonableAutoDca = (p: number) => {
-    if (!(p > 0)) return false;
-    if (trade.is_short && p <= openRate) return false;
-    if (!trade.is_short && p >= openRate) return false;
-    const distPct = (Math.abs(p - openRate) / openRate) * 100;
-    return distPct >= 2.8 && distPct <= 65.0;
-  };
-
-  if (resetLevels || !Array.isArray(trade.planned_dca_levels) || trade.planned_dca_levels.length === 0) {
-    const prevLevels = Array.isArray(trade.planned_dca_levels) ? trade.planned_dca_levels : [];
-    const prevManualStep1 = prevLevels.find((l) => l.step === nextStep1 && l.manual_override);
-    const prevManualStep2 = prevLevels.find((l) => l.step === nextStep2 && l.manual_override);
-    const prevAutoStep1 = prevLevels.find((l) => l.step === nextStep1 && !l.manual_override);
-    const prevAutoStep2 = prevLevels.find((l) => l.step === nextStep2 && !l.manual_override);
-
-    let dcaPrice1: number;
-    let isManual1 = false;
-    if (!resetLevels && prevManualStep1 && prevManualStep1.price > 0) {
-      dcaPrice1 = roundPrice(prevManualStep1.price);
-      isManual1 = true;
-    } else if (!resetLevels && prevAutoStep1 && prevAutoStep1.price > 0 && isReasonableAutoDca(prevAutoStep1.price)) {
-      dcaPrice1 = roundPrice(prevAutoStep1.price);
-      isManual1 = false;
-    } else if (!resetLevels && trade.dca_manual_override && trade.next_dca_price && trade.next_dca_price > 0) {
-      dcaPrice1 = roundPrice(trade.next_dca_price);
-      isManual1 = true;
-    } else if (trade.next_dca_price && isReasonableAutoDca(trade.next_dca_price)) {
-      dcaPrice1 = roundPrice(trade.next_dca_price);
-      isManual1 = false;
-    } else {
-      dcaPrice1 = roundPrice(trade.is_short ? openRate * (1 + dist1) : openRate * (1 - dist1));
-    }
-
-    let dcaPrice2: number;
-    let isManual2 = false;
-    if (!resetLevels && prevManualStep2 && prevManualStep2.price > 0) {
-      dcaPrice2 = roundPrice(prevManualStep2.price);
-      isManual2 = true;
-    } else if (!resetLevels && prevAutoStep2 && prevAutoStep2.price > 0 && isReasonableAutoDca(prevAutoStep2.price)) {
-      dcaPrice2 = roundPrice(prevAutoStep2.price);
-      isManual2 = false;
-    } else {
-      dcaPrice2 = roundPrice(
-        trade.is_short ? dcaPrice1 * (1 + dist1) : dcaPrice1 * (1 - dist1)
-      );
-    }
-
-    trade.next_dca_price = dcaPrice1;
-    trade.dca_manual_override = isManual1 || isManual2;
-    trade.planned_dca_levels = [
-      {
-        step: nextStep1,
-        label: `DCA ${nextStep1}`,
-        price: dcaPrice1,
-        stake_amount: baseStake,
-        amount: Number(((baseStake * lev) / Math.max(1e-8, dcaPrice1)).toFixed(4)),
-        distance_pct: Number((((dcaPrice1 - openRate) / openRate) * 100).toFixed(2)),
-        manual_override: isManual1,
-      },
-      {
-        step: nextStep2,
-        label: `DCA ${nextStep2}`,
-        price: dcaPrice2,
-        stake_amount: baseStake,
-        amount: Number(((baseStake * lev) / Math.max(1e-8, dcaPrice2)).toFixed(4)),
-        distance_pct: Number((((dcaPrice2 - openRate) / openRate) * 100).toFixed(2)),
-        manual_override: isManual2,
-      },
-    ];
-  } else {
-    // Сохраняем все уровни DCA (DCA 1, DCA 2) ровно на тех ценах, где они находятся,
-    // никогда не сдвигая соседний уровень и не сбрасывая ручные или привязанные к SUP/RES цены
-    for (let i = 0; i < trade.planned_dca_levels.length; i++) {
-      const lvl = trade.planned_dca_levels[i];
-      if (!(lvl.price > 0)) {
-        const refBase = i === 0 ? openRate : trade.planned_dca_levels[i - 1].price;
-        lvl.price = roundPrice(trade.is_short ? refBase * (1 + dist1) : refBase * (1 - dist1));
-      }
-      lvl.amount = Number(((lvl.stake_amount * lev) / Math.max(1e-8, lvl.price)).toFixed(4));
-      lvl.distance_pct = Number((((lvl.price - openRate) / openRate) * 100).toFixed(2));
-    }
-    trade.dca_manual_override = trade.planned_dca_levels.some((l) => Boolean(l.manual_override));
-    if (trade.planned_dca_levels[0]) {
-      trade.next_dca_price = trade.planned_dca_levels[0].price;
-    }
-  }
+  trade.planned_dca_levels = [];
+  trade.next_dca_price = undefined;
+  trade.dca_manual_override = false;
 }
 
 function resolvePostDcaTakeProfit(
@@ -1903,14 +1879,14 @@ const botConfig = {
   leverage: Number(scalpBotConfig.leverage || 25),
   margin_mode: String(scalpBotConfig.margin_mode || 'cross'),
   max_open_trades: Number(scalpBotConfig.max_open_trades || 30),
-  dca_enabled: Boolean(scalpBotConfig.dca_enabled ?? true),
-  max_dca_orders: Number(scalpBotConfig.max_dca_orders || 5),
-  dca_multiplier: scalpBotConfig.dca_scale_mode === 'martingale' ? 1.5 : 1.0,
+  dca_enabled: false,
+  max_dca_orders: 0,
+  dca_multiplier: 1.0,
   max_position_multiplier: Number(scalpBotConfig.max_position_multiplier || 6.0),
   min_liquidation_distance_pct: Number(scalpBotConfig.min_liquidation_distance_pct || 15.0),
-  max_margin_used_for_dca_pct: Number(scalpBotConfig.max_margin_used_for_dca_pct || 60.0),
+  max_margin_used_for_dca_pct: 0,
   max_pair_margin_pct: Number(scalpBotConfig.max_pair_margin_pct || 20.0),
-  dca_scale_mode: String(scalpBotConfig.dca_scale_mode || 'linear'),
+  dca_scale_mode: 'linear',
   stoploss: Number(scalpBotConfig.stoploss ?? -1.0),
   trailing_stop: false,
   trailing_stop_positive: 0.02,
@@ -2593,14 +2569,9 @@ async function initializeBotTrades() {
         t.open_rate > 0 && t.take_profit_abs > 0
           ? Math.abs(t.take_profit_abs - t.open_rate) / t.open_rate
           : 0;
-      const dca1Price = t.planned_dca_levels?.[0]?.price || t.next_dca_price || 0;
-      const dcaDistRatio =
-        t.open_rate > 0 && dca1Price > 0 ? Math.abs(dca1Price - t.open_rate) / t.open_rate : 0;
-      const needsMtfRefresh =
-        (!t.tp_manual_override && tpDistRatio < 0.014) ||
-        (!t.dca_manual_override &&
-          (dcaDistRatio < 0.028 ||
-            Boolean(t.planned_dca_levels?.some((l) => String(l.label || '').includes('PENDING_MTF')))));
+      t.planned_dca_levels = [];
+      t.next_dca_price = undefined;
+      const needsMtfRefresh = !t.tp_manual_override && tpDistRatio < 0.014;
       if (needsMtfRefresh) {
         const acc =
           t.account_id && t.account_id !== 'master'
@@ -2670,6 +2641,7 @@ async function initializeBotTrades() {
 let lastExchangeBalanceSyncTs = 0;
 const accInitialPosSynced = new Set<string>();
 const lastExchangeTpEnsureByTrade = new Map<number, { tp: number; ts: number }>();
+const missingFromExchangeCountByTrade = new Map<number, { count: number; firstMissingAt: number }>();
 
 function isOwnerAccountRecord(acc: ExchangeAccountRecord | undefined): boolean {
   if (!acc) return false;
@@ -2957,63 +2929,9 @@ async function enrichImportedPositionMtfLevelsAsync(
         );
       }
 
-      if (!liveTrade.dca_manual_override) {
-        const orderPrices = Array.isArray(liveTrade.orders)
-          ? liveTrade.orders.map((o) => Number(o.price)).filter((p) => p > 0)
-          : [];
-        const prevDcaExtreme =
-          orderPrices.length > 0
-            ? liveTrade.is_short
-              ? Math.max(entryRate, ...orderPrices)
-              : Math.min(entryRate, ...orderPrices)
-            : undefined;
-        const strongDca = findStrongestDcaLevel(
-          c4h,
-          c1d,
-          entryRate,
-          liveTrade.is_short,
-          3.0,
-          95.0,
-          c1w,
-          prevDcaExtreme
-        );
-        const dcaPrice1 =
-          !liveTrade.is_short && manualDcaSup
-            ? roundPrice(manualDcaSup.price)
-            : liveTrade.is_short && manualDcaRes
-            ? roundPrice(manualDcaRes.price)
-            : roundPrice(strongDca.price);
-        const dcaPrice2 = roundPrice(strongDca.second_price);
-        const dcaSource =
-          (!liveTrade.is_short && manualDcaSup) || (liveTrade.is_short && manualDcaRes)
-            ? 'MANUAL_LVL'
-            : strongDca.source;
-        const nextStep1 = (liveTrade.dca_count || 0) + 1;
-        const nextStep2 = (liveTrade.dca_count || 0) + 2;
-
-        liveTrade.planned_dca_levels = [
-          {
-            step: nextStep1,
-            label: `DCA ${nextStep1} (${dcaSource})`,
-            price: dcaPrice1,
-            stake_amount: stakeUsdt,
-            amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice1)).toFixed(4)),
-            distance_pct: Number((((dcaPrice1 - entryRate) / entryRate) * 100).toFixed(2)),
-            manual_override: (!liveTrade.is_short && hasManualSup) || (liveTrade.is_short && hasManualRes),
-          },
-          {
-            step: nextStep2,
-            label: `DCA ${nextStep2} (${liveTrade.is_short ? 'Strong Res #2' : 'Strong Sup #2'})`,
-            price: dcaPrice2,
-            stake_amount: stakeUsdt,
-            amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice2)).toFixed(4)),
-            distance_pct: Number((((dcaPrice2 - entryRate) / entryRate) * 100).toFixed(2)),
-            manual_override: false,
-          },
-        ];
-        liveTrade.next_dca_price = dcaPrice1;
-        liveTrade.plan_notes = `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) и проанализирована (1D=${mtf.d1_trend} | SUP=${liveTrade.support_level}$ | RES=${liveTrade.resistance_level}$ | TP=${liveTrade.take_profit_abs}$ | DCA${nextStep1}=${dcaPrice1}$ | DCA${nextStep2}=${dcaPrice2}$)`;
-      }
+      liveTrade.planned_dca_levels = [];
+      liveTrade.next_dca_price = undefined;
+      liveTrade.plan_notes = `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) и проанализирована (1D=${mtf.d1_trend} | SUP=${liveTrade.support_level}$ | RES=${liveTrade.resistance_level}$ | TP=${liveTrade.take_profit_abs}$)`;
 
       recalculateTradeMetrics(liveTrade, false);
       if (!liveTrade.tp_manual_override && liveTrade.min_profitable_tp) {
@@ -3088,6 +3006,7 @@ async function syncPositionsAndHistoryFromExchanges(
         );
 
         if (existingOpen) {
+          missingFromExchangeCountByTrade.delete(existingOpen.trade_id);
           subscribePairKlineStream(existingOpen.pair, existingOpen.timeframe || '1h');
           if (pos.mark_price > 0) {
             existingOpen.current_rate = roundPrice(pos.mark_price);
@@ -3102,116 +3021,40 @@ async function syncPositionsAndHistoryFromExchanges(
             pos.leverage || existingOpen.leverage || 25
           );
           const prevAmount = existingOpen.amount;
-          const prevStake = existingOpen.stake_amount || 0;
           const prevOpenRate = existingOpen.open_rate;
 
-          const sizeIncreased = pos.size > prevAmount * 1.02;
-          const sizeChanged = Math.abs(prevAmount - pos.size) > 1e-5;
+          const sizeChanged = Math.abs(prevAmount - pos.size) > 1e-6;
           const entryShifted =
             pos.entry_price > 0 &&
             Math.abs(prevOpenRate - pos.entry_price) / Math.max(1e-8, pos.entry_price) >
-              0.0003;
-          const isInitialFillAlignment =
-            !sizeIncreased &&
-            (existingOpen.dca_count || 0) === 0 &&
-            pos.entry_price > 0 &&
-            entryShifted &&
-            Date.now() - (existingOpen.open_timestamp || 0) < 120_000;
+              0.0001;
 
           if (sanitizedPosMargin > 0) {
             existingOpen.stake_amount = Number(sanitizedPosMargin.toFixed(2));
+            existingOpen.initial_stake = existingOpen.stake_amount;
           }
           existingOpen.leverage = pos.leverage || existingOpen.leverage;
 
-          if (sizeChanged) {
-            existingOpen.amount = Number(pos.size.toFixed(4));
+          if (sizeChanged && pos.size > 0) {
+            existingOpen.amount = Number(pos.size.toFixed(6));
+            existingOpen.initial_amount = existingOpen.amount;
           }
 
-          if (isInitialFillAlignment) {
+          if (entryShifted && pos.entry_price > 0) {
             const exactEntry = roundPrice(pos.entry_price);
             existingOpen.open_rate = exactEntry;
             existingOpen.initial_open_rate = exactEntry;
-            if (Array.isArray(existingOpen.orders) && existingOpen.orders.length === 1) {
+            if (Array.isArray(existingOpen.orders) && existingOpen.orders.length > 0) {
               existingOpen.orders[0].price = exactEntry;
               existingOpen.orders[0].amount = existingOpen.amount;
               existingOpen.orders[0].stake_amount = existingOpen.stake_amount;
             }
-          } else if (sizeIncreased && pos.entry_price > 0) {
-            const addedQty = Math.max(0, Number((pos.size - prevAmount).toFixed(4)));
-            const addedStake = Math.max(
-              0,
-              Number((sanitizedPosMargin - prevStake).toFixed(2))
-            );
-            const inferredFillPrice =
-              addedQty > 0 && prevAmount > 0
-                ? roundPrice(
-                    Math.max(
-                      1e-8,
-                      (pos.entry_price * pos.size - prevOpenRate * prevAmount) / addedQty
-                    )
-                  )
-                : roundPrice(pos.entry_price);
-            existingOpen.open_rate = roundPrice(pos.entry_price);
-            const nextStep = (existingOpen.dca_count || 0) + 1;
-            existingOpen.dca_count = nextStep;
-            existingOpen.trade_state = 'DCA_ACTIVE';
-            const nowTs = Date.now();
-            const nowDateStr = new Date(nowTs).toISOString().replace('T', ' ').slice(0, 19);
-            existingOpen.last_dca_date = nowDateStr;
-            if (!Array.isArray(existingOpen.orders)) existingOpen.orders = [];
-            const dcaOrdId = `ord-ex-dca-${existingOpen.trade_id}-${nextStep}-${nowTs}`;
-            existingOpen.orders.push({
-              id: dcaOrdId,
-              step: nextStep,
-              label: `DCA #${nextStep} (Синхр. с биржи ${acc.exchange.toUpperCase()})`,
-              side: existingOpen.is_short ? 'short' : 'long',
-              price: inferredFillPrice,
-              amount: addedQty > 0 ? addedQty : existingOpen.amount,
-              stake_amount: addedStake > 0 ? addedStake : existingOpen.stake_amount,
-              timestamp: nowTs,
-              date: nowDateStr,
-            });
-            sqliteDb.recordOrder({
-              trade_id: existingOpen.trade_id,
-              pair: existingOpen.pair,
-              order_type: 'market',
-              side: existingOpen.is_short ? 'sell' : 'buy',
-              price: inferredFillPrice,
-              amount: addedQty > 0 ? addedQty : existingOpen.amount,
-              cost: addedStake > 0 ? addedStake : existingOpen.stake_amount,
-              fee: 0,
-              realized_pnl: 0,
-              action_type: `DCA_STEP_${nextStep}`,
-              notes: `Exchange DCA sync #${nextStep} @ ${inferredFillPrice}, New Avg: ${existingOpen.open_rate}`,
-            });
-            if (!existingOpen.tp_manual_override) {
-              const exTpValid =
-                pos.take_profit &&
-                pos.take_profit > 0 &&
-                Math.abs(pos.take_profit - existingOpen.open_rate) /
-                  Math.max(1e-8, existingOpen.open_rate) >=
-                  0.015;
-              const newTp = exTpValid
-                ? roundPrice(Number(pos.take_profit))
-                : roundPrice(
-                    existingOpen.is_short
-                      ? existingOpen.open_rate * (1 - 0.018)
-                      : existingOpen.open_rate * (1 + 0.018)
-                  );
-              existingOpen.take_profit_abs = newTp;
-            }
           }
+          existingOpen.dca_count = 0;
+          existingOpen.last_dca_date = null;
 
-          // При отсутствии реальных MTF уровней DCA/TP ИЛИ при подключении / восстановлении связи доанализируем асинхронно
-          const hasExistingPlannedDca =
-            Array.isArray(existingOpen.planned_dca_levels) &&
-            existingOpen.planned_dca_levels.length >= 2 &&
-            existingOpen.planned_dca_levels.every(
-              (l) =>
-                l.price > 0 &&
-                !String(l.label || '').includes('PENDING_MTF') &&
-                Math.abs(Number(l.distance_pct || 0)) >= 2.8
-            );
+          existingOpen.planned_dca_levels = [];
+          existingOpen.next_dca_price = undefined;
           const hasTooCloseAutoTp =
             !existingOpen.tp_manual_override &&
             existingOpen.take_profit_abs > 0 &&
@@ -3219,10 +3062,7 @@ async function syncPositionsAndHistoryFromExchanges(
             Math.abs(existingOpen.take_profit_abs - existingOpen.open_rate) /
               existingOpen.open_rate <
               0.014;
-          if (
-            !existingOpen.dca_manual_override &&
-            (!hasExistingPlannedDca || hasTooCloseAutoTp || forceReanalyzeOpen)
-          ) {
+          if (hasTooCloseAutoTp || forceReanalyzeOpen) {
             void enrichImportedPositionMtfLevelsAsync(existingOpen.trade_id, acc, pos, creds);
           }
           recalculateTradeMetrics(existingOpen, false);
@@ -3342,31 +3182,12 @@ async function syncPositionsAndHistoryFromExchanges(
                 date: openDateStr,
               },
             ],
-            planned_dca_levels: [
-              {
-                step: 1,
-                label: 'DCA 1 (PENDING_MTF)',
-                price: dcaPrice1,
-                stake_amount: stakeUsdt,
-                amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice1)).toFixed(4)),
-                distance_pct: Number((((dcaPrice1 - entryRate) / entryRate) * 100).toFixed(2)),
-                manual_override: false,
-              },
-              {
-                step: 2,
-                label: `DCA 2 (PENDING_MTF)`,
-                price: dcaPrice2,
-                stake_amount: stakeUsdt,
-                amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice2)).toFixed(4)),
-                distance_pct: Number((((dcaPrice2 - entryRate) / entryRate) * 100).toFixed(2)),
-                manual_override: false,
-              },
-            ],
+            planned_dca_levels: [],
             support_level: analyzedSup,
             resistance_level: analyzedRes,
             plan_notes: `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) — выполняется MTF-анализ 1D/4H...`,
             trade_state: 'WAITING_PULLBACK',
-            next_dca_price: dcaPrice1,
+            next_dca_price: undefined,
             tp_manual_override: false,
             sl_manual_override: posSl > 0,
             dca_manual_override: false,
@@ -3470,12 +3291,40 @@ async function syncPositionsAndHistoryFromExchanges(
           Date.now() - (t.open_timestamp || 0) > 15_000
       );
 
-      const disappearedTrades = localOpenForAcc.filter(
+      let disappearedTrades = localOpenForAcc.filter(
         (localTrade) =>
           !openPosRes.positions.some(
             (p) => p.pair === localTrade.pair && p.is_short === localTrade.is_short
           )
       );
+
+      // Защита от ложного закрытия на сайте: если какие-то сделки отсутствуют в кэшированном ответе,
+      // ОБЯЗАТЕЛЬНО делаем прямой некэшированный запрос к бирже (forceFresh = true), чтобы убедиться, что позиция реально закрыта на бирже!
+      if (disappearedTrades.length > 0 && !shouldForceFresh) {
+        const freshPosCheck = await fetchExchangeOpenPositions(creds, true).catch(() => ({
+          success: false,
+          positions: [] as typeof openPosRes.positions,
+        }));
+        if (!freshPosCheck.success) {
+          // Если биржа временно не ответила на прямой запрос позиций — НЕ закрываем сделки локально!
+          disappearedTrades = [];
+        } else {
+          for (const fPos of freshPosCheck.positions) {
+            const matchStillOpen = disappearedTrades.find(
+              (t) => t.pair === fPos.pair && t.is_short === fPos.is_short
+            );
+            if (matchStillOpen) {
+              missingFromExchangeCountByTrade.delete(matchStillOpen.trade_id);
+            }
+          }
+          disappearedTrades = disappearedTrades.filter(
+            (localTrade) =>
+              !freshPosCheck.positions.some(
+                (p) => p.pair === localTrade.pair && p.is_short === localTrade.is_short
+              )
+          );
+        }
+      }
 
       if (disappearedTrades.length > 0) {
         const missingPairs = Array.from(new Set(disappearedTrades.map((t) => t.pair)));
@@ -3500,8 +3349,23 @@ async function syncPositionsAndHistoryFromExchanges(
             : undefined;
 
           if (!matchedClosed) {
-            // Если позиция реально исчезла из открытых на бирже, но эндпоинт closed-pnl ещё не проиндексировал запись (или позиция закрыта без записи в последнем батче),
-            // НИКОГДА не удаляем сделку! Переводим её в закрытые по лучшей известной рыночной цене/TP.
+            // КРИТИЧЕСКАЯ ЗАЩИТА: если в истории закрытых сделок биржи (closed-pnl / userTrades) НЕТ записи о закрытии этой позиции,
+            // НЕ закрываем сделку на сайте с первого раза! Считаем последовательные подтверждения отсутствия (минимум 4 проверки и >= 30 секунд),
+            // чтобы кратковременный сбой API или задержка индексации закрытия на бирже никогда не закрывали сделки локально.
+            const prevMiss = missingFromExchangeCountByTrade.get(localTrade.trade_id);
+            const nowMs = Date.now();
+            const nextMiss = prevMiss
+              ? { count: prevMiss.count + 1, firstMissingAt: prevMiss.firstMissingAt }
+              : { count: 1, firstMissingAt: nowMs };
+            missingFromExchangeCountByTrade.set(localTrade.trade_id, nextMiss);
+
+            if (nextMiss.count < 4 || nowMs - nextMiss.firstMissingAt < 30_000) {
+              continue;
+            }
+
+            // Только если на протяжении >= 4 свежих проверок (>= 30 сек) позиции точно нет на бирже (например, закрыта в 0 без записи в income),
+            // переводим её в закрытые:
+            missingFromExchangeCountByTrade.delete(localTrade.trade_id);
             const fallbackClosePrice = roundPrice(
               localTrade.current_rate > 0 ? localTrade.current_rate : localTrade.open_rate
             );
@@ -3522,19 +3386,21 @@ async function syncPositionsAndHistoryFromExchanges(
             appendLog(
               `freqtrade.exchange.${acc.exchange}`,
               'INFO',
-              `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] закрыта на бирже ${acc.exchange.toUpperCase()} @ ${fallbackClosePrice}$ | PnL: ${localTrade.profit_abs}$`,
+              `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] подтверждённо отсутствует на бирже ${acc.exchange.toUpperCase()} @ ${fallbackClosePrice}$ | PnL: ${localTrade.profit_abs}$`,
               { userId: acc.user_id || 'owner' }
             );
             continue;
           }
+
+          missingFromExchangeCountByTrade.delete(localTrade.trade_id);
           const matchedKey = `${matchedClosed.order_id}:${matchedClosed.updated_time}:${matchedClosed.pair}:${matchedClosed.is_short ? 'S' : 'L'}`;
           consumedClosedKeys.add(matchedKey);
 
-          if (!(localTrade.open_rate > 0) && matchedClosed.entry_price > 0 && !matchedClosed.order_id.startsWith('inc-')) {
+          if (matchedClosed.entry_price > 0 && !matchedClosed.order_id.startsWith('inc-')) {
             localTrade.open_rate = roundPrice(matchedClosed.entry_price);
           }
           if (matchedClosed.qty > 0 && !matchedClosed.order_id.startsWith('inc-')) {
-            localTrade.amount = Number(matchedClosed.qty.toFixed(4));
+            localTrade.amount = Number(matchedClosed.qty.toFixed(6));
             const lev = Math.max(1, localTrade.leverage || 25);
             localTrade.stake_amount = Number(
               ((localTrade.open_rate * localTrade.amount) / lev).toFixed(2)
@@ -3561,7 +3427,7 @@ async function syncPositionsAndHistoryFromExchanges(
           localTrade.fee_total = Number((matchedClosed.open_fee + matchedClosed.close_fee).toFixed(4));
           localTrade.exchange_realized_pnl = matchedClosed.closed_pnl;
           if (matchedClosed.order_id) {
-            localTrade.plan_notes = `Синхронизировано с биржей ${acc.exchange.toUpperCase()} (OrderID: ${matchedClosed.order_id})`;
+            localTrade.plan_notes = `Синхронизировано с биржей ${acc.exchange.toUpperCase()} (OrderID: ${matchedClosed.order_id}) [EXACT_EXCHANGE_RECONCILED]`;
           }
           recalculateTradeMetrics(localTrade, false);
 
@@ -3648,7 +3514,7 @@ let exchangeSyncInFlight: Promise<void> | null = null;
 const lastSyncErrorLogByAcc = new Map<string, { msg: string; ts: number }>();
 
 function triggerBackgroundExchangeSync(force = false): void {
-  if (!force && Date.now() - lastExchangeBalanceSyncTs < 35_000) return;
+  if (!force && Date.now() - lastExchangeBalanceSyncTs < 6_000) return;
   if (exchangeSyncInFlight) return;
   exchangeSyncInFlight = syncRealExchangeBalancesIfNeeded(force).finally(() => {
     exchangeSyncInFlight = null;
@@ -3656,7 +3522,7 @@ function triggerBackgroundExchangeSync(force = false): void {
 }
 
 async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
-  if (!force && Date.now() - lastExchangeBalanceSyncTs < 35_000) return;
+  if (!force && Date.now() - lastExchangeBalanceSyncTs < 6_000) return;
   lastExchangeBalanceSyncTs = Date.now();
   const enabledAccs = exchangeAccountsStore.filter((a) => a.enabled);
   for (const acc of enabledAccs) {
@@ -3896,6 +3762,9 @@ async function runScalpBotCycle(waitForActive = false) {
               trade.current_rate = actualClosePrice;
               trade.close_date = nowStr;
               trade.close_timestamp = now;
+              if (closeOrderRes?.open_fee_usdt && closeOrderRes.open_fee_usdt > 0) {
+                trade.fee_open = Number(closeOrderRes.open_fee_usdt.toFixed(4));
+              }
               if (closeOrderRes?.commission_usdt && closeOrderRes.commission_usdt > 0) {
                 trade.fee_close = Number(closeOrderRes.commission_usdt.toFixed(4));
               }
@@ -4034,6 +3903,9 @@ async function runScalpBotCycle(waitForActive = false) {
                 trade.current_rate = actualClosePrice;
                 trade.close_date = nowStr;
                 trade.close_timestamp = now;
+                if (closeOrderRes?.open_fee_usdt && closeOrderRes.open_fee_usdt > 0) {
+                  trade.fee_open = Number(closeOrderRes.open_fee_usdt.toFixed(4));
+                }
                 if (closeOrderRes?.commission_usdt && closeOrderRes.commission_usdt > 0) {
                   trade.fee_close = Number(closeOrderRes.commission_usdt.toFixed(4));
                 }
@@ -4090,512 +3962,9 @@ async function runScalpBotCycle(waitForActive = false) {
         }
       }
 
-      // 1D. Smart Level DCA check (_check_trade_dca) — строго от сильного уровня поддержки/сопротивления с подтверждением отскока!
-      let nextDcaTarget = trade.planned_dca_levels?.[0]?.price || trade.next_dca_price || 0;
-      const isManualDcaTarget = Boolean(
-        trade.dca_manual_override || trade.planned_dca_levels?.[0]?.manual_override
-      );
-      if (botConfig.dca_enabled && nextDcaTarget > 0) {
-        const dcaLockKey = getPosLockKey(tradeAccScopeId, trade.pair, trade.is_short);
-        if (activePositionKeys.has(dcaLockKey)) {
-          continue;
-        }
-        // Находим самую дальнюю цену среди уже исполненных ордеров (вход + все предыдущие шаги DCA),
-        // чтобы следующий уровень усреднения ВСЕГДА стоял дальше предыдущего ордера усреднения минимум на 3.0%–3.4%!
-        const executedOrderPrices = Array.isArray(trade.orders)
-          ? trade.orders.map((o) => Number(o.price)).filter((p) => p > 0)
-          : [];
-        const furthestExecutedPrice =
-          executedOrderPrices.length > 0
-            ? trade.is_short
-              ? Math.max(trade.open_rate, ...executedOrderPrices)
-              : Math.min(trade.open_rate, ...executedOrderPrices)
-            : trade.open_rate;
-
-        const dcaDistPctFromAnchor =
-          furthestExecutedPrice > 0
-            ? (Math.abs(nextDcaTarget - furthestExecutedPrice) / furthestExecutedPrice) * 100
-            : 0;
-        const isWrongSideOfAnchor =
-          furthestExecutedPrice > 0 &&
-          (trade.is_short
-            ? nextDcaTarget <= furthestExecutedPrice
-            : nextDcaTarget >= furthestExecutedPrice);
-        const isPendingPlaceholderDca = Boolean(
-          trade.planned_dca_levels?.[0] &&
-            String(trade.planned_dca_levels[0].label || '').includes('PENDING_MTF')
-        );
-        if (
-          !isManualDcaTarget &&
-          (isWrongSideOfAnchor || dcaDistPctFromAnchor < 2.8 || isPendingPlaceholderDca)
-        ) {
-          const [{ candles: c1wPre }, { candles: c4hPre }, { candles: c1dPre }] = await Promise.all([
-            fetchRealCandles(trade.pair, '1w', 300),
-            fetchRealCandles(trade.pair, '4h', 1000),
-            fetchRealCandles(trade.pair, '1d', 1000),
-          ]);
-          if (c4hPre.length >= 20) {
-            const strongPreDca = findStrongestDcaLevel(
-              c4hPre,
-              c1dPre,
-              trade.open_rate,
-              trade.is_short,
-              3.0,
-              95.0,
-              c1wPre,
-              furthestExecutedPrice
-            );
-            const updatedDca1 = roundPrice(strongPreDca.price);
-            const updatedDca2 = roundPrice(strongPreDca.second_price);
-            const nextStep1 = (trade.dca_count || 0) + 1;
-            const nextStep2 = (trade.dca_count || 0) + 2;
-            const baseStake = trade.initial_stake || trade.stake_amount || 25;
-            const lev = trade.leverage || botConfig.leverage || 25;
-            trade.next_dca_price = updatedDca1;
-            trade.planned_dca_levels = [
-              {
-                step: nextStep1,
-                label: `DCA ${nextStep1} (${strongPreDca.source})`,
-                price: updatedDca1,
-                stake_amount: baseStake,
-                amount: Number(((baseStake * lev) / Math.max(1e-8, updatedDca1)).toFixed(4)),
-                distance_pct: Number(
-                  (((updatedDca1 - trade.open_rate) / trade.open_rate) * 100).toFixed(2)
-                ),
-                manual_override: false,
-              },
-              {
-                step: nextStep2,
-                label: `DCA ${nextStep2} (${trade.is_short ? 'Strong Res #2' : 'Strong Sup #2'})`,
-                price: updatedDca2,
-                stake_amount: baseStake,
-                amount: Number(((baseStake * lev) / Math.max(1e-8, updatedDca2)).toFixed(4)),
-                distance_pct: Number(
-                  (((updatedDca2 - trade.open_rate) / trade.open_rate) * 100).toFixed(2)
-                ),
-                manual_override: false,
-              },
-            ];
-            sqliteDb.upsertTrade(trade);
-            nextDcaTarget = updatedDca1;
-          }
-        }
-
-        // Защита от повторного усреднения на одной и той же свече/минуте: минимум 3 минуты между шагами авто-DCA
-        const lastDcaOrderTs = Array.isArray(trade.orders)
-          ? trade.orders
-              .filter((o) => Number(o.step) > 0)
-              .reduce((maxTs, o) => Math.max(maxTs, Number(o.timestamp || 0)), 0)
-          : 0;
-        const dcaCooldownActive =
-          !isManualDcaTarget && lastDcaOrderTs > 0 && Date.now() - lastDcaOrderTs < 180_000;
-
-        const reachedDcaLevel =
-          !dcaCooldownActive &&
-          (!trade.is_short ? currentPrice <= nextDcaTarget : currentPrice >= nextDcaTarget);
-
-        if (reachedDcaLevel) {
-          const { compoundedBalance: totalDeposit } = getCompoundedAccountBalance(tradeAcc.id);
-          const localUsedMargin = tradesStore
-            .filter((t) => t.is_open && tradeMatchesAccount(t, tradeAcc, tradeAccScopeId))
-            .reduce((acc, t) => acc + t.stake_amount, 0);
-          const isRealOwner = Boolean(tradeAcc?.api_key_raw && !isSimulatedTestApiKey(tradeAcc.api_key_raw));
-          const usedMargin = isRealOwner
-            ? Number(tradeAcc?.used_margin_usdt || 0) > 0
-              ? Number(tradeAcc?.used_margin_usdt || 0)
-              : localUsedMargin
-            : localUsedMargin;
-          const otherActiveCoins = tradesStore.filter(
-            (t) =>
-              t.is_open &&
-              tradeMatchesAccount(t, tradeAcc, tradeAccScopeId) &&
-              t.pair !== trade.pair
-          ).length;
-
-          const riskCheck = canExecuteDca(
-            {
-              pair: trade.pair,
-              dcaCount: trade.dca_count || 0,
-              initialAmount: trade.initial_amount || trade.amount,
-              currentAmount: trade.amount,
-              currentPrice,
-              openRate: trade.open_rate,
-              isShort: trade.is_short,
-              leverage: trade.leverage || botConfig.leverage,
-              totalBalanceUsdt: totalDeposit,
-              usedMarginUsdt: usedMargin,
-              otherActiveCoinsCount: otherActiveCoins,
-            },
-            scalpBotConfig
-          );
-
-          if (!riskCheck.allowed) {
-            const lastSkipLog = dcaRiskSkipLogTs.get(trade.trade_id) || 0;
-            if (Date.now() - lastSkipLog > 600_000) {
-              dcaRiskSkipLogTs.set(trade.trade_id, Date.now());
-              appendLog(
-                'freqtrade.bot.dca',
-                'WARNING',
-                `🛡️ [DCA RISK GUARD] ${trade.pair} #${trade.trade_id} (${tradeAcc.name}): усреднение #${(trade.dca_count || 0) + 1} остановлено — ${riskCheck.reason} (Лимит по монете: ${riskCheck.maxAllowedDca}, Ликв. до/после: ${riskCheck.liquidationDistancePct}% / ${riskCheck.postDcaLiquidationDistancePct ?? riskCheck.liquidationDistancePct}%)`,
-                { userId: tradeUserId }
-              );
-            }
-          }
-
-          if (riskCheck.allowed) {
-            const candles1hForDca =
-              (trade.timeframe || botConfig.timeframe) === '1h'
-                ? candles1h
-                : (await fetchRealCandles(trade.pair, '1h', 60)).candles;
-            const dcaEvalCandles = candles1hForDca.length >= 3 ? candles1hForDca : candles1h;
-
-            const pairLvlsForDca =
-              botLevelsStore.get(`${tradeUserId}::${trade.pair}`) ||
-              botLevelsStore.get(`${tradeUserId}::${trade.pair}_${botConfig.timeframe}`) ||
-              botLevelsStore.get(trade.pair) ||
-              botLevelsStore.get(`${trade.pair}_${botConfig.timeframe}`) ||
-              [];
-            const nearestDcaZoneLvl = pairLvlsForDca.find(
-              (l) =>
-                (l.zone_low || l.zone_high) &&
-                (Math.abs(l.price - nextDcaTarget) / Math.max(1e-8, nextDcaTarget)) * 100 <= 1.2
-            );
-            const zoneBounds = nearestDcaZoneLvl
-              ? { zoneLow: nearestDcaZoneLvl.zone_low, zoneHigh: nearestDcaZoneLvl.zone_high }
-              : undefined;
-
-            const noKnifeOrPump = !trade.is_short
-              ? !isKnifeDrop(dcaEvalCandles)
-              : !isPumpExhaustion(dcaEvalCandles);
-            const rejectionCheck = checkCandleRejection(
-              dcaEvalCandles,
-              nextDcaTarget,
-              trade.is_short,
-              1.5,
-              zoneBounds
-            );
-            const rsiCheck = checkRsiCondition(dcaEvalCandles, trade.is_short);
-            const lastBar = dcaEvalCandles[dcaEvalCandles.length - 1];
-            const hasBounceOrWickReaction = Boolean(
-              lastBar &&
-                (!trade.is_short
-                  ? lastBar.close >= lastBar.open ||
-                    (Math.min(lastBar.open, lastBar.close) - lastBar.low) /
-                      Math.max(1e-8, lastBar.high - lastBar.low) >=
-                      0.28
-                  : lastBar.close <= lastBar.open ||
-                    (lastBar.high - Math.max(lastBar.open, lastBar.close)) /
-                      Math.max(1e-8, lastBar.high - lastBar.low) >=
-                      0.28)
-            );
-
-            // Усредняем ТОЛЬКО когда цена дошла до сильного уровня поддержки/сопротивления:
-            // - мгновенно, если уровень DCA выставлен/перетащен пользователем вручную;
-            // - либо по сильному структурному уровню при отсутствии ножа/пампа И подтверждении реакции (свечной отскок или RSI + разворотная/хвостовая реакция на уровне)
-            if (
-              isManualDcaTarget ||
-              (noKnifeOrPump &&
-                (rejectionCheck.confirmed || (rsiCheck.confirmed && hasBounceOrWickReaction)))
-            ) {
-              // Find next strongest 1W->1D / 4H DCA level first
-              const [{ candles: c1w }, { candles: c4h }, { candles: c1d }] = await Promise.all([
-                fetchRealCandles(trade.pair, '1w', 300),
-                fetchRealCandles(trade.pair, '4h', 1000),
-                fetchRealCandles(trade.pair, '1d', 1000),
-              ]);
-
-              // 2. Dynamic DCA calculation: pulls average entry price as close to current reversal price as possible (within ~0.8%)
-              const otherCoinsCount = tradesStore.filter(
-                (t) => t.is_open && (tradeAcc ? tradeMatchesAccount(t, tradeAcc, tradeAccScopeId) : (!t.account_id || t.account_id === 'master')) && t.pair !== trade.pair
-              ).length;
-              const dynamicDca = calculateDynamicDcaAmount({
-                currentAmount: trade.amount,
-                openRate: trade.open_rate,
-                currentPrice,
-                isShort: trade.is_short,
-                leverage: trade.leverage || botConfig.leverage,
-                totalBalanceUsdt: totalDeposit,
-                usedMarginUsdt: usedMargin,
-                otherActiveCoinsCount: otherCoinsCount,
-                maxPairMarginPct: scalpBotConfig.max_pair_margin_pct || 20.0,
-                minStakeUsdt: botConfig.min_stake_amount || 5,
-              });
-
-              if (dynamicDca.addAmount <= 0 || dynamicDca.addStake <= 0) {
-                const lastSkipLog = dcaRiskSkipLogTs.get(trade.trade_id) || 0;
-                if (Date.now() - lastSkipLog > 600_000) {
-                  dcaRiskSkipLogTs.set(trade.trade_id, Date.now());
-                  appendLog(
-                    'freqtrade.bot.dca',
-                    'WARNING',
-                    `🛡️ [DCA MARGIN/LIQ GUARD] ${trade.pair} #${trade.trade_id} (${tradeAcc.name}): недостаточно безопасной маржи/дистанции ликвидации для усреднения (Исп. маржа: ${usedMargin.toFixed(2)} / ${totalDeposit.toFixed(2)} USDT)`,
-                    { userId: tradeUserId }
-                  );
-                }
-                continue;
-              }
-
-              let addAmount = dynamicDca.addAmount;
-              const addStake = dynamicDca.addStake;
-              const prevMasterStake = trade.stake_amount || 25;
-              const dcaMultiplierRatio = addStake / Math.max(1, prevMasterStake);
-
-              // Блокируем позицию на время отправки ордера DCA, чтобы фоновый WS/REST не перезаписал amount до записи шага в БД
-              const preDcaAmount = trade.amount;
-              const preDcaStake = trade.stake_amount;
-              const preDcaOpenRate = trade.open_rate;
-              activePositionKeys.add(dcaLockKey);
-              let dcaOrderRes: PlacedOrderResult | null = null;
-              try {
-                dcaOrderRes = await dispatchOrderToExchangeAccount(tradeAcc, {
-                  pair: trade.pair,
-                  action: 'DCA',
-                  isShort: trade.is_short,
-                  quantity: addAmount,
-                  referencePrice: currentPrice,
-                  leverage: trade.leverage || botConfig.leverage || 25,
-                });
-              } finally {
-                activePositionKeys.delete(dcaLockKey);
-              }
-              if (tradeAcc && !isSimulatedTestApiKey(tradeAcc.api_key_raw) && !dcaOrderRes?.success) {
-                continue;
-              }
-              if (dcaOrderRes?.success && !dcaOrderRes.is_simulated_test && dcaOrderRes.qty > 0) {
-                addAmount = dcaOrderRes.qty;
-              }
-              const actualDcaPrice =
-                dcaOrderRes?.success && dcaOrderRes.price > 0
-                  ? roundPrice(dcaOrderRes.price)
-                  : currentPrice;
-
-              const prevOpenRate = preDcaOpenRate;
-              const newTotalAmount = Number((preDcaAmount + addAmount).toFixed(4));
-              const newTotalStake = Number((preDcaStake + addStake).toFixed(2));
-              const newAvgOpenRate = roundPrice(
-                (prevOpenRate * preDcaAmount + actualDcaPrice * addAmount) /
-                  Math.max(1e-8, newTotalAmount)
-              );
-
-              const nextStep = (trade.dca_count || 0) + 1;
-              const now =
-                dcaOrderRes?.exchange_time && dcaOrderRes.exchange_time > 0
-                  ? dcaOrderRes.exchange_time
-                  : Date.now();
-              const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
-              // Ищем следующий уровень усреднения (DCA) строго за пределами самой дальней цены исполнения DCA (мин. 3.4% дальше!)
-              const postDcaFurthestPrice = trade.is_short
-                ? Math.max(furthestExecutedPrice, newAvgOpenRate, actualDcaPrice)
-                : Math.min(furthestExecutedPrice, newAvgOpenRate, actualDcaPrice);
-              const nextStrongDca = findStrongestDcaLevel(
-                c4h,
-                c1d,
-                newAvgOpenRate,
-                trade.is_short,
-                3.0,
-                95.0,
-                c1w,
-                postDcaFurthestPrice
-              );
-
-              // 1. Before DB transaction: if this trade is part of a 2-way hedge campaign, close profitable sibling leg on exchange first
-              let siblingToClose: FreqtradeTrade | undefined;
-              let siblingCloseRes: PlacedOrderResult | null = null;
-              if (trade.campaign_id) {
-                const candidateSibling = tradesStore.find(
-                  (s) =>
-                    s.is_open &&
-                    resolveTradeUserId(s) === tradeUserId &&
-                    tradeMatchesAccount(s, tradeAcc, tradeAccScopeId) &&
-                    s.campaign_id === trade.campaign_id &&
-                    s.trade_id !== trade.trade_id
-                );
-                if (candidateSibling && (candidateSibling.net_profit ?? candidateSibling.profit_abs) > 0) {
-                  siblingCloseRes = await dispatchOrderToExchangeAccount(tradeAcc, {
-                    pair: candidateSibling.pair,
-                    action: 'CLOSE',
-                    isShort: candidateSibling.is_short,
-                    quantity: candidateSibling.amount,
-                    referencePrice: currentPrice,
-                    leverage: candidateSibling.leverage || 25,
-                  });
-                  if (!tradeAcc || isSimulatedTestApiKey(tradeAcc.api_key_raw) || siblingCloseRes?.success) {
-                    siblingToClose = candidateSibling;
-                  }
-                }
-              }
-
-              const postDcaMtf =
-                c4h.length >= 20
-                  ? analyzeMultiTimeframe(trade.pair, dcaEvalCandles, c4h, c1d, undefined, c1w)
-                  : null;
-              sqliteDb.runInTransaction(() => {
-                if (siblingToClose) {
-                  const sibClosePrice =
-                    siblingCloseRes?.success && siblingCloseRes.price > 0
-                      ? roundPrice(siblingCloseRes.price)
-                      : currentPrice;
-                  siblingToClose.is_open = false;
-                  siblingToClose.close_rate = sibClosePrice;
-                  siblingToClose.close_date = nowStr;
-                  siblingToClose.close_timestamp = now;
-                  if (siblingCloseRes?.commission_usdt && siblingCloseRes.commission_usdt > 0) {
-                    siblingToClose.fee_close = Number(siblingCloseRes.commission_usdt.toFixed(4));
-                  }
-                  siblingToClose.exit_reason = 'hedge_level_reversal_profit';
-                  siblingToClose.trade_state = 'CLOSED';
-                  siblingToClose.planned_dca_levels = [];
-                  recalculateTradeMetrics(siblingToClose, false);
-                  sqliteDb.upsertTrade(siblingToClose);
-                  sqliteDb.recordOrder({
-                    trade_id: siblingToClose.trade_id,
-                    pair: siblingToClose.pair,
-                    order_type: 'market',
-                    side: siblingToClose.is_short ? 'buy' : 'sell',
-                    price: sibClosePrice,
-                    amount: siblingToClose.amount,
-                    cost: Number((sibClosePrice * siblingToClose.amount).toFixed(4)),
-                    fee: siblingToClose.fee_close || 0,
-                    realized_pnl: siblingToClose.net_profit || siblingToClose.profit_abs,
-                    action_type: 'TAKE_PROFIT',
-                    notes: `Hedge Reversal: зафиксирован чистый профит +${siblingToClose.profit_abs} USDT на глобальном развороте ${sibClosePrice}`,
-                  });
-                  trade.campaign_banked_profit =
-                    (trade.campaign_banked_profit || 0) + (siblingToClose.net_profit || siblingToClose.profit_abs);
-                  appendLog(
-                    'freqtrade.bot.hedge',
-                    'INFO',
-                    `🏦 Hedge Reversal [${trade.pair}] (${tradeAcc.name}): зафиксирован чистый профит по ${siblingToClose.is_short ? 'SHORT' : 'LONG'} (+${siblingToClose.profit_abs}$ после комиссии). Вторая нога максимально усредняется для подтягивания цены к рынку!`,
-                    { userId: tradeUserId }
-                  );
-                }
-
-                trade.open_rate = newAvgOpenRate;
-                trade.amount = newTotalAmount;
-                trade.stake_amount = newTotalStake;
-                trade.dca_count = nextStep;
-                trade.last_dca_date = nowStr;
-                trade.trade_state = 'DCA_ACTIVE';
-                trade.enter_tag = `${trade.is_short ? 'Short' : 'Long'} (DCA ×${nextStep})`;
-
-                const existingNextPlanned = (trade.planned_dca_levels || []).find(
-                  (l) => l.step === nextStep + 1 && l.manual_override && l.price > 0
-                );
-                const existingStep2Planned = (trade.planned_dca_levels || []).find(
-                  (l) => l.step === nextStep + 2 && l.manual_override && l.price > 0
-                );
-                const nextDca1 = existingNextPlanned
-                  ? roundPrice(existingNextPlanned.price)
-                  : roundPrice(nextStrongDca.price);
-                const nextDca2 = existingStep2Planned
-                  ? roundPrice(existingStep2Planned.price)
-                  : existingNextPlanned
-                  ? roundPrice(
-                      trade.is_short
-                        ? Math.max(nextStrongDca.second_price, nextDca1 * 1.032)
-                        : Math.min(nextStrongDca.second_price, nextDca1 * 0.968)
-                    )
-                  : roundPrice(nextStrongDca.second_price);
-                trade.next_dca_price = nextDca1;
-                trade.dca_manual_override = Boolean(existingNextPlanned || existingStep2Planned);
-                trade.planned_dca_levels = [
-                  {
-                    step: nextStep + 1,
-                    label: existingNextPlanned
-                      ? existingNextPlanned.label || `DCA ${nextStep + 1} (USER)`
-                      : `DCA ${nextStep + 1} (${nextStrongDca.source})`,
-                    price: nextDca1,
-                    stake_amount: addStake,
-                    amount: Number(((addStake * (trade.leverage || 25)) / Math.max(1e-8, nextDca1)).toFixed(4)),
-                    distance_pct: Number((((nextDca1 - newAvgOpenRate) / newAvgOpenRate) * 100).toFixed(2)),
-                    manual_override: Boolean(existingNextPlanned),
-                  },
-                  {
-                    step: nextStep + 2,
-                    label: existingStep2Planned
-                      ? existingStep2Planned.label || `DCA ${nextStep + 2} (USER)`
-                      : `DCA ${nextStep + 2}`,
-                    price: nextDca2,
-                    stake_amount: addStake,
-                    amount: Number(((addStake * (trade.leverage || 25)) / Math.max(1e-8, nextDca2)).toFixed(4)),
-                    distance_pct: Number((((nextDca2 - newAvgOpenRate) / newAvgOpenRate) * 100).toFixed(2)),
-                    manual_override: Boolean(existingStep2Planned),
-                  },
-                ];
-
-                trade.orders.push({
-                  id: dcaOrderRes?.order_id || `ord-${trade.trade_id}-${nextStep}`,
-                  step: nextStep,
-                  label: `Smart DCA #${nextStep} (${nextStrongDca.source})`,
-                  side: trade.is_short ? 'short' : 'long',
-                  price: actualDcaPrice,
-                  amount: addAmount,
-                  stake_amount: addStake,
-                  timestamp: now,
-                  date: nowStr,
-                });
-
-                // Сначала пересчитываем точный безубыток с учетом всех комиссий DCA, затем ставим TP на ближайшую зону отката выше безубытка
-                recalculateTradeMetrics(trade, false);
-                if (!trade.tp_manual_override) {
-                  trade.take_profit_abs = resolvePostDcaTakeProfit(
-                    newAvgOpenRate,
-                    trade.is_short,
-                    postDcaMtf,
-                    trade.min_profitable_tp
-                  );
-                  trade.tp_reason = `Пост-DCA цель: ближайший уровень/зона отката выше безубытка (${trade.min_profitable_tp}$)`;
-                  recalculateTradeMetrics(trade, false);
-                }
-                sqliteDb.upsertTrade(trade);
-
-                // Сразу обновляем биржевой ордер Take-Profit на новую цену TP после усреднения (строго >= min_profitable_tp)
-                const tradeCreds = getAccountCredentialsFromStore(tradeAcc);
-                if (tradeCreds && !isSimulatedTestApiKey(tradeCreds.apiKey) && trade.take_profit_abs > 0) {
-                  const safeExchangeTp = !trade.tp_manual_override && trade.min_profitable_tp
-                    ? (trade.is_short ? Math.min(trade.take_profit_abs, trade.min_profitable_tp) : Math.max(trade.take_profit_abs, trade.min_profitable_tp))
-                    : trade.take_profit_abs;
-                  placeOrUpdateExchangeTakeProfitOrder(tradeCreds, {
-                    pair: trade.pair,
-                    isShort: trade.is_short,
-                    quantity: trade.amount,
-                    takeProfitPrice: safeExchangeTp,
-                  }).catch(() => {});
-                }
-                sqliteDb.recordOrder({
-                  trade_id: trade.trade_id,
-                  pair: trade.pair,
-                  order_type: 'market',
-                  side: trade.is_short ? 'sell' : 'buy',
-                  price: actualDcaPrice,
-                  amount: addAmount,
-                  cost: addStake,
-                  fee:
-                    dcaOrderRes?.commission_usdt && dcaOrderRes.commission_usdt > 0
-                      ? Number(dcaOrderRes.commission_usdt.toFixed(4))
-                      : Number((actualDcaPrice * addAmount * TAKER_FEE_RATE).toFixed(4)),
-                  realized_pnl: 0,
-                  action_type: `DCA_STEP_${nextStep}`,
-                  notes: `Smart DCA #${nextStep} at ${actualDcaPrice}, New Avg: ${newAvgOpenRate}, TP: ${trade.take_profit_abs}`,
-                });
-              });
-
-              if (siblingToClose) {
-                broadcastTradeLifecycleEvent('trade:closed', siblingToClose);
-              }
-
-              appendLog(
-                'freqtrade.bot.dca',
-                'INFO',
-                `✅ Smart DCA #${nextStep} [${trade.pair}] (${tradeAcc.name}): +${addAmount} монет @ ${actualDcaPrice}$ ($${addStake} маржи) | Новая средняя: ${newAvgOpenRate}$ (подтянута к цене на ${dynamicDca.pullDistancePct}%) | Безубыток (с комиссией): ${trade.breakeven_price}$ | Пост-DCA TP: ${trade.take_profit_abs}$ | След. DCA: ${trade.next_dca_price}$`,
-                { userId: tradeUserId }
-              );
-              broadcastTradeLifecycleEvent('trade:updated', trade);
-            }
-          }
-        }
-      }
-
+      // Усреднение (DCA) полностью отключено: очищаем возможные старые плановые уровни DCA
+      trade.planned_dca_levels = [];
+      trade.next_dca_price = undefined;
       sqliteDb.upsertTrade(trade);
     }
 
@@ -5251,39 +4620,11 @@ async function createScalpBotPosition(
       ((Math.abs(targetTp - entryRate) / Math.max(1e-8, entryRate)) * 100).toFixed(2)
     );
 
-    // Усреднения: DCA 1 и DCA 2 строго на самых сильных подтверждённых уровнях 1W->1D->4H SUP/RES (мин. >= 3.0% от входа)
-    const strongestDca = findStrongestDcaLevel(
-      candles4h,
-      candles1d,
-      entryRate,
-      isShort,
-      3.0,
-      95.0,
-      customOpts?.candles1w
-    );
-    const nextDcaPrice = !isShort
-      ? manualDcaSupLvl
-        ? roundPrice(manualDcaSupLvl.price)
-        : roundPrice(strongestDca.price)
-      : manualDcaResLvl
-      ? roundPrice(manualDcaResLvl.price)
-      : roundPrice(strongestDca.price);
-    const secondDcaPrice = roundPrice(
-      strongestDca.second_price &&
-        (isShort ? strongestDca.second_price > nextDcaPrice * 1.005 : strongestDca.second_price < nextDcaPrice * 0.995)
-        ? strongestDca.second_price
-        : isShort
-        ? nextDcaPrice * 1.035
-        : nextDcaPrice * 0.965
-    );
-    const dcaSourceLabel =
-      (!isShort && manualDcaSupLvl) || (isShort && manualDcaResLvl) ? 'MANUAL_LVL' : strongestDca.source;
-
     const resolvedStrategyName =
       customOpts?.strategyName || (isGlobalHedge ? 'GlobalHedgeStrategy' : 'ScalpingStrategy');
     const resolvedTimeframe =
       customOpts?.timeframeOverride || (isGlobalHedge ? '4h' : botConfig.timeframe);
-    const planNotes = `${side.toUpperCase()} [${resolvedStrategyName}] | 1D: ${mtf.d1_trend} | 4H: ${mtf.h4_trend} | ${isShort ? `Global Res: ${effectiveRes}` : `Global Sup: ${effectiveSup}`} | TP (${tpHorizon}): ${targetTp} [${tpReason}] | DCA #1 (${dcaSourceLabel}): ${nextDcaPrice} | DCA #2 (${isShort ? 'Abs Peak' : 'Abs Bottom'}): ${secondDcaPrice}`;
+    const planNotes = `${side.toUpperCase()} [${resolvedStrategyName}] | 1D: ${mtf.d1_trend} | 4H: ${mtf.h4_trend} | ${isShort ? `Global Res: ${effectiveRes}` : `Global Sup: ${effectiveSup}`} | TP (${tpHorizon}): ${targetTp} [${tpReason}]`;
 
     const initialOrderEntry: TradeOrderEntry & { commission_usdt?: number } = {
       id: primaryOrderRes?.order_id || `ord-${id}-0`,
@@ -5348,7 +4689,7 @@ async function createScalpBotPosition(
       leverage,
       support_level: effectiveSup,
       resistance_level: effectiveRes,
-      next_dca_price: nextDcaPrice,
+      next_dca_price: undefined,
       trade_state: 'WAITING_PULLBACK',
       pullback_min_profit_pct: 0.5,
       plan_notes: planNotes,
@@ -5357,26 +4698,7 @@ async function createScalpBotPosition(
       account_id: targetAccId,
       account_name: customOpts?.accountName || targetExchangeAcc.name || 'Main',
       orders: [initialOrderEntry],
-      planned_dca_levels: [
-        {
-          step: 1,
-          label: `DCA 1 (${dcaSourceLabel})`,
-          price: nextDcaPrice,
-          stake_amount: stake,
-          amount: Number(((stake * leverage) / Math.max(1e-8, nextDcaPrice)).toFixed(4)),
-          distance_pct: Number((((nextDcaPrice - entryRate) / entryRate) * 100).toFixed(2)),
-          manual_override: Boolean((!isShort && manualDcaSupLvl) || (isShort && manualDcaResLvl)),
-        },
-        {
-          step: 2,
-          label: `DCA 2 (${isShort ? 'Abs Peak' : 'Abs Bottom'})`,
-          price: secondDcaPrice,
-          stake_amount: stake,
-          amount: Number(((stake * leverage) / Math.max(1e-8, secondDcaPrice)).toFixed(4)),
-          distance_pct: Number((((secondDcaPrice - entryRate) / entryRate) * 100).toFixed(2)),
-          manual_override: false,
-        },
-      ],
+      planned_dca_levels: [],
     };
 
     sqliteDb.runInTransaction(() => {
@@ -5433,7 +4755,7 @@ async function createScalpBotPosition(
     appendLog(
       'freqtrade.bot',
       'INFO',
-      `🟢 Открыта позиция #${id} [${cleanPair}] (${targetExchangeAcc.name}) ${isShort ? 'SHORT' : 'LONG'} ${leverage}x @ ${entryRate}$ | Маржа 0.5%: ${stake}$ (депозит $${totalDeposit}) | TP (${tpHorizon}): ${newTrade.take_profit_abs}$ [${tpReason}] | Next DCA (${strongestDca.source}): ${nextDcaPrice}$`,
+      `🟢 Открыта позиция #${id} [${cleanPair}] (${targetExchangeAcc.name}) ${isShort ? 'SHORT' : 'LONG'} ${leverage}x @ ${entryRate}$ | Маржа 0.5%: ${stake}$ (депозит $${totalDeposit}) | TP (${tpHorizon}): ${newTrade.take_profit_abs}$ [${tpReason}]`,
       { userId: targetUserId }
     );
 
@@ -5458,9 +4780,18 @@ async function startServer() {
       (a) => a.enabled && !isSimulatedTestApiKey(a.api_key_raw)
     );
     if (hasRealActiveAccount) {
+      triggerBackgroundExchangeSync(false);
+    }
+  }, 5_000);
+
+  setInterval(() => {
+    const hasRealActiveAccount = exchangeAccountsStore.some(
+      (a) => a.enabled && !isSimulatedTestApiKey(a.api_key_raw)
+    );
+    if (hasRealActiveAccount) {
       runScalpBotCycle().catch(() => {});
     }
-  }, 10_000);
+  }, 8_000);
 
   app.get('/api/v1/ping', (_req, res) => {
     res.json({ status: 'pong' });
@@ -5776,11 +5107,7 @@ async function startServer() {
       }
       const aUsed =
         aIsReal && sanitizedAccUsed > 0
-          ? aOpen.length > 0 && a.open_trades_count === aOpen.length
-            ? sanitizedAccUsed
-            : aOpen.length > 0
-            ? aLocalUsed
-            : sanitizedAccUsed
+          ? sanitizedAccUsed
           : aLocalUsed;
       const aPnl =
         aOpen.length > 0
@@ -6924,284 +6251,23 @@ async function startServer() {
     res.json(newTrade);
   });
 
-  // Bot Averaging (DCA) endpoint — operates strictly on the user's own trade
-  app.post('/api/v1/dca', async (req, res) => {
-    const auth = requireAuth(req, res);
-    if (!auth) return;
-    await initializeBotTrades();
-    if (!hasConnectedExchangeAccount(auth.userId)) {
-      res.status(400).json({
-        error: 'Бот не может выполнять усреднение (DCA) без подключенной биржи.',
-      });
-      return;
-    }
-    const { tradeid, price: customDcaPrice, stakeamount } = req.body || {};
-    const id = Number(tradeid);
-    const trade = tradesStore.find((t) => t.trade_id === id && t.is_open);
-    if (!trade) {
-      res.status(404).json({ error: `Открытая сделка #${id} не найдена` });
-      return;
-    }
-    if (
-      resolveTradeUserId(trade) !== auth.userId ||
-      (auth.role === 'client' && auth.accountId && trade.account_id !== auth.accountId)
-    ) {
-      res.status(403).json({ error: 'Нет доступа к чужой сделке' });
-      return;
-    }
-
-    const [{ candles: c1w }, { candles: c1d }, { candles: c4h }, { candles: c1h }] =
-      await Promise.all([
-        fetchRealCandles(trade.pair, '1w', 300),
-        fetchRealCandles(trade.pair, '1d', 1000),
-        fetchRealCandles(trade.pair, '4h', 1000),
-        fetchRealCandles(trade.pair, '1h', 100),
-      ]);
-    refreshTradeLivePriceFromWs(trade);
-    const liveWsExec = getFuturesExecutionPrice(trade.pair, trade.is_short, false, trade.exchange);
-    const livePrice =
-      liveWsExec && liveWsExec.executionPrice > 0
-        ? liveWsExec.executionPrice
-        : trade.current_rate > 0
-        ? trade.current_rate
-        : c1h.length > 0
-        ? c1h[c1h.length - 1].close
-        : trade.open_rate;
-    trade.current_rate = roundPrice(livePrice);
-
-    let fillPrice = livePrice;
-    if (customDcaPrice && Number(customDcaPrice) > 0) {
-      fillPrice = Number(customDcaPrice);
-    }
-    fillPrice = roundPrice(fillPrice);
-
-    const nextStep = (trade.dca_count || 0) + 1;
-    const baseStake = trade.initial_stake || trade.stake_amount;
-    const defaultDcaStake = Number(
-      (baseStake * Math.pow(botConfig.dca_multiplier, nextStep)).toFixed(2)
-    );
-    const addStake =
-      stakeamount && Number(stakeamount) > 0 ? Number(stakeamount) : defaultDcaStake;
-    const leverage = trade.leverage || botConfig.leverage;
-    const rawAddAmount = Number(((addStake * leverage) / Math.max(1e-8, fillPrice)).toFixed(4));
-
-    // Отправка реального DCA-ордера на биржу (под защитой in-flight ключа от гонки синхронизации)
-    const targetAccId = trade.account_id || 'master';
-    const dcaLockKey = getPosLockKey(targetAccId, trade.pair, trade.is_short);
-    activePositionKeys.add(dcaLockKey);
-
-    let dcaOrderRes: PlacedOrderResult | null = null;
-    let addAmount = rawAddAmount;
-    let prevOpenRate = trade.open_rate;
-    let newTotalAmount = trade.amount;
-    let newTotalStake = trade.stake_amount;
-    let newAvgOpenRate = trade.open_rate;
-    let nextStrongDca: ReturnType<typeof findStrongestDcaLevel>;
-
-    try {
-      dcaOrderRes = await dispatchOrderToExchangeAccount(targetAccId, {
-        pair: trade.pair,
-        isShort: trade.is_short,
-        action: 'DCA',
-        quantity: rawAddAmount,
-        leverage,
-        referencePrice: fillPrice,
-      });
-      const targetCreds = getAccountCredentialsFromStore(targetAccId);
-      if (
-        targetCreds &&
-        !isSimulatedTestApiKey(targetCreds.apiKey) &&
-        (!dcaOrderRes || !dcaOrderRes.success)
-      ) {
-        res.status(400).json({
-          error:
-            dcaOrderRes?.error ||
-            `Биржа отклонила ордер усреднения (DCA) по паре ${trade.pair}.`,
-        });
-        return;
-      }
-
-      addAmount =
-        dcaOrderRes?.success && dcaOrderRes.qty > 0 ? dcaOrderRes.qty : rawAddAmount;
-      if (dcaOrderRes?.success && dcaOrderRes.price > 0 && !customDcaPrice) {
-        fillPrice = roundPrice(dcaOrderRes.price);
-      }
-
-      prevOpenRate = trade.open_rate;
-      const prevAmount = trade.amount;
-      const prevStake = trade.stake_amount;
-
-      newTotalAmount = Number((prevAmount + addAmount).toFixed(4));
-      newTotalStake = Number((prevStake + addStake).toFixed(3));
-      newAvgOpenRate = roundPrice(
-        (prevOpenRate * prevAmount + fillPrice * addAmount) / Math.max(1e-8, newTotalAmount)
-      );
-
-      const now = Date.now();
-      const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
-      const dcaAnchorPrice = trade.is_short
-        ? Math.max(newAvgOpenRate, fillPrice)
-        : Math.min(newAvgOpenRate, fillPrice);
-      nextStrongDca = findStrongestDcaLevel(
-        c4h,
-        c1d,
-        dcaAnchorPrice,
-        trade.is_short,
-        3.0,
-        95.0,
-        c1w
-      );
-
-      const postDcaMtf =
-        c4h.length >= 20
-          ? analyzeMultiTimeframe(trade.pair, c1h, c4h, c1d, undefined, c1w)
-          : null;
-
-      sqliteDb.runInTransaction(() => {
-        trade.open_rate = newAvgOpenRate;
-        trade.amount = newTotalAmount;
-        trade.stake_amount = newTotalStake;
-        trade.dca_count = nextStep;
-        trade.last_dca_date = nowStr;
-        trade.trade_state = 'AVERAGED';
-        trade.pullback_min_profit_pct = 0.4;
-        trade.enter_tag = `${trade.is_short ? 'Short' : 'Long'} (DCA ×${nextStep})`;
-
-        const existingNextPlanned = (trade.planned_dca_levels || []).find(
-          (l) => l.step === nextStep + 1 && l.manual_override && l.price > 0
-        );
-        const existingStep2Planned = (trade.planned_dca_levels || []).find(
-          (l) => l.step === nextStep + 2 && l.manual_override && l.price > 0
-        );
-        const nextDca1 = existingNextPlanned
-          ? roundPrice(existingNextPlanned.price)
-          : roundPrice(nextStrongDca.price);
-        const nextDca2 = existingStep2Planned
-          ? roundPrice(existingStep2Planned.price)
-          : existingNextPlanned
-          ? roundPrice(
-              trade.is_short
-                ? Math.max(nextStrongDca.second_price, nextDca1 * 1.032)
-                : Math.min(nextStrongDca.second_price, nextDca1 * 0.968)
-            )
-          : roundPrice(nextStrongDca.second_price);
-        trade.next_dca_price = nextDca1;
-        trade.dca_manual_override = Boolean(existingNextPlanned || existingStep2Planned);
-        trade.planned_dca_levels = [
-          {
-            step: nextStep + 1,
-            label: existingNextPlanned
-              ? existingNextPlanned.label || `DCA ${nextStep + 1} (USER)`
-              : `DCA ${nextStep + 1} (${nextStrongDca.source})`,
-            price: nextDca1,
-            stake_amount: addStake,
-            amount: Number(((addStake * leverage) / Math.max(1e-8, nextDca1)).toFixed(4)),
-            distance_pct: Number((((nextDca1 - newAvgOpenRate) / newAvgOpenRate) * 100).toFixed(2)),
-            manual_override: Boolean(existingNextPlanned),
-          },
-          {
-            step: nextStep + 2,
-            label: existingStep2Planned
-              ? existingStep2Planned.label || `DCA ${nextStep + 2} (USER)`
-              : `DCA ${nextStep + 2}`,
-            price: nextDca2,
-            stake_amount: addStake,
-            amount: Number(((addStake * leverage) / Math.max(1e-8, nextDca2)).toFixed(4)),
-            distance_pct: Number((((nextDca2 - newAvgOpenRate) / newAvgOpenRate) * 100).toFixed(2)),
-            manual_override: Boolean(existingStep2Planned),
-          },
-        ];
-
-        const dcaOrderEntry: TradeOrderEntry & { commission_usdt?: number } = {
-          id: dcaOrderRes?.order_id || `ord-${trade.trade_id}-${nextStep}`,
-          step: nextStep,
-          label: `Усреднение #${nextStep} (${nextStrongDca.source})`,
-          side: trade.is_short ? 'short' : 'long',
-          price: fillPrice,
-          amount: addAmount,
-          stake_amount: addStake,
-          timestamp: now,
-          date: nowStr,
-        };
-        if (dcaOrderRes?.commission_usdt && dcaOrderRes.commission_usdt > 0) {
-          dcaOrderEntry.commission_usdt = Number(dcaOrderRes.commission_usdt.toFixed(4));
-        }
-        trade.orders.push(dcaOrderEntry);
-
-        // Сначала пересчитываем точный безубыток с учетом всех комиссий (вход + DCA + выход), затем ставим TP к ближайшей зоне отката выше безубытка
-        recalculateTradeMetrics(trade, false);
-        if (!trade.tp_manual_override) {
-          trade.take_profit_abs = resolvePostDcaTakeProfit(
-            newAvgOpenRate,
-            trade.is_short,
-            postDcaMtf,
-            trade.min_profitable_tp
-          );
-          trade.tp_horizon = 'POST_DCA';
-          trade.tp_reason = `Пост-DCA цель: ближайшая зона отката выше безубытка (${trade.min_profitable_tp}$)`;
-          recalculateTradeMetrics(trade, false);
-        }
-        sqliteDb.upsertTrade(trade);
-
-        if (targetCreds && !isSimulatedTestApiKey(targetCreds.apiKey) && trade.take_profit_abs > 0) {
-          const safeExchangeTp =
-            !trade.tp_manual_override && trade.min_profitable_tp
-              ? trade.is_short
-                ? Math.min(trade.take_profit_abs, trade.min_profitable_tp)
-                : Math.max(trade.take_profit_abs, trade.min_profitable_tp)
-              : trade.take_profit_abs;
-          placeOrUpdateExchangeTakeProfitOrder(targetCreds, {
-            pair: trade.pair,
-            isShort: trade.is_short,
-            quantity: trade.amount,
-            takeProfitPrice: safeExchangeTp,
-          }).catch(() => {});
-        }
-        sqliteDb.recordOrder({
-          trade_id: trade.trade_id,
-          pair: trade.pair,
-          order_type: 'market',
-          side: trade.is_short ? 'sell' : 'buy',
-          price: fillPrice,
-          amount: addAmount,
-          cost: addStake,
-          fee:
-            dcaOrderRes?.commission_usdt && dcaOrderRes.commission_usdt > 0
-              ? Number(dcaOrderRes.commission_usdt.toFixed(4))
-              : Number((fillPrice * addAmount * TAKER_FEE_RATE).toFixed(4)),
-          realized_pnl: 0,
-          action_type: `DCA_${nextStep}`,
-          notes: `DCA #${nextStep} @ ${fillPrice} | Avg: ${prevOpenRate} -> ${newAvgOpenRate} | Breakeven: ${trade.breakeven_price} | TP: ${trade.take_profit_abs} | Next DCA: ${trade.next_dca_price}${dcaOrderRes?.order_id ? ` | ExOrderId: ${dcaOrderRes.order_id}` : ''}`,
-        });
-      });
-    } finally {
-      activePositionKeys.delete(dcaLockKey);
-    }
-
-    appendLog(
-      'freqtrade.bot.dca',
-      'INFO',
-      `🔄 Усреднение #${nextStep} [${trade.pair}]: +${addStake}$ @ ${fillPrice}$. Средняя цена: ${prevOpenRate}$ ➔ ${newAvgOpenRate}$ | Безубыток (с комиссией 0.06%): ${trade.breakeven_price}$ | Новый TP: ${trade.take_profit_abs}$ | След. DCA: ${trade.next_dca_price}$`,
-      { userId: auth.userId }
-    );
-
-    broadcastTradeLifecycleEvent('trade:updated', trade);
-    scheduleScopeStateSync(auth.userId);
-
-    res.json({
-      result: `Trade #${id} averaged (DCA ×${nextStep})`,
-      previous_open_rate: prevOpenRate,
-      new_open_rate: newAvgOpenRate,
-      trade,
+  // Bot Averaging (DCA) endpoint — completely disabled
+  app.post('/api/v1/dca', (_req, res) => {
+    res.status(400).json({
+      error: 'Усреднение (DCA) полностью отключено в боте.',
     });
   });
 
-  // Update trade levels (TP, SL, Support, Resistance, or Planned DCA levels) when dragged by the user on the chart
+  // Update trade levels (TP, SL, Support, Resistance) when dragged by the user on the chart
   app.patch('/api/v1/trade_levels', async (req, res) => {
     const auth = requireAuth(req, res);
     if (!auth) return;
     await initializeBotTrades();
-    const { tradeid, level_type, step, price } = req.body || {};
+    const { tradeid, level_type, price } = req.body || {};
+    if (level_type === 'dca') {
+      res.status(400).json({ error: 'Усреднение (DCA) полностью отключено в боте.' });
+      return;
+    }
     const id = Number(tradeid);
     const requestedPrice = roundPrice(Number(price));
     if (!Number.isFinite(requestedPrice) || requestedPrice <= 0) {
@@ -7270,54 +6336,13 @@ async function startServer() {
           `[${trade.pair}] SL изменен вручную на графике: ${prevPrice}$ ➔ ${effectivePrice}$ (${trade.stop_loss_pct}%). Сохранено в trades.sqlite.`,
           { userId: auth.userId }
         );
-      } else if (level_type === 'dca') {
-        const targetStep = Number(step) || (trade.dca_count || 0) + 1;
-        trade.dca_manual_override = true;
-        const dcaItem = trade.planned_dca_levels?.find((l) => l.step === targetStep);
-        if (dcaItem) {
-          prevPrice = dcaItem.price;
-          dcaItem.price = effectivePrice;
-          dcaItem.manual_override = true;
-          if (targetStep === (trade.dca_count || 0) + 1) {
-            trade.next_dca_price = effectivePrice;
-          }
-          recalculateTradeMetrics(trade, false);
-          appendLog(
-            'freqtrade.bot.levels',
-            'INFO',
-            `[${trade.pair}] Уровень DCA #${targetStep} перенесен на графике: ${prevPrice}$ ➔ ${effectivePrice}$ (дистанция: ${dcaItem.distance_pct}%, объем: ${dcaItem.amount}). Бот синхронизирован.`,
-            { userId: auth.userId }
-          );
-        } else {
-          prevPrice = trade.next_dca_price || 0;
-          trade.next_dca_price = effectivePrice;
-          if (trade.planned_dca_levels?.[0]) {
-            trade.planned_dca_levels[0].price = effectivePrice;
-            trade.planned_dca_levels[0].manual_override = true;
-          }
-          recalculateTradeMetrics(trade, false);
-        }
       } else if (level_type === 'support') {
         prevPrice = trade.support_level || 0;
         trade.support_level = effectivePrice;
-        const dca1 = trade.planned_dca_levels?.[0];
-        if (!trade.is_short && !dca1?.manual_override) {
-          trade.next_dca_price = effectivePrice;
-          if (dca1) {
-            dca1.price = effectivePrice;
-          }
-        }
         recalculateTradeMetrics(trade, false);
       } else if (level_type === 'resistance') {
         prevPrice = trade.resistance_level || 0;
         trade.resistance_level = effectivePrice;
-        const dca1 = trade.planned_dca_levels?.[0];
-        if (trade.is_short && !dca1?.manual_override) {
-          trade.next_dca_price = effectivePrice;
-          if (dca1) {
-            dca1.price = effectivePrice;
-          }
-        }
         recalculateTradeMetrics(trade, false);
       }
 
@@ -7487,24 +6512,10 @@ async function startServer() {
 
         for (const t of tradesStore) {
           if (t.is_open && t.pair === cleanPair && resolveTradeUserId(t) === auth.userId) {
-            recalculateTradeMetrics(t, false);
-            const dca1 = t.planned_dca_levels?.[0];
             if (target.role === 'support') {
               t.support_level = newPrice;
-              if (!t.is_short && !dca1?.manual_override) {
-                t.next_dca_price = newPrice;
-                if (dca1) {
-                  dca1.price = newPrice;
-                }
-              }
             } else {
               t.resistance_level = newPrice;
-              if (t.is_short && !dca1?.manual_override) {
-                t.next_dca_price = newPrice;
-                if (dca1) {
-                  dca1.price = newPrice;
-                }
-              }
             }
             recalculateTradeMetrics(t, false);
             sqliteDb.upsertTrade(t);
@@ -8481,6 +7492,9 @@ async function startServer() {
           t.close_timestamp = closeRes?.exchange_time || now;
           t.close_rate =
             closeRes?.success && closeRes.price > 0 ? roundPrice(closeRes.price) : t.current_rate;
+          if (closeRes?.open_fee_usdt && closeRes.open_fee_usdt > 0) {
+            t.fee_open = Number(closeRes.open_fee_usdt.toFixed(4));
+          }
           if (closeRes?.commission_usdt && closeRes.commission_usdt > 0) {
             t.fee_close = Number(closeRes.commission_usdt.toFixed(4));
           }
@@ -8539,7 +7553,7 @@ async function startServer() {
       }
       if (closedCount === 0 && skippedNegativeCount > 0) {
         res.status(400).json({
-          error: `Защита от закрытия в минус: все открытые сделки (${skippedNegativeCount} шт.) сейчас не проходят защитный порог чистой прибыли с учётом всех комиссий и резерва проскальзывания. Бот удерживает их до выхода в уверенный чистый плюс через усреднение (DCA).`,
+          error: `Защита от закрытия в минус: все открытые сделки (${skippedNegativeCount} шт.) сейчас не проходят защитный порог чистой прибыли с учётом всех комиссий и резерва проскальзывания. Бот удерживает их до выхода в уверенный чистый плюс по Take-Profit.`,
           closed_count: 0,
           protected_count: skippedNegativeCount,
         });
@@ -8585,7 +7599,7 @@ async function startServer() {
         { userId: auth.userId }
       );
       res.status(400).json({
-        error: `Запрещено закрывать сделку #${id} (${trade.pair})! ${closeGuard.reason}. Чистый PnL с учётом всех комиссий ($${trade.fee_total}): ${netProfitUsdt}$ (${trade.net_profit_percent}%). Точка безубытка: ${trade.breakeven_price}$, мин. безопасный TP: ${trade.min_profitable_tp}$. Используйте усреднение (DCA) или дождитесь выхода в уверенный чистый плюс.`,
+        error: `Запрещено закрывать сделку #${id} (${trade.pair})! ${closeGuard.reason}. Чистый PnL с учётом всех комиссий ($${trade.fee_total}): ${netProfitUsdt}$ (${trade.net_profit_percent}%). Точка безубытка: ${trade.breakeven_price}$, мин. безопасный TP: ${trade.min_profitable_tp}$. Дождитесь выхода позиции в уверенный чистый плюс.`,
         net_profit: netProfitUsdt,
         fee_total: trade.fee_total,
         breakeven_price: trade.breakeven_price,
@@ -8631,6 +7645,9 @@ async function startServer() {
         closeOrderRes?.success && closeOrderRes.price > 0
           ? roundPrice(closeOrderRes.price)
           : trade.current_rate;
+      if (closeOrderRes?.open_fee_usdt && closeOrderRes.open_fee_usdt > 0) {
+        trade.fee_open = Number(closeOrderRes.open_fee_usdt.toFixed(4));
+      }
       if (closeOrderRes?.commission_usdt && closeOrderRes.commission_usdt > 0) {
         trade.fee_close = Number(closeOrderRes.commission_usdt.toFixed(4));
       }

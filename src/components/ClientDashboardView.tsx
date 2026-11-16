@@ -233,7 +233,7 @@ export const ClientDashboardView: React.FC<ClientDashboardViewProps> = ({
               <span className="w-2 h-2 rounded-full bg-[#10b981] animate-ping" />
               АКТИВНО 100%
             </div>
-            <span className="text-[10.5px] text-[#9ca3af] mt-1">2-Way Hedge + Smart DCA</span>
+            <span className="text-[10.5px] text-[#9ca3af] mt-1">MTF 1D/4H S&R + Take-Profit</span>
           </div>
         </div>
 
@@ -247,7 +247,7 @@ export const ClientDashboardView: React.FC<ClientDashboardViewProps> = ({
               </span>
             </div>
             <div className="text-[11.5px] text-[#9ca3af]">
-              Бот открывает парные сделки (LONG + SHORT) с контролируемым объемом строго 0.5% от вашего депозита (${stakeAmount}) с плечом 25x. Стоп-лоссы отсутствуют — выход осуществляется исключительно по ключевым институциональным уровням 4H/1D (от +3% до +8% движения цены) с безопасным динамическим усреднением на подтвержденных разворотах.
+              Бот открывает сделки с контролируемым объемом 0.5% от вашего депозита (${stakeAmount}) с плечом 25x без усреднений. Выход осуществляется строго в плюс по ключевым уровням поддержки и сопротивления 1H/4H/1D.
             </div>
           </div>
         </div>
@@ -281,7 +281,7 @@ export const ClientDashboardView: React.FC<ClientDashboardViewProps> = ({
                     <th className="py-2.5 px-4">Цена входа</th>
                     <th className="py-2.5 px-4">Текущая цена</th>
                     <th className="py-2.5 px-4">Цель TP</th>
-                    <th className="py-2.5 px-4">Усреднение (DCA)</th>
+                    <th className="py-2.5 px-4">Режим</th>
                     <th className="py-2.5 px-4 text-right">Текущий PnL</th>
                   </tr>
                 </thead>
@@ -319,11 +319,7 @@ export const ClientDashboardView: React.FC<ClientDashboardViewProps> = ({
                           {t.take_profit_abs ? `${t.take_profit_abs}` : '—'}
                         </td>
                         <td className="py-3 px-4">
-                          <span className="text-[11px] text-[#cbd5e1]">
-                            {t.dca_count && t.dca_count > 0
-                              ? `Шаг #${t.dca_count}`
-                              : 'Ожидание разворота'}
-                          </span>
+                          <span className="text-[11px] text-[#cbd5e1]">Ожидание TP</span>
                         </td>
                         <td className="py-3 px-4 text-right">
                           <div

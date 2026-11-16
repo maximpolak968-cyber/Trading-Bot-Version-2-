@@ -1461,111 +1461,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
         const dcaCount = t.dca_count || 0;
         const sideEng = isShort ? 'SHORT' : 'LONG';
 
-        // 1) If averaged (dcaCount > 0), draw thin dashed lines for initial entry (ENTRY 1) and filled DCA steps (DCA 1 ✓)
-        if (dcaCount > 0 && Array.isArray(t.orders) && t.orders.length > 0) {
-          t.orders.forEach((ord, ordIdx) => {
-            const ordY = priceToY(ord.price);
-            const isInitial = ord.step === 0;
-            drawHorizontalLevel(ctx, {
-              y: ordY,
-              plotLeft,
-              plotRight,
-              plotTop,
-              plotBottom,
-              rightPriceAxisWidth,
-              priceText: formatAxisPrice(ord.price),
-              badgeText: isInitial ? `ENTRY 1` : `DCA ${ord.step} ✓`,
-              lineColor: 'rgba(148, 163, 184, 0.55)',
-              badgeBg: 'rgba(15, 23, 42, 0.9)',
-              badgeBorder: 'rgba(148, 163, 184, 0.45)',
-              badgeTextColor: '#cbd5e1',
-              axisTagBg: '#475569',
-              lineWidth: 1,
-              dash: [3, 4],
-              badgeX: plotLeft + 14 + ordIdx * 82,
-            });
-          });
-
-          // Vertical shift arrow from initial entry to new weighted-average entry
-          if (t.initial_open_rate && Math.abs(t.initial_open_rate - t.open_rate) > 1e-8) {
-            const initY = priceToY(t.initial_open_rate);
-            const avgY = priceToY(t.open_rate);
-            if (initY >= plotTop && initY <= plotBottom && avgY >= plotTop && avgY <= plotBottom) {
-              const arrowX = plotLeft + 88;
-              const entryColor = isShort ? '#ef4444' : '#10b981';
-              ctx.save();
-              ctx.strokeStyle = entryColor;
-              ctx.lineWidth = 1.5;
-              ctx.setLineDash([2, 2]);
-              ctx.beginPath();
-              ctx.moveTo(arrowX, initY);
-              ctx.lineTo(arrowX, avgY);
-              ctx.stroke();
-              ctx.setLineDash([]);
-
-              const dir = avgY > initY ? 1 : -1;
-              ctx.fillStyle = entryColor;
-              ctx.beginPath();
-              ctx.moveTo(arrowX, avgY);
-              ctx.lineTo(arrowX - 4, avgY - dir * 6);
-              ctx.lineTo(arrowX + 4, avgY - dir * 6);
-              ctx.closePath();
-              ctx.fill();
-              ctx.restore();
-            }
-          }
-        }
-
-        // 2) Bot's Planned DCA Averaging Limit Levels (↕ DCA 1, ↕ DCA 2 — draggable!)
-        if (Array.isArray(t.planned_dca_levels)) {
-          t.planned_dca_levels.forEach((lvl, dcaIdx) => {
-            const tKey = `dca-${t.trade_id}-${lvl.step}`;
-            const activePrice =
-              draggingLevel && draggingLevel.target.key === tKey
-                ? draggingLevel.currentPrice
-                : lvl.price;
-            const lvlY = priceToY(activePrice);
-            const isActive =
-              hoveredLevelKey === tKey || (draggingLevel && draggingLevel.target.key === tKey);
-            const distPct = (((activePrice - t.open_rate) / t.open_rate) * 100).toFixed(2);
-
-            const dcaBadgeX = Math.max(
-              plotLeft + 210,
-              plotRight - 220 - dcaIdx * 105 - tradeIdx * 95
-            );
-            const dcaBadgeInfo = drawHorizontalLevel(ctx, {
-              y: lvlY,
-              plotLeft,
-              plotRight,
-              plotTop,
-              plotBottom,
-              rightPriceAxisWidth,
-              priceText: formatAxisPrice(activePrice),
-              badgeText: isActive ? `↕ DCA ${lvl.step} (${distPct}%)` : `↕ DCA ${lvl.step}`,
-              lineColor: '#f59e0b',
-              badgeBg: 'rgba(41, 27, 8, 0.94)',
-              badgeBorder: '#f59e0b',
-              badgeTextColor: '#fde68a',
-              axisTagBg: '#d97706',
-              lineWidth: 1.4,
-              dash: [6, 4],
-              badgeX: dcaBadgeX,
-              isHoveredOrDragged: Boolean(isActive),
-            });
-
-            nextDraggableTargets.push({
-              key: tKey,
-              kind: 'dca',
-              tradeId: t.trade_id,
-              step: lvl.step,
-              label: `DCA ${lvl.step}`,
-              price: activePrice,
-              y: lvlY,
-              badgeX: dcaBadgeInfo.boxX,
-              badgeW: dcaBadgeInfo.boxW,
-            });
-          });
-        }
+        // Усреднение (DCA) полностью отключено: линии DCA на графике не отображаются
 
         // 3) Take-Profit Level (↕ TP — GREEN #10b981, draggable!)
         if (t.take_profit_abs && t.take_profit_abs > 0) {
@@ -1628,10 +1524,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
         // 5) MAIN ENTRY / SHIFTED WEIGHTED-AVERAGE ENTRY LINE
         const mainEntryY = priceToY(t.open_rate);
         const pnlSign = t.profit_abs >= 0 ? '+' : '';
-        const mainBadgeLabel =
-          dcaCount > 0
-            ? `AVG ${sideEng} ×${dcaCount} (${pnlSign}${t.profit_abs.toFixed(2)}$)`
-            : `${sideEng} ${t.leverage || 1}x (${pnlSign}${t.profit_abs.toFixed(2)}$)`;
+        const mainBadgeLabel = `${sideEng} ${t.leverage || 1}x (${pnlSign}${t.profit_abs.toFixed(2)}$)`;
 
         drawHorizontalLevel(ctx, {
           y: mainEntryY,
@@ -3447,7 +3340,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
       {/* Compact Help Drawer */}
       {showConfigModal && (
         <div className="px-3 py-1.5 bg-[#1e222d] border-b border-[#2a2e39] flex flex-wrap items-center gap-4 text-[11px] text-[#cfd6df]">
-          <span>• Уровни (↕ TP, ↕ SL, ↕ DCA, ↕ LVL) перетаскиваются мышкой, а кнопка [×] на плашке удаляет уровень или линейку</span>
+          <span>• Уровни (↕ TP, ↕ SL, ↕ LVL) перетаскиваются мышкой, а кнопка [×] на плашке удаляет уровень или линейку</span>
           <span>• Слева на графике — панель инструментов анализа TradingView (Тренд, Фибоначчи, Зоны, LONG/SHORT RR, Фиксируемая линейка)</span>
         </div>
       )}

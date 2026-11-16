@@ -388,7 +388,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <span className="text-[11px] font-normal text-[#94a3b8]">USDT</span>
               </div>
               <div className="text-[10px] text-[#64748b] mt-0.5">
-                Доступно для входов и DCA (вход 0.5%: ${fmtComma(walletBalance * 0.005, 2)})
+                Доступно для входов (вход 0.5%: ${fmtComma(walletBalance * 0.005, 2)})
               </div>
             </div>
           </div>
@@ -495,7 +495,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   title={
                     botConfig?.pause_new_entries
                       ? 'Новые сделки остановлены. Нажмите, чтобы разрешить новые входы'
-                      : 'Нажмите, чтобы остановить открытие новых сделок (DCA и TP текущих продолжат работать)'
+                      : 'Нажмите, чтобы остановить открытие новых сделок (TP текущих продолжат работать)'
                   }
                 >
                   {botConfig?.pause_new_entries ? '⏸ Без новых' : '▶ Входы ВКЛ'}
@@ -539,7 +539,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     <th className="py-2 px-3">Откр. / Закр.</th>
                     <th className="py-2 px-3">Плавающий PnL</th>
                     <th className="py-2 px-3">Чистый закр. PnL</th>
-                    <th className="py-2 px-3">Горизонт и DCA</th>
+                    <th className="py-2 px-3">Горизонт цели</th>
                     <th className="py-2 px-3">Винрейт</th>
                   </tr>
                 </thead>
@@ -566,7 +566,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                         {fmtComma(scalpClosedPnl, 2)} $
                       </span>
                     </td>
-                    <td className="py-2.5 px-3 font-mono text-[#94a3b8]">Краткосрок · DCA по хаям/лоям</td>
+                    <td className="py-2.5 px-3 font-mono text-[#94a3b8]">Краткосрок · Сильные уровни S/R</td>
                     <td className="py-2.5 px-3 font-mono text-[#10b981]">
                       {closedScalpTrades.filter((t) => (t.net_profit ?? t.profit_abs ?? 0) > 0).length}В /{' '}
                       {closedScalpTrades.filter((t) => (t.net_profit ?? t.profit_abs ?? 0) <= 0).length}П

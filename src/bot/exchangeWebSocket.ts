@@ -393,7 +393,7 @@ function updatePositionsMarkPriceFromTicker(
 ): void {
   if (!(markPrice > 0)) return;
   for (const state of wsAccountStateByKey.values()) {
-    if (state.exchange !== sourceExchange) continue;
+    if (state.exchange !== sourceExchange || state.isTestnet) continue;
     let changed = false;
     let totalUnrealized = 0;
     for (const pos of state.positions) {
