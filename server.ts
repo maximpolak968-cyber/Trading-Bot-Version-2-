@@ -18,6 +18,9 @@ import {
   evaluateGlobalHedgeStrategy,
   canExecuteDca,
   calculateDynamicDcaAmount,
+  detectThreePhaseLevelReversal,
+  calculateBasketConvergenceBreakeven,
+  calculateTailBitePartialClose,
   checkCandleRejection,
   checkRsiCondition,
   isKnifeDrop,
@@ -1401,6 +1404,8 @@ interface PlannedDcaLevel {
   amount: number;
   distance_pct: number;
   manual_override?: boolean;
+  filled?: boolean;
+  filled_at?: string;
 }
 
 interface BotChartLevel {
@@ -1475,7 +1480,12 @@ interface FreqtradeTrade {
   pullback_min_profit_pct?: number;
   plan_notes?: string;
   campaign_id?: string;
+  campaign_role?: 'primary' | 'insurance' | 'standalone';
   campaign_banked_profit?: number;
+  rehedge_stop_price?: number;
+  rehedge_stop_qty?: number;
+  whipsaw_stop_price?: number;
+  tail_bites_count?: number;
   fee_open?: number;
   fee_close?: number;
   fee_total?: number;
@@ -1592,12 +1602,18 @@ function verifySafeProfitableClose(
       ? Math.max(computedGrossAtRef, freshExUnrealized)
       : (computedGrossAtRef ?? freshExUnrealized);
 
+  const bankedProfitUsdt = Math.max(0, Number(trade.campaign_banked_profit || 0));
+  const isUnloadingPriorityL2 = (trade.dca_count || 0) >= 2;
+  const maxAllowedUnloadingLoss = isUnloadingPriorityL2
+    ? Math.max(0, (trade.stake_amount || 0) * 0.1)
+    : 0;
+
   if (typeof effectiveGross === 'number' && Number.isFinite(effectiveGross)) {
-    const requiredGross = totalFees + slippageReserveUsdt;
+    const requiredGross = totalFees + slippageReserveUsdt - bankedProfitUsdt - maxAllowedUnloadingLoss;
     if (effectiveGross <= requiredGross) {
       return {
         ok: false,
-        reason: `Unrealized PnL (${effectiveGross.toFixed(3)}$) не перекрывает комиссии + резерв проскальзывания (${requiredGross.toFixed(3)}$)`,
+        reason: `Unrealized PnL (${effectiveGross.toFixed(3)}$ + банк ${bankedProfitUsdt.toFixed(2)}$) не перекрывает комиссии + резерв проскальзывания (${(totalFees + slippageReserveUsdt).toFixed(3)}$)`,
         slippageReserveUsdt,
         totalFees,
       };
@@ -1608,10 +1624,11 @@ function verifySafeProfitableClose(
     computedNetAtRef !== undefined
       ? Math.max(computedNetAtRef, trade.net_profit ?? trade.profit_abs ?? -Infinity)
       : (trade.net_profit ?? trade.profit_abs ?? 0);
-  if (effectiveNet <= slippageReserveUsdt) {
+  const cycleNetWithBank = effectiveNet + bankedProfitUsdt + maxAllowedUnloadingLoss;
+  if (cycleNetWithBank <= slippageReserveUsdt) {
     return {
       ok: false,
-      reason: `Расчётная чистая прибыль (${effectiveNet.toFixed(3)}$) <= резерва проскальзывания (${slippageReserveUsdt.toFixed(3)}$)`,
+      reason: `Расчётный чистый итог цикла (${(effectiveNet + bankedProfitUsdt).toFixed(3)}$) <= резерва проскальзывания (${slippageReserveUsdt.toFixed(3)}$)`,
       slippageReserveUsdt,
       totalFees,
     };
@@ -1733,22 +1750,44 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     trade.profit_abs = Number(netProfit.toFixed(4));
   }
 
-  const feeOpenPerCoin = trade.fee_open / totalAmount;
-  const exactBreakeven = trade.is_short
-    ? (openRate - feeOpenPerCoin) / (1 + exchangeFeeRate)
-    : (openRate + feeOpenPerCoin) / (1 - exchangeFeeRate);
-  trade.breakeven_price = roundPrice(exactBreakeven);
+  const bankedProfitUsdt = Math.max(0, Number(trade.campaign_banked_profit || 0));
+  if (bankedProfitUsdt > 0 || ((trade.dca_count || 0) > 0 && trade.campaign_id)) {
+    const basketBe = calculateBasketConvergenceBreakeven({
+      openRate,
+      amount: totalAmount,
+      isShort: trade.is_short,
+      bankedProfitUsdt,
+      feeOpenUsdt: trade.fee_open,
+      feeRate: exchangeFeeRate,
+      dcaCount: trade.dca_count || 0,
+      stakeAmount: trade.stake_amount,
+    });
+    trade.breakeven_price = roundPrice(basketBe.exactZeroCyclePrice);
+    trade.min_profitable_tp = roundPrice(
+      (trade.dca_count || 0) >= 2 ? basketBe.unloadingFloorPrice : basketBe.targetCycleExitPrice
+    );
+  } else {
+    const feeOpenPerCoin = trade.fee_open / totalAmount;
+    const exactBreakeven = trade.is_short
+      ? (openRate - feeOpenPerCoin) / (1 + exchangeFeeRate)
+      : (openRate + feeOpenPerCoin) / (1 - exchangeFeeRate);
+    trade.breakeven_price = roundPrice(exactBreakeven);
 
-  const rawMinProfitableTp = trade.is_short
-    ? exactBreakeven * (1 - MIN_NET_PROFIT_PRICE_BUFFER)
-    : exactBreakeven * (1 + MIN_NET_PROFIT_PRICE_BUFFER);
-  trade.min_profitable_tp = roundPrice(rawMinProfitableTp);
+    const rawMinProfitableTp = trade.is_short
+      ? exactBreakeven * (1 - MIN_NET_PROFIT_PRICE_BUFFER)
+      : exactBreakeven * (1 + MIN_NET_PROFIT_PRICE_BUFFER);
+    trade.min_profitable_tp = roundPrice(rawMinProfitableTp);
+  }
 
   const tpMove = (trade.dca_count || 0) > 0 ? 0.018 : 0.024;
 
   // Защита ручного TP: если пользователь сам перетащил TP (tp_manual_override === true), бот НИКОГДА не сбрасывает его в фоновых циклах!
   if (trade.tp_manual_override && trade.take_profit_abs > 0) {
     // Оставляем ровно тот TP, который выставил пользователь
+  } else if (bankedProfitUsdt > 0 && (trade.dca_count || 0) >= 1 && trade.min_profitable_tp) {
+    // После разворотного усреднения и фиксации страховочной ноги (Сценарий 3.4 и Раздел 5Б)
+    // подтягиваем рабочий TP к точке схлопывания корзины P_BE_cycle!
+    trade.take_profit_abs = trade.min_profitable_tp;
   } else {
     const isTpBelowMinProfitable = trade.is_short
       ? (trade.take_profit_abs || 0) <= 0 || (trade.take_profit_abs || 0) > trade.min_profitable_tp
@@ -1771,22 +1810,27 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     }
   }
 
-  // Чистый ожидаемый профит на уровне TP (за вычетом всех комиссий 0.06%)
+  // Чистый ожидаемый профит на уровне TP (за вычетом всех комиссий 0.06% + накопленный банк кампании)
   const tpExitFee = trade.take_profit_abs * totalAmount * TAKER_FEE_RATE;
   const tpGross =
     (trade.is_short ? openRate - trade.take_profit_abs : trade.take_profit_abs - openRate) *
     totalAmount;
-  const tpNet = tpGross - (trade.fee_open + tpExitFee);
+  const tpNet = tpGross - (trade.fee_open + tpExitFee) + bankedProfitUsdt;
   trade.take_profit_pct = Number(
     ((tpNet / Math.max(1e-8, trade.stake_amount)) * 100).toFixed(2)
   );
 
-  trade.stop_loss_abs = 0;
-  trade.stop_loss_pct = 0;
+  if (!trade.sl_manual_override && !(trade.stop_loss_abs > 0)) {
+    trade.stop_loss_abs = 0;
+    trade.stop_loss_pct = 0;
+  }
   trade.pullback_min_profit_pct = 3.0;
-  trade.planned_dca_levels = [];
-  trade.next_dca_price = undefined;
-  trade.dca_manual_override = false;
+  if (trade.campaign_role === 'insurance') {
+    trade.planned_dca_levels = [];
+    trade.next_dca_price = undefined;
+  } else if (Array.isArray(trade.planned_dca_levels) && trade.planned_dca_levels.length > 0) {
+    trade.next_dca_price = trade.planned_dca_levels[0]?.price;
+  }
 }
 
 function resolvePostDcaTakeProfit(
@@ -1879,12 +1923,12 @@ const botConfig = {
   leverage: Number(scalpBotConfig.leverage || 25),
   margin_mode: String(scalpBotConfig.margin_mode || 'cross'),
   max_open_trades: Number(scalpBotConfig.max_open_trades || 30),
-  dca_enabled: false,
-  max_dca_orders: 0,
+  dca_enabled: Boolean(scalpBotConfig.dca_enabled ?? true),
+  max_dca_orders: Number(scalpBotConfig.max_dca_orders ?? 2),
   dca_multiplier: 1.0,
   max_position_multiplier: Number(scalpBotConfig.max_position_multiplier || 6.0),
   min_liquidation_distance_pct: Number(scalpBotConfig.min_liquidation_distance_pct || 15.0),
-  max_margin_used_for_dca_pct: 0,
+  max_margin_used_for_dca_pct: Number(scalpBotConfig.max_margin_used_for_dca_pct || 60.0),
   max_pair_margin_pct: Number(scalpBotConfig.max_pair_margin_pct || 20.0),
   dca_scale_mode: 'linear',
   stoploss: Number(scalpBotConfig.stoploss ?? -1.0),
@@ -2569,8 +2613,12 @@ async function initializeBotTrades() {
         t.open_rate > 0 && t.take_profit_abs > 0
           ? Math.abs(t.take_profit_abs - t.open_rate) / t.open_rate
           : 0;
-      t.planned_dca_levels = [];
-      t.next_dca_price = undefined;
+      if (t.campaign_role === 'insurance') {
+        t.planned_dca_levels = [];
+        t.next_dca_price = undefined;
+      } else if (Array.isArray(t.planned_dca_levels) && t.planned_dca_levels.length > 0) {
+        t.next_dca_price = t.planned_dca_levels[0]?.price;
+      }
       const needsMtfRefresh = !t.tp_manual_override && tpDistRatio < 0.014;
       if (needsMtfRefresh) {
         const acc =
@@ -3031,30 +3079,36 @@ async function syncPositionsAndHistoryFromExchanges(
 
           if (sanitizedPosMargin > 0) {
             existingOpen.stake_amount = Number(sanitizedPosMargin.toFixed(2));
-            existingOpen.initial_stake = existingOpen.stake_amount;
+            if ((existingOpen.dca_count || 0) === 0) {
+              existingOpen.initial_stake = existingOpen.stake_amount;
+            }
           }
           existingOpen.leverage = pos.leverage || existingOpen.leverage;
 
           if (sizeChanged && pos.size > 0) {
             existingOpen.amount = Number(pos.size.toFixed(6));
-            existingOpen.initial_amount = existingOpen.amount;
+            if ((existingOpen.dca_count || 0) === 0) {
+              existingOpen.initial_amount = existingOpen.amount;
+            }
           }
 
           if (entryShifted && pos.entry_price > 0) {
             const exactEntry = roundPrice(pos.entry_price);
             existingOpen.open_rate = exactEntry;
-            existingOpen.initial_open_rate = exactEntry;
-            if (Array.isArray(existingOpen.orders) && existingOpen.orders.length > 0) {
-              existingOpen.orders[0].price = exactEntry;
-              existingOpen.orders[0].amount = existingOpen.amount;
-              existingOpen.orders[0].stake_amount = existingOpen.stake_amount;
+            if ((existingOpen.dca_count || 0) === 0) {
+              existingOpen.initial_open_rate = exactEntry;
+              if (Array.isArray(existingOpen.orders) && existingOpen.orders.length === 1) {
+                existingOpen.orders[0].price = exactEntry;
+                existingOpen.orders[0].amount = existingOpen.amount;
+                existingOpen.orders[0].stake_amount = existingOpen.stake_amount;
+              }
             }
           }
-          existingOpen.dca_count = 0;
-          existingOpen.last_dca_date = null;
 
-          existingOpen.planned_dca_levels = [];
-          existingOpen.next_dca_price = undefined;
+          if (existingOpen.campaign_role === 'insurance') {
+            existingOpen.planned_dca_levels = [];
+            existingOpen.next_dca_price = undefined;
+          }
           const hasTooCloseAutoTp =
             !existingOpen.tp_manual_override &&
             existingOpen.take_profit_abs > 0 &&
@@ -3722,8 +3776,319 @@ async function runScalpBotCycle(waitForActive = false) {
         closeExecPrice
       );
 
+      // Находим парную ногу хедж-кампании (если открыта)
+      const openSibling = trade.campaign_id
+        ? tradesStore.find(
+            (s) =>
+              s.is_open &&
+              resolveTradeUserId(s) === tradeUserId &&
+              tradeMatchesAccount(s, tradeAcc, tradeAccScopeId) &&
+              s.campaign_id === trade.campaign_id &&
+              s.trade_id !== trade.trade_id
+          )
+        : undefined;
+
+      // Определяем роль ноги в кампании (primary = 1.0x по тренду, insurance = 0.5x страховка против тренда)
+      if (trade.campaign_id && !trade.campaign_role && openSibling) {
+        if ((trade.initial_stake || trade.stake_amount) > (openSibling.initial_stake || openSibling.stake_amount) * 1.15) {
+          trade.campaign_role = 'primary';
+          openSibling.campaign_role = 'insurance';
+        } else if ((openSibling.initial_stake || openSibling.stake_amount) > (trade.initial_stake || trade.stake_amount) * 1.15) {
+          trade.campaign_role = 'insurance';
+          openSibling.campaign_role = 'primary';
+        }
+      }
+
+      // СЦЕНАРИЙ 4 (Пункт 4.3): Защита от «распила» (Whipsaw Stop) на повторно открытой страховочной позиции
+      if (
+        trade.campaign_role === 'insurance' &&
+        trade.whipsaw_stop_price &&
+        trade.whipsaw_stop_price > 0
+      ) {
+        const whipsawTriggered = trade.is_short
+          ? currentPrice >= trade.whipsaw_stop_price
+          : currentPrice <= trade.whipsaw_stop_price;
+        if (whipsawTriggered) {
+          let closedWhipsaw = false;
+          const lockKey = getPosLockKey(trade.account_id || tradeAccScopeId, trade.pair, trade.is_short);
+          await withPositionLock(lockKey, async () => {
+            if (!trade.is_open) {
+              closedWhipsaw = true;
+              return;
+            }
+            const closeOrderRes = await dispatchOrderToExchangeAccount(tradeAcc, {
+              pair: trade.pair,
+              action: 'CLOSE',
+              isShort: trade.is_short,
+              quantity: trade.amount,
+              referencePrice: closeExecPrice,
+              leverage: trade.leverage || 25,
+            });
+            if (tradeAcc && !isSimulatedTestApiKey(tradeAcc.api_key_raw) && !closeOrderRes?.success) {
+              return;
+            }
+            const actualClosePrice =
+              closeOrderRes?.success && closeOrderRes.price > 0
+                ? roundPrice(closeOrderRes.price)
+                : closeExecPrice;
+            const now = Date.now();
+            const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
+            sqliteDb.runInTransaction(() => {
+              trade.is_open = false;
+              trade.close_rate = actualClosePrice;
+              trade.current_rate = actualClosePrice;
+              trade.close_date = nowStr;
+              trade.close_timestamp = now;
+              trade.exit_reason = 'whipsaw_rehedge_stop';
+              trade.trade_state = 'CLOSED';
+              trade.whipsaw_stop_price = undefined;
+              recalculateTradeMetrics(trade, false);
+              sqliteDb.upsertTrade(trade);
+              if (openSibling) {
+                openSibling.campaign_banked_profit = Number(
+                  ((openSibling.campaign_banked_profit || 0) + (trade.net_profit ?? trade.profit_abs ?? 0)).toFixed(4)
+                );
+                recalculateTradeMetrics(openSibling, false);
+                sqliteDb.upsertTrade(openSibling);
+              }
+            });
+            appendLog(
+              'freqtrade.bot.hedge',
+              'WARNING',
+              `🛡️ [Whipsaw Guard] Повторная страховка #${trade.trade_id} [${trade.pair}] закрыта по короткому стопу ${actualClosePrice}$ (возврат цены за уровень L1). Основная позиция продолжает движение к разгрузке.`,
+              { userId: tradeUserId }
+            );
+            broadcastTradeLifecycleEvent('trade:closed', trade);
+            closedWhipsaw = true;
+          });
+          if (closedWhipsaw) continue;
+        }
+      }
+
+      // СЦЕНАРИЙ 4 (Пункт 4.1): Срабатывание защитного стоп-ордера повторного хеджирования (Re-Hedge Stop за тенью разворотной свечи)
+      if (
+        trade.rehedge_stop_price &&
+        trade.rehedge_stop_price > 0 &&
+        !openSibling &&
+        trade.campaign_id
+      ) {
+        const rehedgeTriggered = trade.is_short
+          ? currentPrice >= trade.rehedge_stop_price
+          : currentPrice <= trade.rehedge_stop_price;
+        if (rehedgeTriggered) {
+          const rehedgePrice = trade.rehedge_stop_price;
+          const storedWhipsawPrice =
+            trade.whipsaw_stop_price && trade.whipsaw_stop_price > 0
+              ? trade.whipsaw_stop_price
+              : roundPrice(rehedgePrice * (trade.is_short ? 0.996 : 1.004));
+          const rehedgeStake = Math.max(
+            botConfig.min_stake_amount || 5,
+            Number((trade.stake_amount * 0.5).toFixed(2))
+          );
+          trade.rehedge_stop_price = undefined;
+          trade.rehedge_stop_qty = undefined;
+          sqliteDb.upsertTrade(trade);
+
+          try {
+            const [{ candles: c4h }, { candles: c1d }] = await Promise.all([
+              fetchRealCandles(trade.pair, '4h', 120),
+              fetchRealCandles(trade.pair, '1d', 90),
+            ]);
+            const mtfRehedge = analyzeMultiTimeframe(trade.pair, candles1h, c4h, c1d);
+            const newInsuranceSide: 'long' | 'short' = trade.is_short ? 'long' : 'short';
+            const newInsuranceTrade = await createScalpBotPosition(
+              trade.pair,
+              newInsuranceSide,
+              currentPrice,
+              mtfRehedge,
+              c4h,
+              c1d,
+              `ReHedge_${newInsuranceSide === 'short' ? 'Short' : 'Long'}_L2`,
+              {
+                accountId: tradeAcc.id,
+                accountName: tradeAcc.name,
+                stake: rehedgeStake,
+                leverage: trade.leverage || 25,
+                campaignId: trade.campaign_id,
+                campaignRole: 'insurance',
+                whipsawStopPrice: storedWhipsawPrice,
+                strategyName: 'GlobalHedgeStrategy',
+                timeframeOverride: trade.timeframe || '4h',
+              }
+            );
+            appendLog(
+              'freqtrade.bot.hedge',
+              'WARNING',
+              `🔒 [Сценарий 4: Повторный лок] Ложный разворот на L1 по [${trade.pair}] (пробит Re-Hedge Stop ${rehedgePrice}$): открыта новая страховка #${newInsuranceTrade.trade_id} (${newInsuranceSide.toUpperCase()}, 0.5x от главной ноги = ${rehedgeStake}$) с защитой от распила ${storedWhipsawPrice}$ до уровня L2.`,
+              { userId: tradeUserId }
+            );
+          } catch (rehedgeErr: any) {
+            appendLog(
+              'freqtrade.bot.hedge',
+              'ERROR',
+              `⚠️ Ошибка открытия повторного лока [${trade.pair}]: ${rehedgeErr?.message || rehedgeErr}`,
+              { userId: tradeUserId }
+            );
+          }
+        }
+      }
+
+      // СЦЕНАРИЙ 6: Затяжной флэт в середине коридора (> 24 часов без доjścia до L1 и без усреднений)
+      if (
+        openSibling &&
+        (trade.dca_count || 0) === 0 &&
+        (openSibling.dca_count || 0) === 0 &&
+        trade.open_timestamp > 0 &&
+        Date.now() - trade.open_timestamp >= 24 * 3600 * 1000
+      ) {
+        const distFromEntryPct =
+          (Math.abs(currentPrice - trade.open_rate) / Math.max(1e-8, trade.open_rate)) * 100;
+        if (distFromEntryPct <= 0.15) {
+          for (const leg of [trade, openSibling]) {
+            if (!leg.is_open) continue;
+            const legLockKey = getPosLockKey(leg.account_id || tradeAccScopeId, leg.pair, leg.is_short);
+            await withPositionLock(legLockKey, async () => {
+              if (!leg.is_open) return;
+              const legExec = getFuturesExecutionPrice(leg.pair, leg.is_short, true, leg.exchange);
+              const legClosePrice =
+                legExec && legExec.executionPrice > 0 ? roundPrice(legExec.executionPrice) : currentPrice;
+              const closeRes = await dispatchOrderToExchangeAccount(tradeAcc, {
+                pair: leg.pair,
+                action: 'CLOSE',
+                isShort: leg.is_short,
+                quantity: leg.amount,
+                referencePrice: legClosePrice,
+                leverage: leg.leverage || 25,
+              });
+              if (tradeAcc && !isSimulatedTestApiKey(tradeAcc.api_key_raw) && !closeRes?.success) return;
+              const actualPrice =
+                closeRes?.success && closeRes.price > 0 ? roundPrice(closeRes.price) : legClosePrice;
+              const now = Date.now();
+              const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
+              sqliteDb.runInTransaction(() => {
+                leg.is_open = false;
+                leg.close_rate = actualPrice;
+                leg.current_rate = actualPrice;
+                leg.close_date = nowStr;
+                leg.close_timestamp = now;
+                leg.exit_reason = 'hedge_flat_corridor_exit';
+                leg.trade_state = 'CLOSED';
+                leg.planned_dca_levels = [];
+                recalculateTradeMetrics(leg, false);
+                sqliteDb.upsertTrade(leg);
+              });
+              broadcastTradeLifecycleEvent('trade:closed', leg);
+            });
+          }
+          appendLog(
+            'freqtrade.bot.hedge',
+            'INFO',
+            `⏳ [Сценарий 6: Выход из флэта] Кампания ${trade.campaign_id} [${trade.pair}] расформирована в точке исходного входа (${currentPrice}$) спустя >24ч затяжной пилы без касания уровней.`,
+            { userId: tradeUserId }
+          );
+          continue;
+        }
+      }
+
+      // СЦЕНАРИЙ 1 и СЦЕНАРИЙ 2: Цена идёт ПО ТРЕНДУ к уровню L1 при открытом асимметричном замке (Primary 1.0x + Insurance 0.5x)
+      if (
+        openSibling &&
+        trade.campaign_role === 'primary' &&
+        openSibling.campaign_role === 'insurance' &&
+        trade.take_profit_abs > 0
+      ) {
+        const nearOrBeyondPrimaryTp = trade.is_short
+          ? currentPrice <= trade.take_profit_abs * 1.0035
+          : currentPrice >= trade.take_profit_abs * 0.9965;
+        if (nearOrBeyondPrimaryTp) {
+          // Проверяем 3-фазный разворот от уровня L1 против основного тренда (если мы в шорте, L1 — поддержка, ждём отскок вверх true; если в лонге, L1 — сопротивление, ждём отбой вниз false)
+          const isBounceFromSupportAtTp = trade.is_short;
+          const levelReversalAtTp = detectThreePhaseLevelReversal(
+            candles1h,
+            trade.take_profit_abs,
+            isBounceFromSupportAtTp,
+            0.75
+          );
+          const primaryNetPnl = trade.net_profit ?? trade.profit_abs ?? 0;
+          const insuranceNetPnl = openSibling.net_profit ?? openSibling.profit_abs ?? 0;
+          const combinedCycleNetPnl = Number((primaryNetPnl + insuranceNetPnl).toFixed(4));
+
+          if (levelReversalAtTp.confirmed && combinedCycleNetPnl > 0.05 && closeProfitGuard.ok) {
+            // СЦЕНАРИЙ 1: На уровне L1 сформировался разворот -> закрываем ОБЕ позиции одновременно в чистый плюс за счёт перевеса 2:1!
+            for (const leg of [trade, openSibling]) {
+              const legLockKey = getPosLockKey(leg.account_id || tradeAccScopeId, leg.pair, leg.is_short);
+              await withPositionLock(legLockKey, async () => {
+                if (!leg.is_open) return;
+                const legExec = getFuturesExecutionPrice(leg.pair, leg.is_short, true, leg.exchange);
+                const legClosePrice =
+                  legExec && legExec.executionPrice > 0 ? roundPrice(legExec.executionPrice) : currentPrice;
+                const closeRes = await dispatchOrderToExchangeAccount(tradeAcc, {
+                  pair: leg.pair,
+                  action: 'CLOSE',
+                  isShort: leg.is_short,
+                  quantity: leg.amount,
+                  referencePrice: legClosePrice,
+                  leverage: leg.leverage || 25,
+                });
+                if (tradeAcc && !isSimulatedTestApiKey(tradeAcc.api_key_raw) && !closeRes?.success) return;
+                const actualPrice =
+                  closeRes?.success && closeRes.price > 0 ? roundPrice(closeRes.price) : legClosePrice;
+                const now = Date.now();
+                const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
+                sqliteDb.runInTransaction(() => {
+                  leg.is_open = false;
+                  leg.close_rate = actualPrice;
+                  leg.current_rate = actualPrice;
+                  leg.close_date = nowStr;
+                  leg.close_timestamp = now;
+                  leg.exit_reason = 'asymmetric_hedge_cycle_profit';
+                  leg.trade_state = 'CLOSED';
+                  leg.planned_dca_levels = [];
+                  recalculateTradeMetrics(leg, false);
+                  sqliteDb.upsertTrade(leg);
+                });
+                broadcastTradeLifecycleEvent('trade:closed', leg);
+              });
+            }
+            appendLog(
+              'freqtrade.bot.hedge',
+              'INFO',
+              `🏆 [Сценарий 1: Прибыль цикла 2:1] На уровне ${trade.take_profit_abs}$ подтверждён 3-фазный разворот (${levelReversalAtTp.reason}). Обе ноги [${trade.pair}] закрыты одновременно с чистым профитом корзины +${combinedCycleNetPnl}$!`,
+              { userId: tradeUserId }
+            );
+            continue;
+          }
+
+          // СЦЕНАРИЙ 2: Цена уверенно пробивает уровень L1 по тренду без разворота -> тралим стоп за пробитый уровень и переносим цель к L2
+          const brokeBeyondTp = trade.is_short
+            ? currentPrice <= trade.take_profit_abs * 0.995
+            : currentPrice >= trade.take_profit_abs * 1.005;
+          if (brokeBeyondTp && !levelReversalAtTp.confirmed && !trade.tp_manual_override) {
+            const brokenLevel = trade.take_profit_abs;
+            const trailedSl = roundPrice(brokenLevel * (trade.is_short ? 1.004 : 0.996));
+            const shiftedTp = roundPrice(brokenLevel * (trade.is_short ? 0.968 : 1.032));
+            trade.stop_loss_abs = trailedSl;
+            trade.take_profit_abs = shiftedTp;
+            trade.tp_reason = `Сценарий 2: пробой уровня ${brokenLevel}$ по тренду -> трал к L2 (${shiftedTp}$)`;
+            recalculateTradeMetrics(trade, false);
+            sqliteDb.upsertTrade(trade);
+            appendLog(
+              'freqtrade.bot.hedge',
+              'INFO',
+              `🚀 [Сценарий 2: Пробой по тренду] Уровень ${brokenLevel}$ [${trade.pair}] пробит без разворота: стоп подтянут за уровень (${trailedSl}$), цель перенесена к следующему уровню L2 (${shiftedTp}$).`,
+              { userId: tradeUserId }
+            );
+            broadcastTradeLifecycleEvent('trade:updated', trade);
+          }
+        }
+      }
+
       // 1A. Target TP check (serialized via withPositionLock so fast WS TP & cycle never double-close)
-      if (trade.take_profit_abs > 0) {
+      // ВАЖНО: Страховочная нога (insurance) при открытой основной ноге (primary) НЕ закрывается без 3-фазного разворота на сильном уровне (Сценарий 3 / Запрет №4)
+      const isInsuranceWaitingForLevelReversal =
+        trade.campaign_role === 'insurance' && Boolean(openSibling);
+
+      if (trade.take_profit_abs > 0 && !isInsuranceWaitingForLevelReversal) {
         const isTpHit = trade.is_short
           ? currentPrice <= trade.take_profit_abs || closeExecPrice <= trade.take_profit_abs
           : currentPrice >= trade.take_profit_abs || closeExecPrice >= trade.take_profit_abs;
@@ -3777,6 +4142,7 @@ async function runScalpBotCycle(waitForActive = false) {
               trade.exit_reason = 'roi_target_tp';
               trade.trade_state = 'CLOSED';
               trade.planned_dca_levels = [];
+              trade.rehedge_stop_price = undefined;
               recalculateTradeMetrics(trade, false);
               sqliteDb.upsertTrade(trade);
               sqliteDb.recordOrder({
@@ -3793,25 +4159,18 @@ async function runScalpBotCycle(waitForActive = false) {
                 notes: `Target TP hit at ${actualClosePrice}, Net PnL: +${trade.profit_abs} USDT (Fee total: ${trade.fee_total} USDT)`,
               });
 
-              if (trade.campaign_id) {
-                const sibling = tradesStore.find(
-                  (s) =>
-                    s.is_open &&
-                    resolveTradeUserId(s) === tradeUserId &&
-                    tradeMatchesAccount(s, tradeAcc, tradeAccScopeId) &&
-                    s.campaign_id === trade.campaign_id &&
-                    s.trade_id !== trade.trade_id
+              if (trade.campaign_id && openSibling) {
+                openSibling.campaign_banked_profit = Number(
+                  ((openSibling.campaign_banked_profit || 0) + (trade.net_profit || trade.profit_abs)).toFixed(4)
                 );
-                if (sibling) {
-                  sibling.campaign_banked_profit = trade.net_profit || trade.profit_abs;
-                  sqliteDb.upsertTrade(sibling);
-                  appendLog(
-                    'freqtrade.bot.hedge',
-                    'INFO',
-                    `🏦 Hedge Campaign ${trade.campaign_id} (${tradeAcc.name}): закрыта нога ${trade.pair} (${trade.is_short ? 'SHORT' : 'LONG'}) в чистый плюс +${trade.profit_abs}$ (после комиссии ${trade.fee_total}$). Вторая нога выводится в плюс через Smart DCA.`,
-                    { userId: tradeUserId }
-                  );
-                }
+                recalculateTradeMetrics(openSibling, false);
+                sqliteDb.upsertTrade(openSibling);
+                appendLog(
+                  'freqtrade.bot.hedge',
+                  'INFO',
+                  `🏦 Hedge Campaign ${trade.campaign_id} (${tradeAcc.name}): закрыта нога ${trade.pair} (${trade.is_short ? 'SHORT' : 'LONG'}) в чистый плюс +${trade.profit_abs}$ (после комиссии ${trade.fee_total}$). В банк кампании P_bank зачислено +${openSibling.campaign_banked_profit}$.`,
+                  { userId: tradeUserId }
+                );
               }
 
               if (tradeAcc) {
@@ -3862,8 +4221,11 @@ async function runScalpBotCycle(waitForActive = false) {
         }
       }
 
-      // 1C. 4H Hedge Campaign Second Leg Check — СТРОГО БЕЗ ЗАКРЫТИЯ В МИНУС!
-      if (trade.campaign_banked_profit !== undefined && trade.campaign_banked_profit !== null) {
+      // 1C. СЦЕНАРИЙ 3 (Пункт 3.4) и РАЗДЕЛ 5 (Иерархия целей L0/L1/L2 + «Откусывание хвоста»)
+      if (
+        (trade.campaign_banked_profit !== undefined && trade.campaign_banked_profit !== null && trade.campaign_banked_profit > 0) ||
+        (trade.dca_count || 0) >= 1
+      ) {
         if (closeProfitGuard.ok && currentPrice && trade.min_profitable_tp) {
           const reachedMinProfit = trade.is_short
             ? currentPrice <= trade.min_profitable_tp && closeExecPrice <= trade.min_profitable_tp
@@ -3915,9 +4277,14 @@ async function runScalpBotCycle(waitForActive = false) {
                     (closeOrderRes.realized_pnl_usdt - totalFees).toFixed(4)
                   );
                 }
-                trade.exit_reason = 'hedge_breakeven_profit';
+                trade.exit_reason =
+                  (trade.dca_count || 0) >= 2
+                    ? 'hedge_l2_unloading_exit'
+                    : 'hedge_breakeven_profit';
                 trade.trade_state = 'CLOSED';
                 trade.planned_dca_levels = [];
+                trade.rehedge_stop_price = undefined;
+                trade.rehedge_stop_qty = undefined;
                 recalculateTradeMetrics(trade, false);
                 sqliteDb.upsertTrade(trade);
                 sqliteDb.recordOrder({
@@ -3931,7 +4298,7 @@ async function runScalpBotCycle(waitForActive = false) {
                   fee: trade.fee_close || 0,
                   realized_pnl: trade.net_profit || trade.profit_abs,
                   action_type: 'HEDGE_PROFIT_EXIT',
-                  notes: `2-я нога хеджа выведена в чистый плюс +${trade.profit_abs} USDT (комиссия: ${trade.fee_total} USDT)`,
+                  notes: `Выход на отскоке по формуле общего безубытка корзины (${actualClosePrice}$), P_bank=${trade.campaign_banked_profit || 0}$`,
                 });
                 if (tradeAcc) {
                   const remAccOpen = tradesStore.filter(
@@ -3943,15 +4310,10 @@ async function runScalpBotCycle(waitForActive = false) {
                 }
               });
               cooldownPairs.set(`${tradeAcc.id}:${trade.pair}`, Date.now());
-              if (!isSimulatedTestApiKey(tradeAcc.api_key_raw) && typeof trade.exchange_realized_pnl !== 'number') {
-                setTimeout(() => {
-                  void syncRealExchangeBalancesIfNeeded(true);
-                }, 2200);
-              }
               appendLog(
                 'freqtrade.bot.hedge',
                 'INFO',
-                `⚖️ 2-я нога хеджа #${trade.trade_id} [${trade.pair}] (${tradeAcc.name}) выведена в чистый плюс по ${actualClosePrice}$ (+${trade.profit_abs}$ после комиссий ${trade.fee_total}$). Обе ноги кампании закрыты в плюс!`,
+                `⚖️ [Выход на отскоке] Позиция #${trade.trade_id} [${trade.pair}] (${tradeAcc.name}) закрыта по ${actualClosePrice}$ (DCA #${trade.dca_count || 0}, P_bank=${trade.campaign_banked_profit || 0}$). Ордер повторного хеджа снят, цикл завершён в плюс!`,
                 { userId: tradeUserId }
               );
               broadcastTradeLifecycleEvent('trade:closed', trade);
@@ -3960,11 +4322,336 @@ async function runScalpBotCycle(waitForActive = false) {
             if (closedHedgeInCycle) continue;
           }
         }
+
+        // РАЗДЕЛ 5В: Частичная разгрузка («Откусывание хвоста») за счёт накопленного банка страховки P_bank
+        if (
+          trade.is_open &&
+          (trade.dca_count || 0) >= 1 &&
+          (trade.campaign_banked_profit || 0) > 0.5 &&
+          Array.isArray(trade.orders) &&
+          trade.orders.length >= 2 &&
+          trade.min_profitable_tp
+        ) {
+          const lastDcaOrder = trade.orders[trade.orders.length - 1];
+          const bounceSpan = Math.abs(trade.min_profitable_tp - lastDcaOrder.price);
+          const currentBounce = trade.is_short
+            ? lastDcaOrder.price - currentPrice
+            : currentPrice - lastDcaOrder.price;
+          const bounceProgress = bounceSpan > 1e-8 ? currentBounce / bounceSpan : 0;
+          // Если отскок прошёл минимум 45% пути к точке безубытка и начал тормозить
+          if (bounceProgress >= 0.45 && bounceProgress < 0.96) {
+            const tailOrder = trade.orders[0];
+            const tailBite = calculateTailBitePartialClose({
+              orders: trade.orders,
+              currentPrice: closeExecPrice,
+              isShort: trade.is_short,
+              bankedProfitUsdt: trade.campaign_banked_profit || 0,
+              feeRate: getExchangeTakerFeeRate(tradeAcc.exchange),
+            });
+            if (tailBite.canBite && tailBite.closeQty > 0) {
+              const lockKey = getPosLockKey(trade.account_id || tradeAccScopeId, trade.pair, trade.is_short);
+              await withPositionLock(lockKey, async () => {
+                if (!trade.is_open) return;
+                const partCloseRes = await dispatchOrderToExchangeAccount(tradeAcc, {
+                  pair: trade.pair,
+                  action: 'CLOSE',
+                  isShort: trade.is_short,
+                  quantity: tailBite.closeQty,
+                  referencePrice: closeExecPrice,
+                  leverage: trade.leverage || 25,
+                });
+                if (tradeAcc && !isSimulatedTestApiKey(tradeAcc.api_key_raw) && !partCloseRes?.success) {
+                  return;
+                }
+                const ratioRemaining = tailBite.remainingQty / Math.max(1e-8, trade.amount);
+                sqliteDb.runInTransaction(() => {
+                  tailOrder.amount = Number(Math.max(0, tailOrder.amount - tailBite.closeQty).toFixed(4));
+                  tailOrder.stake_amount = Number((tailOrder.stake_amount * ratioRemaining).toFixed(2));
+                  trade.amount = tailBite.remainingQty;
+                  trade.stake_amount = Number((trade.stake_amount * ratioRemaining).toFixed(2));
+                  trade.open_rate = roundPrice(tailBite.newAvgEntryPrice);
+                  trade.campaign_banked_profit = tailBite.remainingBankProfit;
+                  trade.tail_bites_count = (trade.tail_bites_count || 0) + 1;
+                  recalculateTradeMetrics(trade, false);
+                  sqliteDb.upsertTrade(trade);
+                });
+                appendLog(
+                  'freqtrade.bot.hedge',
+                  'INFO',
+                  `✂️ [Откусывание хвоста] [${trade.pair}] #${trade.trade_id}: закрыт кусок верхнего хвоста ${tailBite.closeQty} за счёт банка P_bank (-${tailBite.consumedBankProfit}$). Новая средняя: ${trade.open_rate}$, остаток P_bank: ${trade.campaign_banked_profit}$`,
+                  { userId: tradeUserId }
+                );
+                broadcastTradeLifecycleEvent('trade:updated', trade);
+              });
+            }
+          }
+        }
       }
 
-      // Усреднение (DCA) полностью отключено: очищаем возможные старые плановые уровни DCA
-      trade.planned_dca_levels = [];
-      trade.next_dca_price = undefined;
+      // 1D. СЦЕНАРИЙ 3 и СЦЕНАРИЙ 5: Цена идёт ПРОТИВ основной позиции к сильному уровню L1/L2 -> Ждём 3-фазный разворот -> Закрываем страховку в банк P_bank -> Усредняем основную ногу + ставим Re-Hedge Stop
+      const maxAllowedDca = Math.min(3, Math.max(1, botConfig.max_dca_orders || 2));
+      const isPrimaryOrStandalone = trade.campaign_role !== 'insurance';
+      if (
+        botConfig.dca_enabled &&
+        isPrimaryOrStandalone &&
+        (trade.dca_count || 0) < maxAllowedDca
+      ) {
+        // Определяем целевой сильный уровень L1 или L2 для усреднения
+        let targetDcaLevelPrice = trade.next_dca_price || 0;
+        let targetDcaLevelObj = Array.isArray(trade.planned_dca_levels)
+          ? trade.planned_dca_levels.find((l) => !l.filled && l.step === (trade.dca_count || 0) + 1)
+          : undefined;
+        if (targetDcaLevelObj && targetDcaLevelObj.price > 0) {
+          targetDcaLevelPrice = targetDcaLevelObj.price;
+        } else if (!targetDcaLevelPrice || targetDcaLevelPrice <= 0) {
+          targetDcaLevelPrice = trade.is_short
+            ? trade.resistance_level || 0
+            : trade.support_level || 0;
+        }
+
+        if (targetDcaLevelPrice > 0) {
+          const isNearOrPastDcaLevel = trade.is_short
+            ? currentPrice >= targetDcaLevelPrice * 0.9965
+            : currentPrice <= targetDcaLevelPrice * 1.0035;
+
+          if (isNearOrPastDcaLevel) {
+            // СЦЕНАРИЙ 3 (Раздел 3): проверяем 3 фазы разворота (Фаза 1: Снятие ликвидности / Фаза 2: Пин-бар или поглощение / Фаза 3: Слом локальной структуры + фильтр ножа Сценария 5)
+            const isBounceFromSupport = !trade.is_short;
+            const reversalCheck = detectThreePhaseLevelReversal(
+              candles1h,
+              targetDcaLevelPrice,
+              isBounceFromSupport,
+              0.75
+            );
+
+            if (reversalCheck.confirmed) {
+              const { compoundedBalance } = getCompoundedAccountBalance(tradeAcc.id);
+              const accOpenTrades = tradesStore.filter(
+                (t) => t.is_open && tradeMatchesAccount(t, tradeAcc, tradeAccScopeId)
+              );
+              const usedMargin = accOpenTrades.reduce((s, t) => s + (t.stake_amount || 0), 0);
+              const otherActiveCoinsCount = new Set(
+                accOpenTrades.filter((t) => t.pair !== trade.pair).map((t) => t.pair)
+              ).size;
+              const dcaPermission = canExecuteDca({
+                pair: trade.pair,
+                dcaCount: trade.dca_count || 0,
+                initialAmount: trade.initial_amount || trade.amount,
+                currentAmount: trade.amount,
+                currentPrice,
+                openRate: trade.open_rate,
+                isShort: trade.is_short,
+                leverage: trade.leverage || 25,
+                totalBalanceUsdt: compoundedBalance,
+                usedMarginUsdt: usedMargin,
+                otherActiveCoinsCount,
+                campaignRole: trade.campaign_role === 'insurance' ? 'insurance' : 'primary',
+                hasOpenPrimarySibling: Boolean(openSibling && openSibling.campaign_role === 'primary'),
+              });
+
+              if (dcaPermission.allowed) {
+                const dcaSizing = calculateDynamicDcaAmount({
+                  currentAmount: trade.amount,
+                  openRate: trade.open_rate,
+                  currentPrice,
+                  isShort: trade.is_short,
+                  leverage: trade.leverage || 25,
+                  totalBalanceUsdt: compoundedBalance,
+                  usedMarginUsdt: usedMargin,
+                  otherActiveCoinsCount,
+                  maxPairMarginPct: botConfig.max_pair_margin_pct || 20,
+                  minStakeUsdt: botConfig.min_stake_amount || 5,
+                });
+
+                if (dcaSizing.addStake > 0 && dcaSizing.addAmount > 0) {
+                  // ШАГ 1 (Пункт 3.1): Если открыта страховочная позиция (Insurance) и она в плюсе — сначала фиксируем её прибыль в банк P_bank!
+                  if (openSibling && openSibling.is_open && openSibling.campaign_role === 'insurance') {
+                    const insLockKey = getPosLockKey(
+                      openSibling.account_id || tradeAccScopeId,
+                      openSibling.pair,
+                      openSibling.is_short
+                    );
+                    await withPositionLock(insLockKey, async () => {
+                      if (!openSibling.is_open) return;
+                      const insExec = getFuturesExecutionPrice(
+                        openSibling.pair,
+                        openSibling.is_short,
+                        true,
+                        openSibling.exchange
+                      );
+                      const insClosePrice =
+                        insExec && insExec.executionPrice > 0
+                          ? roundPrice(insExec.executionPrice)
+                          : currentPrice;
+                      const insCloseRes = await dispatchOrderToExchangeAccount(tradeAcc, {
+                        pair: openSibling.pair,
+                        action: 'CLOSE',
+                        isShort: openSibling.is_short,
+                        quantity: openSibling.amount,
+                        referencePrice: insClosePrice,
+                        leverage: openSibling.leverage || 25,
+                      });
+                      if (
+                        tradeAcc &&
+                        !isSimulatedTestApiKey(tradeAcc.api_key_raw) &&
+                        !insCloseRes?.success
+                      ) {
+                        return;
+                      }
+                      const actualInsClose =
+                        insCloseRes?.success && insCloseRes.price > 0
+                          ? roundPrice(insCloseRes.price)
+                          : insClosePrice;
+                      const now = Date.now();
+                      const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
+                      sqliteDb.runInTransaction(() => {
+                        openSibling.is_open = false;
+                        openSibling.close_rate = actualInsClose;
+                        openSibling.current_rate = actualInsClose;
+                        openSibling.close_date = nowStr;
+                        openSibling.close_timestamp = now;
+                        openSibling.exit_reason = 'hedge_insurance_profit_harvest';
+                        openSibling.trade_state = 'CLOSED';
+                        openSibling.planned_dca_levels = [];
+                        recalculateTradeMetrics(openSibling, false);
+                        sqliteDb.upsertTrade(openSibling);
+
+                        const harvestedProfit = Math.max(
+                          0,
+                          Number((openSibling.net_profit ?? openSibling.profit_abs ?? 0).toFixed(4))
+                        );
+                        trade.campaign_banked_profit = Number(
+                          ((trade.campaign_banked_profit || 0) + harvestedProfit).toFixed(4)
+                        );
+                        sqliteDb.upsertTrade(trade);
+                      });
+                      broadcastTradeLifecycleEvent('trade:closed', openSibling);
+                      appendLog(
+                        'freqtrade.bot.hedge',
+                        'INFO',
+                        `💰 [Сценарий 3.1: Фиксация страховки] Страховочная нога #${openSibling.trade_id} [${openSibling.pair}] закрыта на уровне L${(trade.dca_count || 0) + 1} (${actualInsClose}$). В банк кампании P_bank зачислено: +${trade.campaign_banked_profit}$`,
+                        { userId: tradeUserId }
+                      );
+                    });
+                  }
+
+                  // ШАГ 2 (Пункт 3.2): Усредняем основную позицию по рынку на подтверждённом развороте от уровня!
+                  const primaryLockKey = getPosLockKey(
+                    trade.account_id || tradeAccScopeId,
+                    trade.pair,
+                    trade.is_short
+                  );
+                  await withPositionLock(primaryLockKey, async () => {
+                    if (!trade.is_open) return;
+                    const dcaOrderRes = await dispatchOrderToExchangeAccount(tradeAcc, {
+                      pair: trade.pair,
+                      action: 'DCA',
+                      isShort: trade.is_short,
+                      quantity: dcaSizing.addAmount,
+                      referencePrice: currentPrice,
+                      leverage: trade.leverage || 25,
+                    });
+                    if (
+                      tradeAcc &&
+                      !isSimulatedTestApiKey(tradeAcc.api_key_raw) &&
+                      !dcaOrderRes?.success
+                    ) {
+                      return;
+                    }
+                    const fillPrice =
+                      dcaOrderRes?.success && dcaOrderRes.price > 0
+                        ? roundPrice(dcaOrderRes.price)
+                        : currentPrice;
+                    const fillQty =
+                      dcaOrderRes?.success && dcaOrderRes.qty > 0
+                        ? dcaOrderRes.qty
+                        : dcaSizing.addAmount;
+                    const now = Date.now();
+                    const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
+                    const newStep = (trade.dca_count || 0) + 1;
+
+                    sqliteDb.runInTransaction(() => {
+                      const prevTotalQty = trade.amount;
+                      const newTotalQty = Number((prevTotalQty + fillQty).toFixed(4));
+                      const weightedAvgPrice =
+                        (trade.open_rate * prevTotalQty + fillPrice * fillQty) /
+                        Math.max(1e-8, newTotalQty);
+                      trade.open_rate = roundPrice(weightedAvgPrice);
+                      trade.amount = newTotalQty;
+                      trade.stake_amount = Number(
+                        (trade.stake_amount + dcaSizing.addStake).toFixed(2)
+                      );
+                      trade.dca_count = newStep;
+                      trade.last_dca_date = nowStr;
+                      trade.trade_state = 'DCA_ACTIVE';
+
+                      // ШАГ 3 (Пункт 3.3): Ставим обязательный защитный стоп-ордер повторного хеджирования (Re-Hedge Stop) за тенью разворотной свечи!
+                      trade.rehedge_stop_price = roundPrice(reversalCheck.rehedgeStopPrice);
+                      trade.rehedge_stop_qty = Number((trade.amount * 0.5).toFixed(4));
+                      trade.whipsaw_stop_price = roundPrice(reversalCheck.whipsawStopPrice);
+
+                      if (!Array.isArray(trade.orders)) trade.orders = [];
+                      trade.orders.push({
+                        id: dcaOrderRes?.order_id || `ord-${trade.trade_id}-dca-${newStep}`,
+                        step: newStep,
+                        label: `Усреднение #${newStep} на уровне L${newStep} (3-фазный разворот)`,
+                        side: trade.is_short ? 'short' : 'long',
+                        price: fillPrice,
+                        amount: fillQty,
+                        stake_amount: dcaSizing.addStake,
+                        timestamp: now,
+                        date: nowStr,
+                      });
+
+                      if (Array.isArray(trade.planned_dca_levels)) {
+                        const curLvl = trade.planned_dca_levels.find((l) => l.step === newStep);
+                        if (curLvl) {
+                          curLvl.filled = true;
+                          curLvl.filled_at = nowStr;
+                        }
+                        const nextLvl = trade.planned_dca_levels.find(
+                          (l) => !l.filled && l.step === newStep + 1
+                        );
+                        trade.next_dca_price = nextLvl ? nextLvl.price : undefined;
+                      } else {
+                        trade.next_dca_price = undefined;
+                      }
+
+                      recalculateTradeMetrics(trade, false);
+                      if (!trade.tp_manual_override && trade.min_profitable_tp) {
+                        trade.take_profit_abs = trade.min_profitable_tp;
+                      }
+                      sqliteDb.upsertTrade(trade);
+                      sqliteDb.recordOrder({
+                        trade_id: trade.trade_id,
+                        pair: trade.pair,
+                        order_type: 'market',
+                        side: trade.is_short ? 'sell' : 'buy',
+                        price: fillPrice,
+                        amount: fillQty,
+                        cost: dcaSizing.addStake,
+                        fee: Number((fillPrice * fillQty * TAKER_FEE_RATE).toFixed(4)),
+                        realized_pnl: 0,
+                        action_type: 'DCA_REVERSAL_ENTRY',
+                        notes: `DCA #${newStep} @ ${fillPrice}$ (${reversalCheck.reason}) | Новая средняя: ${trade.open_rate}$ | Выход P_exit: ${trade.min_profitable_tp}$ | Re-Hedge Stop: ${trade.rehedge_stop_price}$`,
+                      });
+                    });
+
+                    appendLog(
+                      'freqtrade.bot.dca',
+                      'INFO',
+                      `🔄 [Сценарий 3: Разворотное усреднение #${newStep}] [${trade.pair}] #${trade.trade_id} @ ${fillPrice}$ (${reversalCheck.reason}) | Новая средняя: ${trade.open_rate}$ | Точка схлопывания корзины P_exit: ${trade.min_profitable_tp}$ (P_bank=${trade.campaign_banked_profit || 0}$) | Защитный Re-Hedge Stop за тенью: ${trade.rehedge_stop_price}$`,
+                      { userId: tradeUserId }
+                    );
+                    broadcastTradeLifecycleEvent('trade:updated', trade);
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+
       sqliteDb.upsertTrade(trade);
     }
 
@@ -4347,14 +5034,32 @@ async function openHedgeCampaign(
     return { longTrade: singleTrade, shortTrade: null };
   }
 
+  // Определяем доминирующий тренд старшего ТФ для асимметричного замка 2:1 (Раздел 1 Регламента)
+  const dominantBearish =
+    mtf.market_trend === 'BEARISH' ||
+    (mtf.market_trend === 'NEUTRAL' &&
+      (mtf.d1_trend === 'BEARISH' || mtf.d1_trend === 'MILD_BEARISH' || mtf.h4_trend === 'BEARISH'));
+  const primarySide: 'long' | 'short' = dominantBearish ? 'short' : 'long';
+  const longRole: 'primary' | 'insurance' = primarySide === 'long' ? 'primary' : 'insurance';
+  const shortRole: 'primary' | 'insurance' = primarySide === 'short' ? 'primary' : 'insurance';
+
+  const { compoundedBalance: accEquity } = getCompoundedAccountBalance(targetAcc.id);
+  const basePrimaryStake =
+    customOpts?.stake && customOpts.stake > 0
+      ? customOpts.stake
+      : Math.max(botConfig.min_stake_amount || 5, Number((accEquity * 0.005).toFixed(2)));
+  const halfInsuranceStake = Number((basePrimaryStake * 0.5).toFixed(2));
+  const longStake = longRole === 'primary' ? basePrimaryStake : halfInsuranceStake;
+  const shortStake = shortRole === 'primary' ? basePrimaryStake : halfInsuranceStake;
+
   appendLog(
     'freqtrade.bot.hedge',
     'INFO',
-    `⚖️ [GlobalHedgeStrategy] (${targetAcc.name}) Открываю 2-стороннюю кампанию (${customOpts?.horizon === 'LONG_TERM_1D' ? 'ДОЛГОСРОК 1D' : 'СРЕДНЕСРОК 4H'}) ${campaignId} [${cleanPair}] @ ${entryPrice}$: параллельный вход LONG + SHORT (0.5% от депозита аккаунта)`,
+    `⚖️ [Асимметричный Хедж 2:1] (${targetAcc.name}) Открываю кампанию ${campaignId} [${cleanPair}] @ ${entryPrice}$: Основная нога ${primarySide.toUpperCase()} (1.0x = ${basePrimaryStake}$) + Страховочная нога ${primarySide === 'long' ? 'SHORT' : 'LONG'} (0.5x = ${halfInsuranceStake}$)`,
     { userId: targetUserId }
   );
 
-  // 2. Open LONG and SHORT in parallel for this target account
+  // 2. Open LONG and SHORT in parallel with 2:1 asymmetric stake sizing
   const [longTrade, shortTrade] = await Promise.all([
     createScalpBotPosition(
       cleanPair,
@@ -4363,13 +5068,15 @@ async function openHedgeCampaign(
       mtf,
       candles4h,
       candles1d,
-      `${horizonTag}_Long`,
+      `${horizonTag}_Long_${longRole === 'primary' ? 'Primary1x' : 'Insurance0.5x'}`,
       {
         ...customOpts,
         accountId: targetAcc.id,
         accountName: customOpts?.accountName || targetAcc.name,
+        stake: longStake,
         customTp: customOpts?.longTpPrice,
         campaignId,
+        campaignRole: longRole,
         preloadedPairLevels,
         strategyName: 'GlobalHedgeStrategy',
         timeframeOverride: hedgeTimeframe,
@@ -4382,13 +5089,15 @@ async function openHedgeCampaign(
       mtf,
       candles4h,
       candles1d,
-      `${horizonTag}_Short`,
+      `${horizonTag}_Short_${shortRole === 'primary' ? 'Primary1x' : 'Insurance0.5x'}`,
       {
         ...customOpts,
         accountId: targetAcc.id,
         accountName: customOpts?.accountName || targetAcc.name,
+        stake: shortStake,
         customTp: customOpts?.shortTpPrice,
         campaignId,
+        campaignRole: shortRole,
         preloadedPairLevels,
         strategyName: 'GlobalHedgeStrategy',
         timeframeOverride: hedgeTimeframe,
@@ -4413,6 +5122,8 @@ async function createScalpBotPosition(
     customTp?: number;
     customSl?: number;
     campaignId?: string;
+    campaignRole?: 'primary' | 'insurance' | 'standalone';
+    whipsawStopPrice?: number;
     accountId?: string;
     accountName?: string;
     isCopyChild?: boolean;
@@ -4641,6 +5352,58 @@ async function createScalpBotPosition(
       initialOrderEntry.commission_usdt = Number(primaryOrderRes.commission_usdt.toFixed(4));
     }
 
+    const resolvedCampaignRole: 'primary' | 'insurance' | 'standalone' =
+      customOpts?.campaignRole || (customOpts?.campaignId ? 'primary' : 'standalone');
+
+    // Для основной позиции (primary / standalone) рассчитываем до 2 глобальных уровней усреднения (L1 и L2) на сильных зонах П/С 4H/1D
+    const plannedDcaLevels: NonNullable<FreqtradeTrade['planned_dca_levels']> = [];
+    if (botConfig.dca_enabled && resolvedCampaignRole !== 'insurance') {
+      const dcaLvl1 = findStrongestDcaLevel(
+        candles4h,
+        candles1d,
+        entryRate,
+        isShort,
+        2.6,
+        95.0,
+        customOpts?.candles1w
+      );
+      const l1Price = manualDcaSupLvl && !isShort
+        ? roundPrice(manualDcaSupLvl.price)
+        : manualDcaResLvl && isShort
+        ? roundPrice(manualDcaResLvl.price)
+        : roundPrice(dcaLvl1.price);
+
+      if (l1Price > 0) {
+        const l1Stake = Number((stake * 1.0).toFixed(2));
+        const l1Amount = Number(((l1Stake * leverage) / Math.max(1e-8, l1Price)).toFixed(4));
+        plannedDcaLevels.push({
+          step: 1,
+          label: `L1 Усреднение #1 (${dcaLvl1.source || '4H/1D S/R'} · сила ${dcaLvl1.strength_score || 16}★)`,
+          price: l1Price,
+          stake_amount: l1Stake,
+          amount: l1Amount,
+          distance_pct: Number(((Math.abs(l1Price - entryRate) / Math.max(1e-8, entryRate)) * 100).toFixed(2)),
+          filled: false,
+        });
+
+        // Глобальный уровень экстренной разгрузки L2 (Раздел 5В / Табу №1: максимум 2 усреднения за цикл)
+        const l2Price = roundPrice(dcaLvl1.second_price || 0);
+        if (l2Price > 0 && Math.abs(l2Price - l1Price) / Math.max(1e-8, l1Price) >= 0.02) {
+          const l2Stake = Number((stake * 1.5).toFixed(2));
+          const l2Amount = Number(((l2Stake * leverage) / Math.max(1e-8, l2Price)).toFixed(4));
+          plannedDcaLevels.push({
+            step: 2,
+            label: `L2 Экстренная разгрузка #2 (${dcaLvl1.source || '1D/1W S/R'})`,
+            price: l2Price,
+            stake_amount: l2Stake,
+            amount: l2Amount,
+            distance_pct: Number(((Math.abs(l2Price - entryRate) / Math.max(1e-8, entryRate)) * 100).toFixed(2)),
+            filled: false,
+          });
+        }
+      }
+    }
+
     const newTrade: FreqtradeTrade = {
       trade_id: id,
       pair: cleanPair,
@@ -4689,16 +5452,18 @@ async function createScalpBotPosition(
       leverage,
       support_level: effectiveSup,
       resistance_level: effectiveRes,
-      next_dca_price: undefined,
+      next_dca_price: plannedDcaLevels[0]?.price,
       trade_state: 'WAITING_PULLBACK',
       pullback_min_profit_pct: 0.5,
       plan_notes: planNotes,
       campaign_id: customOpts?.campaignId,
+      campaign_role: resolvedCampaignRole,
+      whipsaw_stop_price: customOpts?.whipsawStopPrice,
       user_id: targetUserId,
       account_id: targetAccId,
       account_name: customOpts?.accountName || targetExchangeAcc.name || 'Main',
       orders: [initialOrderEntry],
-      planned_dca_levels: [],
+      planned_dca_levels: plannedDcaLevels,
     };
 
     sqliteDb.runInTransaction(() => {

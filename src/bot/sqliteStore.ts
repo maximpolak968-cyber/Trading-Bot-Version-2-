@@ -297,6 +297,11 @@ export class SqliteBotDatabase {
       ['open_timestamp', 'INTEGER'],
       ['close_timestamp', 'INTEGER'],
       ['user_id', "TEXT DEFAULT 'owner'"],
+      ['campaign_role', 'TEXT'],
+      ['rehedge_stop_price', 'REAL'],
+      ['rehedge_stop_qty', 'REAL'],
+      ['whipsaw_stop_price', 'REAL'],
+      ['tail_bites_count', 'INTEGER DEFAULT 0'],
     ];
     for (const [col, def] of extraTradeCols) {
       try {
@@ -882,7 +887,8 @@ export class SqliteBotDatabase {
             tp_manual_override, sl_manual_override, dca_manual_override,
             planned_dca_json, orders_json, initial_open_rate,
             account_id, account_name, parent_trade_id,
-            current_rate, synced_accounts_json, open_timestamp, close_timestamp, user_id
+            current_rate, synced_accounts_json, open_timestamp, close_timestamp, user_id,
+            campaign_role, rehedge_stop_price, rehedge_stop_qty, whipsaw_stop_price, tail_bites_count
           ) VALUES (
             ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?,
@@ -896,6 +902,7 @@ export class SqliteBotDatabase {
             ?, ?, ?,
             ?, ?, ?,
             ?, ?, ?,
+            ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?
           )
         `);
@@ -953,7 +960,12 @@ export class SqliteBotDatabase {
           syncedAccJson,
           openTs,
           closeTs,
-          trade.user_id || 'owner'
+          trade.user_id || 'owner',
+          trade.campaign_role ?? null,
+          trade.rehedge_stop_price ?? null,
+          trade.rehedge_stop_qty ?? null,
+          trade.whipsaw_stop_price ?? null,
+          trade.tail_bites_count ?? 0
         );
       } else {
         const effectiveDcaCount = Math.max(
@@ -976,7 +988,8 @@ export class SqliteBotDatabase {
             initial_open_rate = ?,
             account_id = ?, account_name = ?, parent_trade_id = ?,
             current_rate = ?, synced_accounts_json = ?, open_timestamp = ?, close_timestamp = ?,
-            user_id = ?
+            user_id = ?,
+            campaign_role = ?, rehedge_stop_price = ?, rehedge_stop_qty = ?, whipsaw_stop_price = ?, tail_bites_count = ?
           WHERE id = ?
         `);
         stmt.run(
@@ -1027,6 +1040,11 @@ export class SqliteBotDatabase {
           openTs,
           closeTs,
           trade.user_id || 'owner',
+          trade.campaign_role ?? null,
+          trade.rehedge_stop_price ?? null,
+          trade.rehedge_stop_qty ?? null,
+          trade.whipsaw_stop_price ?? null,
+          trade.tail_bites_count ?? 0,
           trade.trade_id
         );
       }
@@ -1292,10 +1310,30 @@ export class SqliteBotDatabase {
           pullback_min_profit_pct: Number(r.pullback_min_profit_pct ?? 0.5),
           plan_notes: r.plan_notes ? String(r.plan_notes) : undefined,
           campaign_id: r.campaign_id ? String(r.campaign_id) : undefined,
+          campaign_role:
+            r.campaign_role === 'primary' || r.campaign_role === 'insurance'
+              ? r.campaign_role
+              : undefined,
           campaign_banked_profit:
             r.campaign_banked_profit !== null && r.campaign_banked_profit !== undefined
               ? Number(r.campaign_banked_profit)
               : undefined,
+          rehedge_stop_price:
+            r.rehedge_stop_price !== null && r.rehedge_stop_price !== undefined
+              ? Number(r.rehedge_stop_price)
+              : undefined,
+          rehedge_stop_qty:
+            r.rehedge_stop_qty !== null && r.rehedge_stop_qty !== undefined
+              ? Number(r.rehedge_stop_qty)
+              : undefined,
+          whipsaw_stop_price:
+            r.whipsaw_stop_price !== null && r.whipsaw_stop_price !== undefined
+              ? Number(r.whipsaw_stop_price)
+              : undefined,
+          tail_bites_count:
+            r.tail_bites_count !== null && r.tail_bites_count !== undefined
+              ? Number(r.tail_bites_count)
+              : 0,
           fee_open: Number(r.fee_open || 0),
           fee_close: Number(r.fee_close || 0),
           fee_total: Number(r.fee_total || 0),

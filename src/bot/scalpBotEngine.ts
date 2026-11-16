@@ -164,8 +164,8 @@ export const DEFAULT_SCALPBOT_CONFIG: BotConfigData = {
   use_stoploss: false,
   use_takeprofit: true,
   stoploss: -1.0,
-  dca_enabled: false,
-  max_dca_orders: 0,
+  dca_enabled: true,
+  max_dca_orders: 2,
   max_position_multiplier: 6.0,
   min_liquidation_distance_pct: 15.0,
   max_margin_used_for_dca_pct: 60.0,
@@ -173,8 +173,8 @@ export const DEFAULT_SCALPBOT_CONFIG: BotConfigData = {
   dca_scale_mode: 'linear',
   dca_pnl_step_pct: 25.0,
   dca_min_level_distance_pct: 20,
-  hedge_range_min_pct: 35,
-  hedge_range_max_pct: 65,
+  hedge_range_min_pct: 30,
+  hedge_range_max_pct: 70,
   hedge_min_range_width_pct: 3.0,
   hedge_max_partial_loss_pct: 50.0,
   stake_currency: 'USDT',
@@ -2603,6 +2603,15 @@ export interface GlobalHedgeEvaluation {
   short_dca_price: number;
   horizon: 'MEDIUM_TERM_4H' | 'LONG_TERM_1D';
   horizon_label: 'MEDIUM_TERM_4H' | 'LONG_TERM_1D';
+  dominant_trend: 'BULLISH' | 'BEARISH';
+  primary_side: 'long' | 'short';
+  insurance_side: 'long' | 'short';
+  primary_stake_multiplier: number;
+  insurance_stake_multiplier: number;
+  long_stake_multiplier: number;
+  short_stake_multiplier: number;
+  air_to_support_pct: number;
+  air_to_resistance_pct: number;
   reason: string;
 }
 
@@ -2633,6 +2642,15 @@ export function evaluateGlobalHedgeStrategy(
       short_dca_price: currentPrice * 1.035,
       horizon: 'MEDIUM_TERM_4H',
       horizon_label: 'MEDIUM_TERM_4H',
+      dominant_trend: 'BULLISH',
+      primary_side: 'long',
+      insurance_side: 'short',
+      primary_stake_multiplier: 1.0,
+      insurance_stake_multiplier: 0.5,
+      long_stake_multiplier: 1.0,
+      short_stake_multiplier: 0.5,
+      air_to_support_pct: 0,
+      air_to_resistance_pct: 0,
       reason: 'Недостаточно истории 4H/1D для среднесрочного 2-стороннего входа',
     };
   }
@@ -2642,32 +2660,63 @@ export function evaluateGlobalHedgeStrategy(
   const channelWidthPct =
     globalRes > globalSup ? ((globalRes - globalSup) / currentPrice) * 100.0 : 0;
 
-  // 2-сторонние сделки открываются в среднесрок и долгосрок в широком глобальном коридоре (>= 2.8%)
+  const airToSupPct =
+    currentPrice > 0 && globalSup > 0
+      ? Math.max(0, ((currentPrice - globalSup) / currentPrice) * 100.0)
+      : Math.max(0, mtf.dist_to_4h_sup_pct || 0);
+  const airToResPct =
+    currentPrice > 0 && globalRes > currentPrice
+      ? Math.max(0, ((globalRes - currentPrice) / currentPrice) * 100.0)
+      : Math.max(0, mtf.dist_to_4h_res_pct || 0);
+
+  // Определение доминирующего тренда на старшем ТФ (Раздел 1.2 и 2.2):
+  // Основная нога (1.0x V) открывается по тренду, Страховочная нога (0.5x V) — против тренда (перевес 2:1)
+  const isBearishDominant =
+    mtf.market_trend === 'BEARISH' ||
+    (mtf.market_trend === 'NEUTRAL' &&
+      (mtf.d1_trend === 'BEARISH' ||
+        mtf.d1_trend === 'MILD_BEARISH' ||
+        mtf.h4_trend === 'BEARISH' ||
+        (mtf.h4_trend === 'MILD_BEARISH' && mtf.rsi_4h < 48)));
+  const dominantTrend: 'BULLISH' | 'BEARISH' = isBearishDominant ? 'BEARISH' : 'BULLISH';
+  const primarySide: 'long' | 'short' = dominantTrend === 'BEARISH' ? 'short' : 'long';
+  const insuranceSide: 'long' | 'short' = primarySide === 'long' ? 'short' : 'long';
+  const primaryStakeMult = 1.0;
+  const insuranceStakeMult = 0.5;
+
+  // Раздел 2.2 — Правило «Запаса хода» (Фильтр середины диапазона):
+  // Категорически запрещено открывать замок вплотную к сильному уровню (Лонг под сопротивлением или Шорт над поддержкой).
+  // Вход разрешён только в середине диапазона (25%..75%) при наличии «воздуха» >= 1.4% в обе стороны и ширине коридора >= 3.0%.
   const posPct = Number.isFinite(mtf.pos_4h_pct) ? mtf.pos_4h_pct : 50;
-  const inEquilibriumZone = posPct >= 18.0 && posPct <= 82.0;
+  const inMidRangeCorridor = posPct >= 25.0 && posPct <= 75.0;
+  const hasEnoughAirBothSides = airToSupPct >= 1.4 && airToResPct >= 1.4;
   const safeRsiZone =
-    mtf.rsi_1d >= 16.0 &&
-    mtf.rsi_1d <= 84.0 &&
-    mtf.rsi_4h >= 16.0 &&
-    mtf.rsi_4h <= 84.0 &&
-    mtf.rsi_1h >= 16.0 &&
-    mtf.rsi_1h <= 84.0;
+    mtf.rsi_1d >= 18.0 &&
+    mtf.rsi_1d <= 82.0 &&
+    mtf.rsi_4h >= 18.0 &&
+    mtf.rsi_4h <= 82.0 &&
+    mtf.rsi_1h >= 18.0 &&
+    mtf.rsi_1h <= 82.0;
   const noExtremeImpulse = btcIsSafe && !isKnifeDrop(candles1h) && !isPumpExhaustion(candles1h);
 
   const shouldEnter =
-    channelWidthPct >= 2.8 && inEquilibriumZone && safeRsiZone && noExtremeImpulse;
+    channelWidthPct >= 3.0 &&
+    inMidRangeCorridor &&
+    hasEnoughAirBothSides &&
+    safeRsiZone &&
+    noExtremeImpulse;
 
-  // Цели TP для хеджа по реальным уровням канала 4H/1D (без жёсткого потолка 4.5%, с защитой от микро-цели ниже 0.75%)
-  const minSafeLongHedgeTp = currentPrice * 1.0075;
-  const minSafeShortHedgeTp = currentPrice * 0.9925;
+  // Цели TP для хеджа по сильным уровням канала 4H/1D (уровни $L_1$ по тренду и против тренда)
+  const minSafeLongHedgeTp = currentPrice * 1.012;
+  const minSafeShortHedgeTp = currentPrice * 0.988;
   const htfLongTarget = mtf.chart_targets_long?.find(
     (c) => (c.horizon === '4H' || c.horizon === '1D' || c.horizon === '1W') && c.price >= minSafeLongHedgeTp
   )?.price;
   const htfShortTarget = mtf.chart_targets_short?.find(
     (c) => (c.horizon === '4H' || c.horizon === '1D' || c.horizon === '1W') && c.price <= minSafeShortHedgeTp
   )?.price;
-  const rawLongTarget = globalRes > currentPrice ? globalRes * 0.996 : mtf.recommended_tp_long;
-  const rawShortTarget = globalSup > 0 && globalSup < currentPrice ? globalSup * 1.004 : mtf.recommended_tp_short;
+  const rawLongTarget = globalRes > currentPrice ? globalRes * 0.997 : mtf.recommended_tp_long;
+  const rawShortTarget = globalSup > 0 && globalSup < currentPrice ? globalSup * 1.003 : mtf.recommended_tp_short;
   const chosenLongHedgeTp = htfLongTarget && htfLongTarget < rawLongTarget ? htfLongTarget : rawLongTarget;
   const chosenShortHedgeTp = htfShortTarget && htfShortTarget > rawShortTarget ? htfShortTarget : rawShortTarget;
   const longTpPrice = Number(Math.max(minSafeLongHedgeTp, chosenLongHedgeTp).toPrecision(7));
@@ -2677,6 +2726,19 @@ export function evaluateGlobalHedgeStrategy(
   const shortDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, true, 3.0, 95.0, candles1w);
   const horizonLabel: 'MEDIUM_TERM_4H' | 'LONG_TERM_1D' =
     channelWidthPct >= 6.0 ? 'LONG_TERM_1D' : 'MEDIUM_TERM_4H';
+
+  let rejectDetail = '';
+  if (!shouldEnter) {
+    if (channelWidthPct < 3.0) {
+      rejectDetail = `узкий коридор ${channelWidthPct.toFixed(1)}% (< 3.0%)`;
+    } else if (!inMidRangeCorridor || !hasEnoughAirBothSides) {
+      rejectDetail = `нарушено правило запаса хода (поз. ${posPct.toFixed(0)}%, воздух до SUP=${airToSupPct.toFixed(2)}%, до RES=${airToResPct.toFixed(2)}%)`;
+    } else if (!noExtremeImpulse) {
+      rejectDetail = `импульсный пролив/памп или фильтр BTC`;
+    } else {
+      rejectDetail = `экстремальный RSI вне рабочей зоны`;
+    }
+  }
 
   return {
     strategy_name: 'GlobalHedgeStrategy',
@@ -2689,9 +2751,18 @@ export function evaluateGlobalHedgeStrategy(
     short_dca_price: shortDca.price,
     horizon: horizonLabel,
     horizon_label: horizonLabel,
+    dominant_trend: dominantTrend,
+    primary_side: primarySide,
+    insurance_side: insuranceSide,
+    primary_stake_multiplier: primaryStakeMult,
+    insurance_stake_multiplier: insuranceStakeMult,
+    long_stake_multiplier: primarySide === 'long' ? primaryStakeMult : insuranceStakeMult,
+    short_stake_multiplier: primarySide === 'short' ? primaryStakeMult : insuranceStakeMult,
+    air_to_support_pct: Number(airToSupPct.toFixed(2)),
+    air_to_resistance_pct: Number(airToResPct.toFixed(2)),
     reason: shouldEnter
-      ? `GlobalHedgeStrategy (${horizonLabel === 'LONG_TERM_1D' ? 'Долгосрок 1D' : 'Среднесрок 4H'}): глобальный коридор [${globalSup} .. ${globalRes}] (${channelWidthPct.toFixed(1)}%), позиция в канале ${posPct.toFixed(0)}%`
-      : `Коридор ${channelWidthPct.toFixed(1)}% (поз. ${posPct.toFixed(0)}%) вне зоны среднесрочного 2-стороннего входа`,
+      ? `Асимметричный 2:1 Хедж (${dominantTrend}: основная ${primarySide.toUpperCase()} 1.0x + страховочная ${insuranceSide.toUpperCase()} 0.5x): коридор [${globalSup} .. ${globalRes}] (${channelWidthPct.toFixed(1)}%), поз. ${posPct.toFixed(0)}% (запас хода -${airToSupPct.toFixed(1)}% / +${airToResPct.toFixed(1)}%)`
+      : `Вход в хедж отклонён: ${rejectDetail}`,
   };
 }
 
@@ -3057,9 +3128,440 @@ export function evaluateScalpingStrategy(
 }
 
 // ============================================================================
-// 7. 6-POINT CAN_DCA RISK GUARD (freqtrade/bot/freqtradebot.py::can_dca)
+// 7. ASYMMETRIC LEVEL HEDGE WITH REVERSAL AVERAGING:
+//    • 3-Phase Level Reversal Detector (Section 3: Sweep -> Pin-Bar/Engulfing -> ChoCH)
+//    • Basket Convergence Breakeven & Unloading Hierarchy (Section 5A, 5B, 5C)
+//    • Tail-Biting Partial Unloading ("Откусывание хвоста", Section 5C)
+//    • 6-Point DCA Risk & Taboo Guard (Section 6)
 // ============================================================================
 
+export interface ThreePhaseReversalResult {
+  confirmed: boolean;
+  phase1Sweep: boolean;
+  phase2Braking: boolean;
+  phase3StructureBreak: boolean;
+  wickExtremePrice: number;
+  rehedgeStopPrice: number;
+  whipsawStopPrice: number;
+  reason: string;
+}
+
+/**
+ * Раздел 3 регламента: Трёхфазное подтверждение разворота на сильном уровне (S/R).
+ * Касание уровня НЕ является сигналом. Действие (фиксация страховочной ноги + усреднение основной ноги)
+ * разрешено ТОЛЬКО после прохождения 3 фаз:
+ *   Фаза 1 (Sweep / Захват ликвидности): тень свечи заходит в зону уровня или прокалывает его (на повышенном объёме / сборе стопов).
+ *   Фаза 2 (Возврат и торможение — Пин-бар / Поглощение): тело закрывается обратно внутри уровня с отвергающей тенью, либо формируется поглощение.
+ *   Фаза 3 (Локальный слом структуры / ChoCH): закрытая свеча подтверждает импульс отскока, пробивая экстремум/тело тормозящей свечи, при отсутствии вертикального «ножа» (Сценарий 5).
+ */
+export function detectThreePhaseLevelReversal(
+  candles: OhlcvCandle[],
+  level: number,
+  isBounceFromSupport: boolean,
+  tolerancePct = 0.85,
+  zoneBounds?: { zoneLow?: number; zoneHigh?: number }
+): ThreePhaseReversalResult {
+  const emptyRes = (reason: string): ThreePhaseReversalResult => ({
+    confirmed: false,
+    phase1Sweep: false,
+    phase2Braking: false,
+    phase3StructureBreak: false,
+    wickExtremePrice: level,
+    rehedgeStopPrice: isBounceFromSupport ? level * 0.995 : level * 1.005,
+    whipsawStopPrice: isBounceFromSupport ? level * 1.003 : level * 0.997,
+    reason,
+  });
+
+  if (!candles || candles.length < 4 || !(level > 0)) {
+    return emptyRes('Недостаточно свечей для 3-фазного подтверждения разворота');
+  }
+
+  // Сценарий 5 (Новостной сквиз / пролёт уровня без торможения):
+  // если прямо сейчас летит вертикальный нож или безоткатная палка — уровень пропускается!
+  if (isBounceFromSupport && isKnifeDrop(candles)) {
+    return emptyRes('Сценарий 5 (Анти-нож): вертикальный пролив без торможения — уровень пропускается');
+  }
+  if (!isBounceFromSupport && isPumpExhaustion(candles)) {
+    return emptyRes('Сценарий 5 (Анти-памп): вертикальный памп без торможения — уровень пропускается');
+  }
+
+  const n = candles.length;
+  const cNow = candles[n - 1];
+  const cPrev = candles[n - 2];
+  const cPrev2 = candles[n - 3];
+  const recentWindow = [cPrev2, cPrev, cNow];
+
+  const volumes = candles.slice(-20).map((c) => c.volume || 0);
+  const avgVol =
+    volumes.length > 0 ? volumes.reduce((s, v) => s + v, 0) / volumes.length : 0;
+
+  if (isBounceFromSupport) {
+    const zoneTop =
+      zoneBounds?.zoneHigh && zoneBounds.zoneHigh > level
+        ? zoneBounds.zoneHigh
+        : level * (1 + tolerancePct / 100.0);
+    const zoneBot =
+      zoneBounds?.zoneLow && zoneBounds.zoneLow > 0 && zoneBounds.zoneLow < level
+        ? zoneBounds.zoneLow
+        : level * (1 - tolerancePct / 100.0);
+
+    const lowestWick = Math.min(...recentWindow.map((c) => c.low));
+    const maxRecentVol = Math.max(...recentWindow.map((c) => c.volume || 0));
+
+    // Фаза 1: Захват ликвидности (Sweep) — цена зашла в зону поддержки или кольнула тенью под уровень
+    const touchedZone = lowestWick <= zoneTop;
+    const sweptLiquidity =
+      lowestWick <= level * 1.003 ||
+      lowestWick <= zoneBot * 1.005 ||
+      (touchedZone && (avgVol <= 0 || maxRecentVol >= avgVol * 0.8));
+    const phase1Sweep = touchedZone && sweptLiquidity;
+
+    // Фаза 2: Возврат и торможение (Пин-бар с нижней тенью или бычье поглощение, закрытие тела выше/внутри уровня)
+    const hasPinBarRejection = recentWindow.some((c) => {
+      const range = Math.max(1e-9, c.high - c.low);
+      const body = Math.abs(c.close - c.open);
+      const lowerWick = Math.min(c.open, c.close) - c.low;
+      return (
+        c.low <= zoneTop &&
+        c.close >= zoneBot * 0.998 &&
+        (lowerWick / range >= 0.25 || lowerWick >= body * 0.6)
+      );
+    });
+    const hasBullishEngulfing =
+      (cNow.close > cNow.open &&
+        cPrev.close < cPrev.open &&
+        cNow.close >= cPrev.open &&
+        cPrev.low <= zoneTop) ||
+      (cPrev.close > cPrev.open &&
+        cPrev2.close < cPrev2.open &&
+        cPrev.close >= cPrev2.open &&
+        cPrev2.low <= zoneTop);
+    const returnedAboveLevel = cNow.close >= level * 0.9975 && cNow.close >= zoneBot;
+    const phase2Braking =
+      phase1Sweep && returnedAboveLevel && (hasPinBarRejection || hasBullishEngulfing);
+
+    // Фаза 3: Локальный слом структуры (ChoCH / подтверждающая закрытая бычья свеча вверх от уровня)
+    const brokePrevHighOrBody =
+      cNow.close > cNow.open &&
+      (cNow.close > cPrev.high ||
+        cNow.close > Math.max(cPrev.open, cPrev.close) ||
+        (cPrev.close > cPrev.open && cNow.close > cPrev.close && cNow.low >= cPrev.low));
+    const phase3StructureBreak = phase2Braking && brokePrevHighOrBody;
+
+    // Защитный стоп-ордер (Re-Hedge) ставится за тень разворотной свечи (-0.25% под экстремум тени)
+    const rehedgeStopPrice = Number((lowestWick * (1 - 0.0025)).toPrecision(7));
+    // Короткий стоп от распила для новой страховочной ноги (если уровень пробили, но цена резко вернулась выше уровня)
+    const whipsawStopPrice = Number((Math.max(level, zoneTop) * (1 + 0.0025)).toPrecision(7));
+
+    const confirmed = phase1Sweep && phase2Braking && phase3StructureBreak;
+    return {
+      confirmed,
+      phase1Sweep,
+      phase2Braking,
+      phase3StructureBreak,
+      wickExtremePrice: Number(lowestWick.toPrecision(7)),
+      rehedgeStopPrice,
+      whipsawStopPrice,
+      reason: confirmed
+        ? `3-фазный разворот от поддержки ${level}$ подтверждён (Sweep до ${lowestWick.toPrecision(6)}$ -> Пин-бар/Поглощение -> Слом структуры ChoCH @ ${cNow.close}$)`
+        : `Ожидание 3 фаз разворота у поддержки ${level}$ (Фаза1=${phase1Sweep}, Фаза2=${phase2Braking}, Фаза3=${phase3StructureBreak})`,
+    };
+  } else {
+    const zoneBot =
+      zoneBounds?.zoneLow && zoneBounds.zoneLow > 0 && zoneBounds.zoneLow < level
+        ? zoneBounds.zoneLow
+        : level * (1 - tolerancePct / 100.0);
+    const zoneTop =
+      zoneBounds?.zoneHigh && zoneBounds.zoneHigh > level
+        ? zoneBounds.zoneHigh
+        : level * (1 + tolerancePct / 100.0);
+
+    const highestWick = Math.max(...recentWindow.map((c) => c.high));
+    const maxRecentVol = Math.max(...recentWindow.map((c) => c.volume || 0));
+
+    // Фаза 1: Захват ликвидности (Sweep) — цена зашла в зону сопротивления или кольнула тенью над уровнем
+    const touchedZone = highestWick >= zoneBot;
+    const sweptLiquidity =
+      highestWick >= level * 0.997 ||
+      highestWick >= zoneTop * 0.995 ||
+      (touchedZone && (avgVol <= 0 || maxRecentVol >= avgVol * 0.8));
+    const phase1Sweep = touchedZone && sweptLiquidity;
+
+    // Фаза 2: Возврат и торможение (Пин-бар с верхней тенью или медвежье поглощение, закрытие тела под уровнем)
+    const hasPinBarRejection = recentWindow.some((c) => {
+      const range = Math.max(1e-9, c.high - c.low);
+      const body = Math.abs(c.close - c.open);
+      const upperWick = c.high - Math.max(c.open, c.close);
+      return (
+        c.high >= zoneBot &&
+        c.close <= zoneTop * 1.002 &&
+        (upperWick / range >= 0.25 || upperWick >= body * 0.6)
+      );
+    });
+    const hasBearishEngulfing =
+      (cNow.close < cNow.open &&
+        cPrev.close > cPrev.open &&
+        cNow.close <= cPrev.open &&
+        cPrev.high >= zoneBot) ||
+      (cPrev.close < cPrev.open &&
+        cPrev2.close > cPrev2.open &&
+        cPrev.close <= cPrev2.open &&
+        cPrev2.high >= zoneBot);
+    const returnedBelowLevel = cNow.close <= level * 1.0025 && cNow.close <= zoneTop;
+    const phase2Braking =
+      phase1Sweep && returnedBelowLevel && (hasPinBarRejection || hasBearishEngulfing);
+
+    // Фаза 3: Локальный слом структуры вниз (ChoCH / подтверждающая закрытая медвежья свеча вниз от уровня)
+    const brokePrevLowOrBody =
+      cNow.close < cNow.open &&
+      (cNow.close < cPrev.low ||
+        cNow.close < Math.min(cPrev.open, cPrev.close) ||
+        (cPrev.close < cPrev.open && cNow.close < cPrev.close && cNow.high <= cPrev.high));
+    const phase3StructureBreak = phase2Braking && brokePrevLowOrBody;
+
+    // Защитный стоп-ордер (Re-Hedge) ставится за верхнюю тень разворотной свечи (+0.25% над экстремумом тени)
+    const rehedgeStopPrice = Number((highestWick * (1 + 0.0025)).toPrecision(7));
+    // Короткий стоп от распила для новой страховочной ноги (если уровень пробили вверх, но цена резко вернулась под уровень)
+    const whipsawStopPrice = Number((Math.min(level, zoneBot) * (1 - 0.0025)).toPrecision(7));
+
+    const confirmed = phase1Sweep && phase2Braking && phase3StructureBreak;
+    return {
+      confirmed,
+      phase1Sweep,
+      phase2Braking,
+      phase3StructureBreak,
+      wickExtremePrice: Number(highestWick.toPrecision(7)),
+      rehedgeStopPrice,
+      whipsawStopPrice,
+      reason: confirmed
+        ? `3-фазный разворот от сопротивления ${level}$ подтверждён (Sweep до ${highestWick.toPrecision(6)}$ -> Пин-бар/Поглощение -> Слом структуры ChoCH @ ${cNow.close}$)`
+        : `Ожидание 3 фаз разворота у сопротивления ${level}$ (Фаза1=${phase1Sweep}, Фаза2=${phase2Braking}, Фаза3=${phase3StructureBreak})`,
+    };
+  }
+}
+
+export interface BasketConvergenceResult {
+  exactZeroCyclePrice: number;
+  targetCycleExitPrice: number;
+  unloadingFloorPrice: number;
+  totalCostsUsdt: number;
+  targetNetProfitUsdt: number;
+  bankedProfitUsdt: number;
+  netRequiredFromPrimaryUsdt: number;
+  priceShiftFromBankedProfit: number;
+  exitPriorityMode: 'PURE_PROFIT_L0' | 'CONVERGENCE_PROFIT_L1' | 'UNLOADING_PRIORITY_L2';
+}
+
+/**
+ * Раздел 5А, 5Б, 5В регламента:
+ * Формула расчёта единого безубытка корзины (Basket Convergence Breakeven) с учётом накопленного банка P_bank,
+ * всех комиссий (открытие + усреднения + закрытие + буфер фандинга/проскальзывания) и иерархии целей выхода.
+ *
+ * P_exit = P_avg - (P_bank - F_total - T_net) / Q_main   (для LONG основной ноги)
+ * P_exit = P_avg + (P_bank - F_total - T_net) / Q_main   (для SHORT основной ноги)
+ */
+export function calculateBasketConvergenceBreakeven(params: {
+  openRate: number;
+  amount: number;
+  isShort: boolean;
+  bankedProfitUsdt?: number;
+  feeOpenUsdt?: number;
+  feeRate?: number;
+  dcaCount?: number;
+  stakeAmount?: number;
+  slippageBufferPct?: number;
+}): BasketConvergenceResult {
+  const pAvg = Math.max(1e-8, Number(params.openRate || 0));
+  const qMain = Math.max(1e-8, Number(params.amount || 0));
+  const isShort = Boolean(params.isShort);
+  const pBank = Math.max(0, Number(params.bankedProfitUsdt || 0));
+  const feeRate = Math.max(0.0002, Number(params.feeRate ?? 0.0006));
+  const dcaCount = Math.max(0, Number(params.dcaCount || 0));
+  const stakeAmount = Math.max(1, Number(params.stakeAmount || (pAvg * qMain) / 25));
+  const slippagePct = Math.max(0.0012, Number(params.slippageBufferPct ?? 0.0018));
+
+  const notional = pAvg * qMain;
+  const fOpen =
+    typeof params.feeOpenUsdt === 'number' && params.feeOpenUsdt > 0
+      ? params.feeOpenUsdt
+      : notional * feeRate;
+  const fCloseEst = notional * feeRate;
+  const fSlippageAndFunding = notional * slippagePct;
+  const fTotal = Number((fOpen + fCloseEst + fSlippageAndFunding).toFixed(4));
+
+  // Иерархия целей выхода (Раздел 5В):
+  // • 0 усреднений (L0): чистый профит
+  // • 1 усреднение (L1): безубыток цикла + небольшой чистый профит (+0.18% от объёма)
+  // • 2+ усреднений (L2/L3): приоритет разгрузки тяжёлой позиции (допускается выход в 0 или малый контролируемый минус до -10% от маржи сделки)
+  let exitPriorityMode: BasketConvergenceResult['exitPriorityMode'] = 'PURE_PROFIT_L0';
+  let tNetTarget = notional * 0.0035;
+  let unloadingAllowedLoss = 0;
+
+  if (dcaCount === 1) {
+    exitPriorityMode = 'CONVERGENCE_PROFIT_L1';
+    tNetTarget = Math.max(0.05, notional * 0.0018);
+    unloadingAllowedLoss = 0;
+  } else if (dcaCount >= 2) {
+    exitPriorityMode = 'UNLOADING_PRIORITY_L2';
+    tNetTarget = 0;
+    // Допускается контролируемый малый убыток до 10% от задействованной маржи позиции (эквивалентно ~0.1%..0.3% от депозита, строго < лимита 1.5% из Раздела 5В)
+    unloadingAllowedLoss = stakeAmount * 0.1;
+  }
+
+  // Точка чистого нуля всего цикла (T_net = 0):
+  const netDeltaZero = pBank - fTotal;
+  const exactZeroCyclePrice = isShort
+    ? pAvg + netDeltaZero / qMain
+    : pAvg - netDeltaZero / qMain;
+
+  // Целевая цена выхода с учётом T_net:
+  const netDeltaTarget = pBank - fTotal - tNetTarget;
+  const targetCycleExitPrice = isShort
+    ? pAvg + netDeltaTarget / qMain
+    : pAvg - netDeltaTarget / qMain;
+
+  // Порог приоритетной разгрузки на 2-м/3-м уровне (с допуском малого контролируемого минус-выхода):
+  const netDeltaUnloading = pBank - fTotal + unloadingAllowedLoss;
+  const unloadingFloorPrice = isShort
+    ? pAvg + netDeltaUnloading / qMain
+    : pAvg - netDeltaUnloading / qMain;
+
+  const priceShiftFromBankedProfit = Number((pBank / qMain).toPrecision(7));
+
+  return {
+    exactZeroCyclePrice: Number(Math.max(1e-8, exactZeroCyclePrice).toPrecision(7)),
+    targetCycleExitPrice: Number(Math.max(1e-8, targetCycleExitPrice).toPrecision(7)),
+    unloadingFloorPrice: Number(Math.max(1e-8, unloadingFloorPrice).toPrecision(7)),
+    totalCostsUsdt: fTotal,
+    targetNetProfitUsdt: Number(tNetTarget.toFixed(4)),
+    bankedProfitUsdt: Number(pBank.toFixed(4)),
+    netRequiredFromPrimaryUsdt: Number((fTotal + tNetTarget - pBank).toFixed(4)),
+    priceShiftFromBankedProfit,
+    exitPriorityMode,
+  };
+}
+
+export interface TailBiteCalculationResult {
+  canBite: boolean;
+  closeQty: number;
+  consumedBankProfit: number;
+  remainingBankProfit: number;
+  newAvgEntryPrice: number;
+  remainingQty: number;
+  reason: string;
+}
+
+/**
+ * Раздел 5В регламента — Механика частичной разгрузки («Откусывание хвоста»):
+ * Если после усреднения (dcaCount >= 1) и накопления профита в P_bank импульс отскока затухает на полпути,
+ * бот использует P_bank, чтобы частично закрыть («откусить») самый дальний/убыточный кусок позиции (orders[0]).
+ * Убыток по закрываемой части полностью перекрывается накопленным P_bank (в ноль),
+ * а средняя цена входа оставшегося объёма смещается ещё ближе к текущей рыночной цене!
+ */
+export function calculateTailBitePartialClose(params: {
+  orders: Array<{ price: number; amount: number; stake_amount: number }>;
+  currentPrice: number;
+  isShort: boolean;
+  bankedProfitUsdt: number;
+  feeRate?: number;
+}): TailBiteCalculationResult {
+  const noBite = (reason: string): TailBiteCalculationResult => ({
+    canBite: false,
+    closeQty: 0,
+    consumedBankProfit: 0,
+    remainingBankProfit: Number((params.bankedProfitUsdt || 0).toFixed(4)),
+    newAvgEntryPrice: 0,
+    remainingQty: 0,
+    reason,
+  });
+
+  const orders = Array.isArray(params.orders) ? params.orders : [];
+  if (orders.length < 2) {
+    return noBite('Откусывание хвоста применяется только к усреднённым позициям (минимум 2 ордера в сетке)');
+  }
+  const currentPrice = Number(params.currentPrice || 0);
+  const banked = Number(params.bankedProfitUsdt || 0);
+  const feeRate = Math.max(0.0002, Number(params.feeRate ?? 0.0006));
+  if (!(currentPrice > 0) || !(banked > 0.05)) {
+    return noBite('Недостаточно накопленного профита P_bank для откусывания хвоста');
+  }
+
+  // Самый старый и далёкий от текущей цены ордер (хвост позиции)
+  const tailOrd = orders[0];
+  const tailPrice = Number(tailOrd?.price || 0);
+  const tailQty = Number(tailOrd?.amount || 0);
+  if (!(tailPrice > 0) || !(tailQty > 0)) {
+    return noBite('Некорректные параметры хвостового ордера');
+  }
+
+  // Проверяем, что хвост действительно находится в убытке относительно текущей цены
+  const tailLossPerUnitRaw = params.isShort
+    ? currentPrice - tailPrice
+    : tailPrice - currentPrice;
+  if (tailLossPerUnitRaw <= 0) {
+    return noBite('Хвостовой ордер уже в плюсе — частичное перекрытие убытка не требуется');
+  }
+
+  // Полный расход из P_bank на закрытие 1 единицы хвоста = курсовой убыток + комиссия открытия + комиссия закрытия + микро-резерв
+  const unitCostUsdt =
+    tailLossPerUnitRaw + (tailPrice + currentPrice) * feeRate + currentPrice * 0.0005;
+  const maxAffordableQty = banked / Math.max(1e-8, unitCostUsdt);
+
+  // Откусываем хвост, если накопленного профита хватает хотя бы на 35% от объёма первого входа
+  if (maxAffordableQty < tailQty * 0.35) {
+    return noBite(
+      `Банка P_bank (${banked.toFixed(2)}$) пока недостаточно для гашения ≥35% хвоста (доступно ${((maxAffordableQty / tailQty) * 100).toFixed(1)}%)`
+    );
+  }
+
+  const closeQty = Number(Math.min(tailQty, maxAffordableQty).toFixed(6));
+  if (!(closeQty > 0)) {
+    return noBite('Расчётный объём откусывания хвоста равен 0');
+  }
+
+  const consumedBankProfit = Number(Math.min(banked, closeQty * unitCostUsdt).toFixed(4));
+  const remainingBankProfit = Number(Math.max(0, banked - consumedBankProfit).toFixed(4));
+
+  // Пересчитываем новую среднюю цену входа и остаток позиции после откусывания хвоста
+  let remNotional = 0;
+  let remQty = 0;
+  const leftInTail = Math.max(0, tailQty - closeQty);
+  if (leftInTail > 1e-8) {
+    remNotional += leftInTail * tailPrice;
+    remQty += leftInTail;
+  }
+  for (let i = 1; i < orders.length; i++) {
+    const q = Math.max(0, Number(orders[i].amount || 0));
+    const p = Math.max(0, Number(orders[i].price || 0));
+    remNotional += q * p;
+    remQty += q;
+  }
+
+  if (remQty <= 1e-8) {
+    return noBite('После откусывания хвоста не остаётся рабочего объёма');
+  }
+
+  const newAvgEntryPrice = Number((remNotional / remQty).toPrecision(7));
+  return {
+    canBite: true,
+    closeQty,
+    consumedBankProfit,
+    remainingBankProfit,
+    newAvgEntryPrice,
+    remainingQty: Number(remQty.toFixed(6)),
+    reason: `Откусывание хвоста: закрытие ${closeQty} @ ${currentPrice}$ за счёт P_bank (-${consumedBankProfit}$), средняя цена смещается до ${newAvgEntryPrice}$`,
+  };
+}
+
+/**
+ * Раздел 6 регламента — 6-точечный риск-фильтр и жёсткие табу усреднения (canExecuteDca):
+ * 1. Лимит уровней усреднения: максимум 2–3 глобальных уровня (Табу №1).
+ * 2. Запрет на усреднение страховочной ноги при открытой основной ноге (Табу №2).
+ * 3. Проверка максимального множителя объёма позиции.
+ * 4. Проверка загрузки маржи счёта.
+ * 5. Проверка доли маржи одной торговой пары.
+ * 6. Проверка безопасной дистанции до ликвидации после усреднения.
+ */
 export function canExecuteDca(
   params: {
     pair: string;
@@ -3073,8 +3575,10 @@ export function canExecuteDca(
     totalBalanceUsdt: number;
     usedMarginUsdt: number;
     otherActiveCoinsCount?: number;
+    campaignRole?: 'primary' | 'insurance';
+    hasOpenPrimarySibling?: boolean;
   },
-  _config: BotConfigData = DEFAULT_SCALPBOT_CONFIG
+  config: BotConfigData = DEFAULT_SCALPBOT_CONFIG
 ): {
   allowed: boolean;
   reason: string;
@@ -3084,19 +3588,124 @@ export function canExecuteDca(
   maxAllowedDca: number;
 } {
   const baseAmt = params.initialAmount > 0 ? params.initialAmount : params.currentAmount;
-  const currentMultiplier = baseAmt > 0 ? Number((params.currentAmount / baseAmt).toFixed(2)) : 1.0;
+  const currentMultiplier =
+    baseAmt > 0 ? Number((params.currentAmount / baseAmt).toFixed(2)) : 1.0;
+  const maxAllowedDca = Math.min(3, Math.max(0, Number(config.max_dca_orders ?? 2)));
+
+  if (!config.dca_enabled || maxAllowedDca <= 0) {
+    return {
+      allowed: false,
+      reason: 'Усреднение (DCA) отключено в конфигурации',
+      multiplier: currentMultiplier,
+      liquidationDistancePct: 100,
+      postDcaLiquidationDistancePct: 100,
+      maxAllowedDca: 0,
+    };
+  }
+
+  // Табу №2 (Раздел 6.2): Запрещено усреднять страховочную ногу, пока открыта основная нога!
+  if (params.campaignRole === 'insurance' && params.hasOpenPrimarySibling) {
+    return {
+      allowed: false,
+      reason:
+        'Табу №2 (Раздел 6.2): Категорически запрещено усреднять страховочную ногу при активной основной ноге',
+      multiplier: currentMultiplier,
+      liquidationDistancePct: 100,
+      postDcaLiquidationDistancePct: 100,
+      maxAllowedDca,
+    };
+  }
+
+  // Табу №1 (Раздел 6.1): Лимит уровней усреднения (максимум 2–3 глобальных уровня)
+  if (params.dcaCount >= maxAllowedDca) {
+    return {
+      allowed: false,
+      reason: `Табу №1 (Раздел 6.1): Достигнут лимит глобальных уровней усреднения (${params.dcaCount}/${maxAllowedDca}) — приоритет разгрузки на отскоке`,
+      multiplier: currentMultiplier,
+      liquidationDistancePct: 100,
+      postDcaLiquidationDistancePct: 100,
+      maxAllowedDca,
+    };
+  }
+
+  const maxMult = Math.max(2.0, Number(config.max_position_multiplier || 6.0));
+  if (currentMultiplier >= maxMult) {
+    return {
+      allowed: false,
+      reason: `Превышен максимальный множитель объёма позиции (${currentMultiplier}x >= ${maxMult}x)`,
+      multiplier: currentMultiplier,
+      liquidationDistancePct: 100,
+      postDcaLiquidationDistancePct: 100,
+      maxAllowedDca,
+    };
+  }
+
+  const totalBal = Math.max(1, Number(params.totalBalanceUsdt || 0));
+  const usedMarginPct = (Math.max(0, Number(params.usedMarginUsdt || 0)) / totalBal) * 100.0;
+  const maxMarginPct = Math.max(20, Number(config.max_margin_used_for_dca_pct || 60.0));
+  if (usedMarginPct >= maxMarginPct) {
+    return {
+      allowed: false,
+      reason: `Загрузка маржи счёта (${usedMarginPct.toFixed(1)}%) выше лимита безопасности для усреднения (${maxMarginPct}%)`,
+      multiplier: currentMultiplier,
+      liquidationDistancePct: 100,
+      postDcaLiquidationDistancePct: 100,
+      maxAllowedDca,
+    };
+  }
+
+  const lev = Math.max(1, Number(params.leverage || 25));
+  const currentPosMargin = (params.currentAmount * params.openRate) / lev;
+  const pairMarginPct = (currentPosMargin / totalBal) * 100.0;
+  const maxPairMarginPct = Math.max(5, Number(config.max_pair_margin_pct || 20.0));
+  if (pairMarginPct >= maxPairMarginPct) {
+    return {
+      allowed: false,
+      reason: `Маржа по паре ${params.pair} (${pairMarginPct.toFixed(1)}%) достигла лимита на одну монету (${maxPairMarginPct}%)`,
+      multiplier: currentMultiplier,
+      liquidationDistancePct: 100,
+      postDcaLiquidationDistancePct: 100,
+      maxAllowedDca,
+    };
+  }
+
+  // Оценка дистанции до ликвидации до и после добавления рабочего объёма
+  const addQty = Math.max(baseAmt, params.currentAmount);
+  const newTotalQty = params.currentAmount + addQty;
+  const newAvgRate =
+    (params.currentAmount * params.openRate + addQty * params.currentPrice) /
+    Math.max(1e-8, newTotalQty);
+  const newPosNotional = newTotalQty * newAvgRate;
+  const freeCollateral = Math.max(0, totalBal - Math.max(0, params.usedMarginUsdt - currentPosMargin));
+  const liqBufferPct =
+    newPosNotional > 0 ? Math.min(95, (freeCollateral / newPosNotional) * 100.0) : 100;
+  const minLiqDist = Math.max(5, Number(config.min_liquidation_distance_pct || 15.0));
+
+  if (liqBufferPct < minLiqDist) {
+    return {
+      allowed: false,
+      reason: `Запас до ликвидации после усреднения (${liqBufferPct.toFixed(1)}%) меньше безопасного порога (${minLiqDist}%)`,
+      multiplier: currentMultiplier,
+      liquidationDistancePct: Number(liqBufferPct.toFixed(2)),
+      postDcaLiquidationDistancePct: Number(liqBufferPct.toFixed(2)),
+      maxAllowedDca,
+    };
+  }
+
   return {
-    allowed: false,
-    reason: 'Усреднение (DCA) полностью отключено в боте',
+    allowed: true,
+    reason: `Разворотное усреднение разрешено (уровень #${params.dcaCount + 1}/${maxAllowedDca}, маржа=${usedMarginPct.toFixed(1)}%, запас до ликв.=${liqBufferPct.toFixed(1)}%)`,
     multiplier: currentMultiplier,
-    liquidationDistancePct: 100,
-    postDcaLiquidationDistancePct: 100,
-    maxAllowedDca: 0,
+    liquidationDistancePct: Number(liqBufferPct.toFixed(2)),
+    postDcaLiquidationDistancePct: Number(liqBufferPct.toFixed(2)),
+    maxAllowedDca,
   };
 }
 
 /**
- * DCA is permanently disabled in the bot. Always returns zero additional amount.
+ * Рассчитывает рабочий объём разворотного усреднения основной ноги на сильном уровне S/R
+ * так, чтобы подтянуть среднюю цену входа P_avg максимально близко к уровню разворота
+ * без нарушения лимитов маржи и ликвидации.
  */
 export function calculateDynamicDcaAmount(params: {
   currentAmount: number;
@@ -3110,11 +3719,62 @@ export function calculateDynamicDcaAmount(params: {
   maxPairMarginPct?: number;
   minStakeUsdt?: number;
 }): { addAmount: number; addStake: number; targetAvgPrice: number; pullDistancePct: number } {
+  const curAmt = Math.max(0, Number(params.currentAmount || 0));
+  const openRate = Math.max(0, Number(params.openRate || 0));
+  const curPrice = Math.max(0, Number(params.currentPrice || 0));
+  const lev = Math.max(1, Number(params.leverage || 25));
+  const totalBal = Math.max(0, Number(params.totalBalanceUsdt || 0));
+  const usedMargin = Math.max(0, Number(params.usedMarginUsdt || 0));
+  const maxPairPct = Math.max(5, Number(params.maxPairMarginPct || 20.0));
+  const minStake = Math.max(2, Number(params.minStakeUsdt || 5));
+
+  if (curAmt <= 0 || openRate <= 0 || curPrice <= 0 || totalBal <= 0) {
+    return {
+      addAmount: 0,
+      addStake: 0,
+      targetAvgPrice: Number(openRate.toPrecision(7)),
+      pullDistancePct: 0,
+    };
+  }
+
+  const curStake = (curAmt * openRate) / lev;
+  const maxAllowedPairStake = totalBal * (maxPairPct / 100.0);
+  const availableAccountMargin = Math.max(0, totalBal * 0.6 - usedMargin);
+  const maxAddStake = Math.min(
+    Math.max(0, maxAllowedPairStake - curStake),
+    availableAccountMargin
+  );
+
+  // Базовый рабочий шаг разворотного усреднения: 1.0x от текущего объёма позиции (подтягивает P_avg ровно на 50% к уровню,
+  // а с учётом накопленного профита P_bank со страховочной ноги сдвигает безубыток цикла P_BE_cycle прямо к уровню отскока)
+  const desiredStake = Math.max(minStake, curStake * 1.0);
+  const finalAddStake = Number(Math.min(desiredStake, maxAddStake).toFixed(2));
+  if (finalAddStake < minStake * 0.5) {
+    return {
+      addAmount: 0,
+      addStake: 0,
+      targetAvgPrice: Number(openRate.toPrecision(7)),
+      pullDistancePct: 0,
+    };
+  }
+
+  const addAmount = Number(((finalAddStake * lev) / curPrice).toFixed(6));
+  const totalNewAmt = curAmt + addAmount;
+  const targetAvgPrice =
+    totalNewAmt > 0
+      ? Number(((curAmt * openRate + addAmount * curPrice) / totalNewAmt).toPrecision(7))
+      : openRate;
+  const rawDist = Math.abs(openRate - curPrice);
+  const newDist = Math.abs(targetAvgPrice - curPrice);
+  const pullDistancePct =
+    rawDist > 1e-8 ? Number((((rawDist - newDist) / rawDist) * 100.0).toFixed(1)) : 50.0;
+
   return {
-    addAmount: 0,
-    addStake: 0,
-    targetAvgPrice: Number((params.openRate || 0).toPrecision(7)),
-    pullDistancePct: 0,
+    addAmount,
+    addStake: finalAddStake,
+    targetAvgPrice,
+    pullDistancePct,
   };
 }
+
 
