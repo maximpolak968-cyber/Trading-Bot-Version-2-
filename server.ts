@@ -2431,13 +2431,14 @@ async function getOrComputeMtfBotLevels(
           (Math.abs(existing.price - p) / Math.max(1e-8, existing.price)) * 100 >= minDistPct
       );
 
-    // На дневном (1D) и недельном (1W) графике отображаем СТРОГО 2 главных уровня (1 глобальная поддержка SUP и 1 глобальное сопротивление RES) без нагромождения лишних линий.
-    // На младших/рабочих таймфреймах (15m, 30m, 1h, 4h) добавляем максимум 1 сильнейший уровень поддержки и 1 сильнейший уровень сопротивления выбранного таймфрейма,
-    // и только если он отстоит от глобального уровня минимум на 2.5%–4.0% (чтобы плашки и линии никогда не слипались).
-    if (normTf !== '1d' && normTf !== '1w' && activeCandles.length >= 30 && liveRefPrice > 0) {
+    // Раздел 2А Регламента («Фильтр: Локальные уровни младших таймфреймов внутри текущего дня полностью игнорируются»):
+    // На дневном (1D) и недельном (1W) графике отображаем СТРОГО 2 главных уровня (1 глобальная поддержка SUP и 1 глобальное сопротивление RES).
+    // Дополнительные структурные уровни разрешены ТОЛЬКО со старших таймфреймов (>= 4H: 4h, 6h, 12h), а мелкие внутридневные уровни (15m, 30m, 1h, 2h) полностью игнорируются!
+    const isHtfStructuralAllowed = normTf === '4h' || normTf === '6h' || normTf === '12h';
+    if (isHtfStructuralAllowed && activeCandles.length >= 30 && liveRefPrice > 0) {
       const tfStrong = extractStrongTimeframeLevels(activeCandles, normTf, liveRefPrice, 1);
       const tfLabelPrefix = normTf.toUpperCase();
-      const minSepForTf = normTf === '4h' || normTf === '6h' || normTf === '12h' ? 4.0 : normTf === '1h' || normTf === '2h' ? 3.0 : 2.2;
+      const minSepForTf = 4.0;
 
       const tfBestSup = tfStrong.supports[0];
       if (tfBestSup && isFarFromExisting(roundPrice(tfBestSup.price), minSepForTf)) {
@@ -3181,10 +3182,21 @@ async function syncPositionsAndHistoryFromExchanges(
           }
           recalculateTradeMetrics(existingOpen, false);
 
-          // Если на самой бирже у открытой позиции нет TP (pos.take_profit <= 0) или TP отличается от расчётного на сайте — автоматически выставляем/синхронизируем TP на бирже
+          // Если у позиции НЕТ активной второй ноги замка (то есть страховка уже закрыта и идёт сведение, либо одиночная сделка), синхронизируем TP на бирже.
+          // Пока открыты ОБЕ ноги замка, биржевой лимитный TP не ставится, так как по Разделу 3, Сценарию 1 и Сценарию 2 касание уровня не является сигналом к закрытию одной ноги!
+          const hasActiveLockSibling = Boolean(
+            existingOpen.campaign_id &&
+              tradesStore.some(
+                (s) =>
+                  s.is_open &&
+                  s.campaign_id === existingOpen.campaign_id &&
+                  s.trade_id !== existingOpen.trade_id
+              )
+          );
           const exPosTp = Number(pos.take_profit || 0);
           if (
             !isSimulatedTestApiKey(creds.apiKey) &&
+            !hasActiveLockSibling &&
             existingOpen.campaign_role !== 'insurance' &&
             existingOpen.take_profit_abs > 0 &&
             (!(exPosTp > 0) ||
@@ -3784,7 +3796,10 @@ async function runScalpBotCycle(waitForActive = false) {
       if (!tradeAcc || !tradeAcc.enabled || isUserBotStopped(tradeAcc.user_id || 'owner')) continue;
       const tradeAccScopeId = getTargetAccountIdForRecord(tradeAcc);
       const tradeUserId = resolveTradeUserId(trade);
-      const { candles: candles1h } = await fetchRealCandles(trade.pair, trade.timeframe || botConfig.timeframe, 60);
+      // Раздел 3 (Фаза 3: Локальный слом структуры на младшем таймфрейме):
+      // Всегда запрашиваем свечи рабочего младшего ТФ (botConfig.timeframe = 1h/15m), чтобы 3-фазный разворот проверялся именно на младшем ТФ, а не на 4H/1D!
+      const workingLtf = botConfig.timeframe || '1h';
+      const { candles: candles1h } = await fetchRealCandles(trade.pair, workingLtf, 60);
       if (!candles1h || candles1h.length === 0) continue;
 
       const liveExPos = liveExchangePosMap.get(
@@ -4166,6 +4181,26 @@ async function runScalpBotCycle(waitForActive = false) {
                 );
                 openSibling.campaign_role = 'primary';
                 openSibling.next_dca_price = currentPrice;
+                const nextStep = (openSibling.dca_count || 0) + 1;
+                if (!Array.isArray(openSibling.planned_dca_levels)) {
+                  openSibling.planned_dca_levels = [];
+                }
+                const existingStepLvl = openSibling.planned_dca_levels.find(
+                  (l) => !l.filled && l.step === nextStep
+                );
+                if (existingStepLvl) {
+                  existingStepLvl.price = currentPrice;
+                } else {
+                  openSibling.planned_dca_levels.unshift({
+                    step: nextStep,
+                    label: `L${nextStep} Отыгрыш отката (Сценарий 1Б)`,
+                    price: currentPrice,
+                    stake_amount: openSibling.stake_amount,
+                    amount: openSibling.amount,
+                    distance_pct: 0,
+                    filled: false,
+                  });
+                }
                 // Защитный стоп за макушку разворотной тени (даже если выбьет — цикл в плюсе/безубытке за счёт P_bank!)
                 openSibling.stop_loss_abs = roundPrice(levelReversalAtTp.rehedgeStopPrice);
                 recalculateTradeMetrics(openSibling, false);
@@ -4186,17 +4221,29 @@ async function runScalpBotCycle(waitForActive = false) {
             }
           }
 
-          // СЦЕНАРИЙ 2: Цена уверенно пробивает уровень L1 по тренду без разворота -> тралим стоп за пробитый уровень и переносим цель к L2
+          // СЦЕНАРИЙ 2: Цена уверенно пробивает уровень L1 по тренду без разворота -> тралим стоп за пробитый уровень и переносим цель к следующему глобальному уровню L2
           const brokeBeyondTp = trade.is_short
             ? currentPrice <= trade.take_profit_abs * 0.995
             : currentPrice >= trade.take_profit_abs * 1.005;
           if (brokeBeyondTp && !levelReversalAtTp.confirmed && !trade.tp_manual_override) {
             const brokenLevel = trade.take_profit_abs;
             const trailedSl = roundPrice(brokenLevel * (trade.is_short ? 1.004 : 0.996));
-            const shiftedTp = roundPrice(brokenLevel * (trade.is_short ? 0.968 : 1.032));
+            // Если у страховочной ноги есть уровни или известна дистанция до следующего глобального уровня — целимся туда, иначе +3.2%
+            const siblingNextLvl = Array.isArray(openSibling.planned_dca_levels)
+              ? openSibling.planned_dca_levels.find(
+                  (l) =>
+                    !l.filled &&
+                    (trade.is_short
+                      ? l.price <= brokenLevel * 0.98
+                      : l.price >= brokenLevel * 1.02)
+                )?.price
+              : undefined;
+            const shiftedTp = siblingNextLvl
+              ? roundPrice(siblingNextLvl)
+              : roundPrice(brokenLevel * (trade.is_short ? 0.968 : 1.032));
             trade.stop_loss_abs = trailedSl;
             trade.take_profit_abs = shiftedTp;
-            trade.tp_reason = `Сценарий 2: пробой уровня ${brokenLevel}$ по тренду -> трал к L2 (${shiftedTp}$)`;
+            trade.tp_reason = `Сценарий 2: пробой уровня ${brokenLevel}$ по тренду -> трал к следующему уровню L2 (${shiftedTp}$)`;
             recalculateTradeMetrics(trade, false);
             sqliteDb.upsertTrade(trade);
             appendLog(
@@ -4263,7 +4310,7 @@ async function runScalpBotCycle(waitForActive = false) {
           }
           if (closedByTrailedSl) {
             appendLog(
-              'freqtrade.bot.exit',
+              'freqtrade.bot.hedge',
               'INFO',
               `🛡️ [Защитный Стоп в Плюс/БУ] Сработал подтянутый стоп-приказ ${trade.stop_loss_abs}$ по [${trade.pair}] #${trade.trade_id}: позиция закрыта в чистый плюс (+${trade.profit_abs}$, P_bank=${trade.campaign_banked_profit || 0}$)!`,
               { userId: tradeUserId }
@@ -4273,12 +4320,9 @@ async function runScalpBotCycle(waitForActive = false) {
         }
       }
 
-      // 1A. Target TP check (serialized via withPositionLock so fast WS TP & cycle never double-close)
-      // ВАЖНО: Страховочная нога (insurance) при открытой основной ноге (primary) НЕ закрывается без 3-фазного разворота на сильном уровне (Сценарий 3 / Запрет №4)
-      const isInsuranceWaitingForLevelReversal =
-        trade.campaign_role === 'insurance' && Boolean(openSibling);
-
-      if (trade.take_profit_abs > 0 && !isInsuranceWaitingForLevelReversal) {
+      // 1A. Target TP check (только когда НЕТ активной второй ноги замка — то есть после закрытия страховки при разгрузке основной ноги на отскоке, либо для одиночной сделки).
+      // Пока открыты ОБЕ ноги замка (Boolean(openSibling)), касание уровня НЕ закрывает ногу вслепую — работа идёт строго по Сценариям 1А, 1Б, 2, 3, 4 и 5!
+      if (trade.take_profit_abs > 0 && !openSibling) {
         const isTpHit = trade.is_short
           ? currentPrice <= trade.take_profit_abs || closeExecPrice <= trade.take_profit_abs
           : currentPrice >= trade.take_profit_abs || closeExecPrice >= trade.take_profit_abs;
@@ -4348,23 +4392,6 @@ async function runScalpBotCycle(waitForActive = false) {
                 action_type: 'TAKE_PROFIT',
                 notes: `Target TP hit at ${actualClosePrice}, Net PnL: +${trade.profit_abs} USDT (Fee total: ${trade.fee_total} USDT)`,
               });
-
-              if (trade.campaign_id && openSibling) {
-                openSibling.campaign_banked_profit = Number(
-                  ((openSibling.campaign_banked_profit || 0) + (trade.net_profit || trade.profit_abs)).toFixed(4)
-                );
-                if (openSibling.campaign_role === 'insurance') {
-                  openSibling.campaign_role = 'primary';
-                }
-                recalculateTradeMetrics(openSibling, false);
-                sqliteDb.upsertTrade(openSibling);
-                appendLog(
-                  'freqtrade.bot.hedge',
-                  'INFO',
-                  `🏦 Hedge Campaign ${trade.campaign_id} (${tradeAcc.name}): закрыта нога ${trade.pair} (${trade.is_short ? 'SHORT' : 'LONG'}) в чистый плюс +${trade.profit_abs}$ (после комиссии ${trade.fee_total}$). В банк кампании P_bank зачислено +${openSibling.campaign_banked_profit}$.`,
-                  { userId: tradeUserId }
-                );
-              }
 
               if (tradeAcc) {
                 const remAccOpen = tradesStore.filter(
@@ -4627,10 +4654,10 @@ async function runScalpBotCycle(waitForActive = false) {
       ) {
         // Определяем целевой сильный уровень L1 или L2 для усреднения
         let targetDcaLevelPrice = trade.next_dca_price || 0;
-        let targetDcaLevelObj = Array.isArray(trade.planned_dca_levels)
+        const targetDcaLevelObj = Array.isArray(trade.planned_dca_levels)
           ? trade.planned_dca_levels.find((l) => !l.filled && l.step === (trade.dca_count || 0) + 1)
           : undefined;
-        if (targetDcaLevelObj && targetDcaLevelObj.price > 0) {
+        if (!targetDcaLevelPrice && targetDcaLevelObj && targetDcaLevelObj.price > 0) {
           targetDcaLevelPrice = targetDcaLevelObj.price;
         } else if (!targetDcaLevelPrice || targetDcaLevelPrice <= 0) {
           targetDcaLevelPrice = trade.is_short
@@ -4644,14 +4671,49 @@ async function runScalpBotCycle(waitForActive = false) {
             : currentPrice <= targetDcaLevelPrice * 1.0035;
 
           if (isNearOrPastDcaLevel) {
-            // СЦЕНАРИЙ 3 (Раздел 3): проверяем 3 фазы разворота (Фаза 1: Снятие ликвидности / Фаза 2: Пин-бар или поглощение / Фаза 3: Слом локальной структуры + фильтр ножа Сценария 5)
+            // СЦЕНАРИЙ 3 (Раздел 3) и СЦЕНАРИЙ 5 (Новостной сквиз):
+            // Если цена на новостном сквизе пробила первый уровень L1 без торможения и ушла глубже (ко второму уровню L2 или экстремуму паники),
+            // проверяем 3-фазный разворот как на L1, так и на дальнем уровне L2 (где паника остановилась)!
             const isBounceFromSupport = !trade.is_short;
-            const reversalCheck = detectThreePhaseLevelReversal(
+            let reversalCheck = detectThreePhaseLevelReversal(
               candles1h,
               targetDcaLevelPrice,
               isBounceFromSupport,
               0.75
             );
+            const blewPastL1Squeeze = trade.is_short
+              ? currentPrice >= targetDcaLevelPrice * 1.012
+              : currentPrice <= targetDcaLevelPrice * 0.988;
+            if (!reversalCheck.confirmed && blewPastL1Squeeze) {
+              const deeperLevels: number[] = [];
+              if (Array.isArray(trade.planned_dca_levels)) {
+                for (const l of trade.planned_dca_levels) {
+                  if (
+                    !l.filled &&
+                    l.price > 0 &&
+                    (trade.is_short ? l.price > targetDcaLevelPrice : l.price < targetDcaLevelPrice)
+                  ) {
+                    deeperLevels.push(l.price);
+                  }
+                }
+              }
+              for (const deepLvlPrice of deeperLevels) {
+                const deepRev = detectThreePhaseLevelReversal(
+                  candles1h,
+                  deepLvlPrice,
+                  isBounceFromSupport,
+                  0.85
+                );
+                if (deepRev.confirmed) {
+                  reversalCheck = {
+                    ...deepRev,
+                    reason: `[Сценарий 5: Новостной сквиз до дальнего уровня ${deepLvlPrice}$] ${deepRev.reason}`,
+                  };
+                  targetDcaLevelPrice = deepLvlPrice;
+                  break;
+                }
+              }
+            }
 
             if (reversalCheck.confirmed) {
               const { compoundedBalance } = getCompoundedAccountBalance(tradeAcc.id);
@@ -4987,165 +5049,50 @@ async function runScalpBotCycle(waitForActive = false) {
       const customSup = manualSupLvl?.price || mtf.key_4h_support;
       const customRes = manualResLvl?.price || mtf.key_4h_resistance;
 
-      const sig = evaluateScalpingStrategy(c1h, customSup, customRes, mtf.institutional_levels);
       const hedgeEval = evaluateGlobalHedgeStrategy(c1h, c4h, c1d, mtf, btcGuard.isSafe, c1w);
-
-      const last1hCandle = c1h[c1h.length - 1];
-      const isRed1h = Boolean(last1hCandle && last1hCandle.close < last1hCandle.open);
-      const isGreen1h = Boolean(last1hCandle && last1hCandle.close > last1hCandle.open);
-      const isPullbackToRes = Boolean(
-        last1hCandle &&
-          (last1hCandle.high >= sig.ema_slow * 0.994 || last1hCandle.high >= customRes * 0.992)
-      );
-      const isPullbackToSup = Boolean(
-        last1hCandle &&
-          (last1hCandle.low <= sig.ema_slow * 1.006 || last1hCandle.low <= customSup * 1.008)
-      );
       const effectiveTrend = mtf.market_trend || 'NEUTRAL';
 
       sqliteDb.recordSignal({
         pair,
         signal_type: 'MTF_SCAN',
-        direction: sig.enter_short
-          ? 'short'
-          : sig.enter_long
-          ? 'long'
-          : hedgeEval.should_open_hedge
-          ? 'hedge'
+        direction: hedgeEval.should_open_hedge
+          ? `hedge_${hedgeEval.primary_side}`
           : effectiveTrend === 'BEARISH'
           ? 'short'
           : effectiveTrend === 'BULLISH'
           ? 'long'
           : mtf.d1_trend.toLowerCase(),
-        confidence: sig.enter_long || sig.enter_short || hedgeEval.should_open_hedge ? 0.88 : 0.65,
+        confidence: hedgeEval.should_open_hedge ? 0.92 : 0.65,
         price: livePrice,
-        reason: `Top-Down 1D->4H [${pair}]: Trend=${effectiveTrend} (1D=${mtf.d1_trend} RSI=${mtf.rsi_1d}, 4H=${mtf.h4_trend} RSI=${mtf.rsi_4h}, 1H=${mtf.h1_trend} RSI=${mtf.rsi_1h}) | Global Sup=${roundPrice(customSup)} Res=${roundPrice(customRes)} | Scalp=${sig.enter_tag || 'NONE'} | GlobalHedge=${hedgeEval.should_open_hedge ? hedgeEval.horizon : 'WAIT'}`,
+        reason: `Асимметричный 2:1 Хедж [${pair}]: Приоритет=${hedgeEval.dominant_trend} (Основная 1.0x=${hedgeEval.primary_side.toUpperCase()}, Страховка 0.5x=${hedgeEval.insurance_side.toUpperCase()}) | Global Sup=${roundPrice(customSup)} Res=${roundPrice(customRes)} | Статус=${hedgeEval.should_open_hedge ? hedgeEval.reason : hedgeEval.reason}`,
       });
 
-      const btcAllowsLong =
-        btcGuard.isSafe &&
-        (btcGuard.btcTrend !== 'BEARISH' || effectiveTrend === 'BULLISH' || mtf.dist_to_4h_sup_pct <= 1.2);
-
-      // Independently execute entry decision on each eligible enabled account
+      // ЕДИНСТВЕННАЯ ОСНОВНАЯ СТРАТЕГИЯ БОТА: «Асимметричный уровневый хедж с разворотным усреднением» (Разделы 1–7 Регламента).
+      // Бот открывает ТОЛЬКО асимметричный двусторонний замок 2:1 (Основная нога 1.0x по приоритету + Страховочная нога 0.5x против приоритета)
+      // строго в середине диапазона между сильными уровнями (25%..75%) либо сразу после подтверждённого 3-фазного отбоя от сильного уровня!
       for (const acc of eligibleAccounts) {
         const accScopeId = getTargetAccountIdForRecord(acc);
         const accOpen = tradesStore.filter((t) => t.is_open && tradeMatchesAccount(t, acc, accScopeId));
         if (accOpen.some((t) => t.pair === pair)) continue;
-        if (accOpen.length >= botConfig.max_open_trades) continue;
+        if (accOpen.length + 2 > botConfig.max_open_trades) continue;
         const { compoundedBalance: accDeposit } = getCompoundedAccountBalance(acc.id);
         const accUsedMargin = accOpen.reduce((sum, t) => sum + t.stake_amount, 0);
         if (accDeposit <= 0 || (accUsedMargin / accDeposit) * 100 >= 40.0) continue;
 
-        const canOpenHedgeStrategy =
-          hedgeEval.should_open_hedge && accOpen.length + 2 <= botConfig.max_open_trades;
-        const accUserId = acc.user_id || 'owner';
-        const accPairLevels =
-          accUserId === 'owner'
-            ? pairLevels
-            : await getOrComputeMtfBotLevels(pair, botConfig.timeframe, false, accUserId);
-        const accOpts = {
-          accountId: acc.id,
-          accountName: acc.name,
-          strategyName: 'ScalpingStrategy',
-          candles1w: c1w,
-          preloadedPairLevels: accPairLevels,
-        };
+        if (!hedgeEval.should_open_hedge) continue;
 
         try {
-          // Единое правило запаса хода (Раздел 2В Регламента) для Скальпинга и Двухсторонки:
-          // запрещено входить в SHORT при запасе хода до сильной поддержки < 1.5% и в LONG при запасе хода до сильного сопротивления < 1.5%
-          const hasScalpAirShort = mtf.dist_to_4h_sup_pct >= 1.5;
-          const hasScalpAirLong = mtf.dist_to_4h_res_pct >= 1.5;
-
-          if (effectiveTrend === 'BEARISH') {
-            if (sig.enter_short && mtf.allow_short && hasScalpAirShort) {
-              await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
-              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
-              openedInThisCycle++;
-            } else if (
-              mtf.allow_short &&
-              hasScalpAirShort &&
-              mtf.rsi_1h >= 24.0 &&
-              mtf.rsi_1h <= 65.0 &&
-              isPullbackToRes &&
-              (isRed1h || sig.wt1 <= sig.wt2) &&
-              livePrice <= sig.ema_slow * 1.003
-            ) {
-              await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, 'Scalp_Trend_Short', accOpts);
-              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
-              openedInThisCycle++;
-            } else if (canOpenHedgeStrategy) {
-              await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d, {
-                accountId: acc.id,
-                accountName: acc.name,
-                horizon: hedgeEval.horizon,
-                longTpPrice: hedgeEval.long_tp_price,
-                shortTpPrice: hedgeEval.short_tp_price,
-                candles1w: c1w,
-              });
-              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 2);
-              openedInThisCycle += 2;
-            } else if (sig.enter_long && btcAllowsLong && mtf.allow_long && hasScalpAirLong) {
-              await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
-              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
-              openedInThisCycle++;
-            }
-          } else if (effectiveTrend === 'BULLISH') {
-            if (sig.enter_long && btcAllowsLong && mtf.allow_long && hasScalpAirLong) {
-              await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
-              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
-              openedInThisCycle++;
-            } else if (
-              btcAllowsLong &&
-              mtf.allow_long &&
-              hasScalpAirLong &&
-              mtf.rsi_1h >= 35.0 &&
-              mtf.rsi_1h <= 76.0 &&
-              isPullbackToSup &&
-              (isGreen1h || sig.wt1 >= sig.wt2) &&
-              livePrice >= sig.ema_slow * 0.997
-            ) {
-              await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, 'Scalp_Trend_Long', accOpts);
-              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
-              openedInThisCycle++;
-            } else if (canOpenHedgeStrategy) {
-              await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d, {
-                accountId: acc.id,
-                accountName: acc.name,
-                horizon: hedgeEval.horizon,
-                longTpPrice: hedgeEval.long_tp_price,
-                shortTpPrice: hedgeEval.short_tp_price,
-                candles1w: c1w,
-              });
-              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 2);
-              openedInThisCycle += 2;
-            } else if (sig.enter_short && mtf.allow_short && hasScalpAirShort) {
-              await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
-              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
-              openedInThisCycle++;
-            }
-          } else {
-            if (canOpenHedgeStrategy) {
-              await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d, {
-                accountId: acc.id,
-                accountName: acc.name,
-                horizon: hedgeEval.horizon,
-                longTpPrice: hedgeEval.long_tp_price,
-                shortTpPrice: hedgeEval.short_tp_price,
-                candles1w: c1w,
-              });
-              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 2);
-              openedInThisCycle += 2;
-            } else if (sig.enter_short && mtf.allow_short && hasScalpAirShort) {
-              await createScalpBotPosition(pair, 'short', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
-              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
-              openedInThisCycle++;
-            } else if (sig.enter_long && btcAllowsLong && mtf.allow_long && hasScalpAirLong) {
-              await createScalpBotPosition(pair, 'long', livePrice, mtf, c4h, c1d, sig.enter_tag, accOpts);
-              openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 1);
-              openedInThisCycle++;
-            }
-          }
+          await openHedgeCampaign(pair, livePrice, mtf, c4h, c1d, {
+            accountId: acc.id,
+            accountName: acc.name,
+            horizon: hedgeEval.horizon,
+            longTpPrice: hedgeEval.long_tp_price,
+            shortTpPrice: hedgeEval.short_tp_price,
+            primarySide: hedgeEval.primary_side,
+            candles1w: c1w,
+          });
+          openedPerAccount.set(acc.id, (openedPerAccount.get(acc.id) || 0) + 2);
+          openedInThisCycle += 2;
         } catch (entryErr: any) {
           cooldownPairs.set(`${acc.id}:${pair}`, Date.now());
           appendLog(
@@ -5189,6 +5136,7 @@ async function openHedgeCampaign(
     horizon?: 'MEDIUM_TERM_4H' | 'LONG_TERM_1D';
     longTpPrice?: number;
     shortTpPrice?: number;
+    primarySide?: 'long' | 'short';
     candles1w?: RawCandle[];
   }
 ): Promise<{ longTrade: FreqtradeTrade; shortTrade: FreqtradeTrade | null }> {
@@ -5214,7 +5162,8 @@ async function openHedgeCampaign(
 
   if (!canOpenBothSides) {
     const fallbackSide: 'long' | 'short' =
-      mtf.d1_trend === 'BEARISH' || mtf.d1_trend === 'MILD_BEARISH' ? 'short' : 'long';
+      customOpts?.primarySide ||
+      (mtf.d1_trend === 'BEARISH' || mtf.d1_trend === 'MILD_BEARISH' ? 'short' : 'long');
     appendLog(
       'freqtrade.bot.hedge',
       'WARNING',
@@ -5243,12 +5192,13 @@ async function openHedgeCampaign(
     return { longTrade: singleTrade, shortTrade: null };
   }
 
-  // Определяем доминирующий тренд старшего ТФ для асимметричного замка 2:1 (Раздел 1 Регламента)
+  // Определяем доминирующий тренд старшего ТФ для асимметричного замка 2:1 (Раздел 1 и 2Б Регламента)
   const dominantBearish =
     mtf.market_trend === 'BEARISH' ||
     (mtf.market_trend === 'NEUTRAL' &&
       (mtf.d1_trend === 'BEARISH' || mtf.d1_trend === 'MILD_BEARISH' || mtf.h4_trend === 'BEARISH'));
-  const primarySide: 'long' | 'short' = dominantBearish ? 'short' : 'long';
+  const primarySide: 'long' | 'short' =
+    customOpts?.primarySide || (dominantBearish ? 'short' : 'long');
   const longRole: 'primary' | 'insurance' = primarySide === 'long' ? 'primary' : 'insurance';
   const shortRole: 'primary' | 'insurance' = primarySide === 'short' ? 'primary' : 'insurance';
 
@@ -5687,11 +5637,13 @@ async function createScalpBotPosition(
       tradesStore.unshift(newTrade);
       sqliteDb.upsertTrade(newTrade);
 
-      // Сразу после открытия позиции выставляем нативный Take-Profit ордер напрямую на биржу (кроме страховочной ноги замка, которая ждёт 3-фазного разворота на уровне!)
+      // Нативный лимитный TP на биржу ставится ТОЛЬКО для одиночных сделок без активного замка (!newTrade.campaign_id),
+      // чтобы биржа не закрыла одну ногу замка на голом касании уровня без 3-фазного разворота (Раздел 3, Сценарий 1 и Сценарий 2)!
       const targetCreds = getAccountCredentialsFromStore(targetExchangeAcc);
       if (
         targetCreds &&
         !isSimulatedTestApiKey(targetCreds.apiKey) &&
+        !newTrade.campaign_id &&
         newTrade.campaign_role !== 'insurance' &&
         newTrade.take_profit_abs > 0
       ) {

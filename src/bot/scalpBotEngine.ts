@@ -1563,24 +1563,8 @@ function selectChartDrivenTakeProfit(params: {
     pushLevel(keyGlobalTarget, '1D', '1W->1D глобальный уровень', 18, 3, 0);
   }
 
-  // Из 1H берём ТОЛЬКО сильные подтверждённые уровни (минимум 2 отбоя или боковик >= 3 свечей, отбоев >= пробоев)
-  for (const l of structure1hLevels) {
-    const isStrong1h =
-      (l.bounces >= 2 || (l.consolidation_bars || 0) >= 3) &&
-      (l.bounces >= l.breaks || (l.mirror_retests || 0) >= 1) &&
-      (l.strength_score || 0) >= 5.5;
-    if (!isStrong1h) continue;
-    pushLevel(
-      l.price,
-      '1H',
-      l.consolidation_bars && l.consolidation_bars >= 3 ? '1H сильная зона консолидации' : '1H сильный уровень',
-      l.strength_score || 6,
-      l.bounces || 2,
-      l.breaks || 0,
-      l.zone_low,
-      l.zone_high
-    );
-  }
+  // Раздел 2А Регламента («Фильтр: Локальные уровни младших таймфреймов внутри текущего дня полностью игнорируются»):
+  // Работа ведётся строго от значимых зон старшего порядка (4H, 1D, 1W) — зеркальных уровней, границ проторговок и зон ликвидности.
 
   // Из 4H берём подтверждённые структурные уровни (без случайных одиночных экстремумов возле входа)
   for (const l of structural4hLevels) {
@@ -2669,27 +2653,49 @@ export function evaluateGlobalHedgeStrategy(
       ? Math.max(0, ((globalRes - currentPrice) / currentPrice) * 100.0)
       : Math.max(0, mtf.dist_to_4h_res_pct || 0);
 
-  // Определение доминирующего тренда на старшем ТФ (Раздел 1.2 и 2.2):
-  // Основная нога (1.0x V) открывается по тренду, Страховочная нога (0.5x V) — против тренда (перевес 2:1)
-  const isBearishDominant =
-    mtf.market_trend === 'BEARISH' ||
-    (mtf.market_trend === 'NEUTRAL' &&
-      (mtf.d1_trend === 'BEARISH' ||
-        mtf.d1_trend === 'MILD_BEARISH' ||
-        mtf.h4_trend === 'BEARISH' ||
-        (mtf.h4_trend === 'MILD_BEARISH' && mtf.rsi_4h < 48)));
+  // Раздел 2Б и 2В — Определение глобального приоритета (Тренда) и выбор точки старта («Правило запаса хода»):
+  // Стартовый замок открывается:
+  //   1) В середине диапазона (25%..75%) между двумя сильными уровнями старшего ТФ при запасе хода >= 1.5% в обе стороны,
+  //   2) ЛИБО сразу после подтверждённого 3-фазного отбоя от одного сильного уровня в сторону другого (при запасе хода до противоположного уровня >= 2.2%).
+  const bounceFromSupport =
+    globalSup > 0 &&
+    detectThreePhaseLevelReversal(candles1h, globalSup, true, 0.9, {
+      zoneLow: mtf.support_history?.zone_low,
+      zoneHigh: mtf.support_history?.zone_high,
+    }).confirmed &&
+    airToResPct >= 2.2;
+  const bounceFromResistance =
+    globalRes > 0 &&
+    detectThreePhaseLevelReversal(candles1h, globalRes, false, 0.9, {
+      zoneLow: mtf.resistance_history?.zone_low,
+      zoneHigh: mtf.resistance_history?.zone_high,
+    }).confirmed &&
+    airToSupPct >= 2.2;
+
+  const isBearishDominant = bounceFromResistance
+    ? true
+    : bounceFromSupport
+    ? false
+    : mtf.market_trend === 'BEARISH' ||
+      (mtf.market_trend === 'NEUTRAL' &&
+        (mtf.d1_trend === 'BEARISH' ||
+          mtf.d1_trend === 'MILD_BEARISH' ||
+          mtf.h4_trend === 'BEARISH' ||
+          (mtf.h4_trend === 'MILD_BEARISH' && mtf.rsi_4h < 48)));
   const dominantTrend: 'BULLISH' | 'BEARISH' = isBearishDominant ? 'BEARISH' : 'BULLISH';
   const primarySide: 'long' | 'short' = dominantTrend === 'BEARISH' ? 'short' : 'long';
   const insuranceSide: 'long' | 'short' = primarySide === 'long' ? 'short' : 'long';
   const primaryStakeMult = 1.0;
   const insuranceStakeMult = 0.5;
 
-  // Раздел 2.2 — Правило «Запаса хода» (Фильтр середины диапазона):
-  // Категорически запрещено открывать замок вплотную к сильному уровню (Лонг под сопротивлением или Шорт над поддержкой).
-  // Вход разрешён только в середине диапазона (25%..75%) при наличии «воздуха» >= 1.4% в обе стороны и ширине коридора >= 3.0%.
   const posPct = Number.isFinite(mtf.pos_4h_pct) ? mtf.pos_4h_pct : 50;
-  const inMidRangeCorridor = posPct >= 25.0 && posPct <= 75.0;
-  const hasEnoughAirBothSides = airToSupPct >= 1.4 && airToResPct >= 1.4;
+  const inMidRangeCorridor = posPct >= 25.0 && posPct <= 75.0 && airToSupPct >= 1.5 && airToResPct >= 1.5;
+  const confirmedLevelBounceEntry = bounceFromSupport || bounceFromResistance;
+
+  // Запрет на вход у преграды (Раздел 2В): нельзя открывать Основную ногу в лонг под сопротивлением (< 1.5%) и в шорт над поддержкой (< 1.5%)
+  const obstacleCheckOk =
+    primarySide === 'long' ? airToResPct >= 1.5 : airToSupPct >= 1.5;
+
   const safeRsiZone =
     mtf.rsi_1d >= 18.0 &&
     mtf.rsi_1d <= 82.0 &&
@@ -2697,12 +2703,16 @@ export function evaluateGlobalHedgeStrategy(
     mtf.rsi_4h <= 82.0 &&
     mtf.rsi_1h >= 18.0 &&
     mtf.rsi_1h <= 82.0;
-  const noExtremeImpulse = btcIsSafe && !isKnifeDrop(candles1h) && !isPumpExhaustion(candles1h);
+  const noExtremeImpulse =
+    btcIsSafe &&
+    !isKnifeDrop(candles1h) &&
+    !isPumpExhaustion(candles1h) &&
+    !isNewsHelicopterVolatility(candles1h);
 
   const shouldEnter =
     channelWidthPct >= 3.0 &&
-    inMidRangeCorridor &&
-    hasEnoughAirBothSides &&
+    (inMidRangeCorridor || confirmedLevelBounceEntry) &&
+    obstacleCheckOk &&
     safeRsiZone &&
     noExtremeImpulse;
 
@@ -2731,10 +2741,12 @@ export function evaluateGlobalHedgeStrategy(
   if (!shouldEnter) {
     if (channelWidthPct < 3.0) {
       rejectDetail = `узкий коридор ${channelWidthPct.toFixed(1)}% (< 3.0%)`;
-    } else if (!inMidRangeCorridor || !hasEnoughAirBothSides) {
-      rejectDetail = `нарушено правило запаса хода (поз. ${posPct.toFixed(0)}%, воздух до SUP=${airToSupPct.toFixed(2)}%, до RES=${airToResPct.toFixed(2)}%)`;
+    } else if (!inMidRangeCorridor && !confirmedLevelBounceEntry) {
+      rejectDetail = `нарушено правило запаса хода (поз. ${posPct.toFixed(0)}%, воздух до SUP=${airToSupPct.toFixed(2)}%, до RES=${airToResPct.toFixed(2)}%, нет 3-фазного отбоя)`;
+    } else if (!obstacleCheckOk) {
+      rejectDetail = `запрет на вход у преграды (основная ${primarySide.toUpperCase()}, воздух=${primarySide === 'long' ? airToResPct.toFixed(2) : airToSupPct.toFixed(2)}% < 1.5%)`;
     } else if (!noExtremeImpulse) {
-      rejectDetail = `импульсный пролив/памп или фильтр BTC`;
+      rejectDetail = `импульсный пролив/памп, новостной вертолёт или фильтр BTC`;
     } else {
       rejectDetail = `экстремальный RSI вне рабочей зоны`;
     }
@@ -2761,7 +2773,7 @@ export function evaluateGlobalHedgeStrategy(
     air_to_support_pct: Number(airToSupPct.toFixed(2)),
     air_to_resistance_pct: Number(airToResPct.toFixed(2)),
     reason: shouldEnter
-      ? `Асимметричный 2:1 Хедж (${dominantTrend}: основная ${primarySide.toUpperCase()} 1.0x + страховочная ${insuranceSide.toUpperCase()} 0.5x): коридор [${globalSup} .. ${globalRes}] (${channelWidthPct.toFixed(1)}%), поз. ${posPct.toFixed(0)}% (запас хода -${airToSupPct.toFixed(1)}% / +${airToResPct.toFixed(1)}%)`
+      ? `Асимметричный 2:1 Хедж (${confirmedLevelBounceEntry ? '3-фазный отбой от уровня' : 'середина коридора'} · ${dominantTrend}: основная ${primarySide.toUpperCase()} 1.0x + страховочная ${insuranceSide.toUpperCase()} 0.5x): коридор [${globalSup} .. ${globalRes}] (${channelWidthPct.toFixed(1)}%), поз. ${posPct.toFixed(0)}% (запас хода -${airToSupPct.toFixed(1)}% / +${airToResPct.toFixed(1)}%)`
       : `Вход в хедж отклонён: ${rejectDetail}`,
   };
 }

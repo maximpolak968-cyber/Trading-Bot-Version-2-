@@ -854,7 +854,12 @@ export class SqliteBotDatabase {
       const plannedDcaJson = JSON.stringify(trade.planned_dca_levels || []);
       const ordersJson = JSON.stringify(rawOrders);
       const syncedAccJson = JSON.stringify(trade.synced_accounts || []);
-      const nextDca = trade.planned_dca_levels?.[0]?.price ?? trade.next_dca_price ?? null;
+      const nextDca =
+        (Array.isArray(trade.planned_dca_levels)
+          ? trade.planned_dca_levels.find((l: any) => !l.filled)?.price
+          : undefined) ??
+        trade.next_dca_price ??
+        null;
 
       const openDateStr =
         trade.open_date ||
