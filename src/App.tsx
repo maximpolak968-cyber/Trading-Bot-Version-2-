@@ -668,17 +668,18 @@ export default function App() {
                   ? Number((notional / lev).toFixed(2))
                   : 1;
               const stake = Math.max(1e-8, safeStake);
-              const pct = (net / stake) * 100;
+              const exchangePct = (gross / stake) * 100;
+              const netPct = (net / stake) * 100;
               return {
                 ...t,
                 stake_amount: safeStake,
                 current_rate: liveMark,
                 gross_profit: Number(gross.toFixed(4)),
-                profit_abs: Number(net.toFixed(3)),
-                net_profit: Number(net.toFixed(3)),
-                profit_pct: Number(pct.toFixed(2)),
-                net_profit_percent: Number(pct.toFixed(2)),
-                profit_ratio: Number((pct / 100).toFixed(4)),
+                profit_abs: Number(gross.toFixed(4)),
+                net_profit: Number(net.toFixed(4)),
+                profit_pct: Number(exchangePct.toFixed(2)),
+                net_profit_percent: Number(netPct.toFixed(2)),
+                profit_ratio: Number((exchangePct / 100).toFixed(4)),
               };
             });
             return anyChanged ? updated : prev;

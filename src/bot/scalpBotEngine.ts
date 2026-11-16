@@ -2364,7 +2364,8 @@ export function findStrongestDcaLevel(
   isShort: boolean,
   minDistPct = 2.8,
   maxDistPct = 95.0,
-  candles1w?: OhlcvCandle[]
+  candles1w?: OhlcvCandle[],
+  previousDcaExtremePrice?: number
 ): {
   price: number;
   second_price: number;
@@ -2374,8 +2375,17 @@ export function findStrongestDcaLevel(
   source: string;
   type: 'support' | 'resistance';
 } {
-  const effectiveMinDistPct = Math.max(3.0, minDistPct);
-  if (referencePrice <= 0) {
+  const hasPrevExtreme =
+    typeof previousDcaExtremePrice === 'number' &&
+    Number.isFinite(previousDcaExtremePrice) &&
+    previousDcaExtremePrice > 0;
+  const anchorPrice = hasPrevExtreme
+    ? isShort
+      ? Math.max(referencePrice, previousDcaExtremePrice!)
+      : Math.min(referencePrice, previousDcaExtremePrice!)
+    : referencePrice;
+  const effectiveMinDistPct = Math.max(hasPrevExtreme ? 3.4 : 3.0, minDistPct);
+  if (anchorPrice <= 0) {
     return {
       price: 0,
       second_price: 0,
@@ -2417,7 +2427,7 @@ export function findStrongestDcaLevel(
     const { refinedGlobal, local1d } = refineHigherTimeframeLevels(
       macro1wLevels,
       candles1d,
-      referencePrice
+      anchorPrice
     );
     for (const g of refinedGlobal) {
       allCandidates.push({
@@ -2456,29 +2466,30 @@ export function findStrongestDcaLevel(
     }
   }
 
-  // Фильтруем кандидатов для DCA 1: строго >= effectiveMinDistPct, <= maxDistPct, и уровень НЕ должен быть пробитым чаще, чем отбивал цену
+  // Фильтруем кандидатов для DCA: строго >= effectiveMinDistPct дальше от anchorPrice (и от цены входа, и от предыдущего DCA!), <= maxDistPct
   const targetRole: 'support' | 'resistance' = isShort ? 'resistance' : 'support';
   const allDirectionalLevels = allCandidates
     .filter((lvl) => {
       const distPct = !isShort
-        ? ((referencePrice - lvl.price) / referencePrice) * 100.0
-        : ((lvl.price - referencePrice) / referencePrice) * 100.0;
+        ? ((anchorPrice - lvl.price) / anchorPrice) * 100.0
+        : ((lvl.price - anchorPrice) / anchorPrice) * 100.0;
       return distPct >= effectiveMinDistPct && distPct <= maxDistPct;
     })
     .map((lvl) => ({ ...lvl, type: targetRole }));
 
   const strongReliableLevels = allDirectionalLevels.filter(
     (lvl) =>
+      lvl.strength_score >= 5.5 &&
       (lvl.bounces >= 2 || (lvl.consolidation_bars || 0) >= 3) &&
       (lvl.bounces >= lvl.breaks || (lvl.mirror_retests || 0) >= 1)
   );
   const validLevels = strongReliableLevels.length > 0 ? strongReliableLevels : allDirectionalLevels;
 
   if (validLevels.length > 0) {
-    // Для DCA 1 ищем САМЫЙ СИЛЬНЫЙ уровень поддержки/сопротивления в рабочем коридоре 3.0%..16.0% от входа
+    // Для следующего DCA ищем САМЫЙ СИЛЬНЫЙ уровень поддержки/сопротивления в рабочем коридоре от anchorPrice
     const reachableLevels = validLevels.filter((l) => {
-      const dist = (Math.abs(referencePrice - l.price) / referencePrice) * 100;
-      return dist >= effectiveMinDistPct && dist <= 16.0;
+      const dist = (Math.abs(anchorPrice - l.price) / anchorPrice) * 100;
+      return dist >= effectiveMinDistPct && dist <= 18.0;
     });
     const candidateLevels = reachableLevels.length > 0 ? reachableLevels : validLevels;
     const primaryPool = candidateLevels.filter(
@@ -2503,7 +2514,7 @@ export function findStrongestDcaLevel(
     };
 
     const bestFirst = poolToRank.reduce((best, cur) =>
-      scoreDcaLevel(cur, referencePrice) > scoreDcaLevel(best, referencePrice) ? cur : best
+      scoreDcaLevel(cur, anchorPrice) > scoreDcaLevel(best, anchorPrice) ? cur : best
     );
 
     // Для DCA 2 ищем следующий самый сильный уровень 1W/1D/4H дальше DCA 1 (минимум на 3.2% дальше DCA 1), либо исторический экстремум
@@ -2552,7 +2563,7 @@ export function findStrongestDcaLevel(
   // Fallback если цена уже на самом историческом экстремуме
   const fallbackStepPct = Math.max(0.035, effectiveMinDistPct / 100);
   const fallbackPrice1 = Number(
-    (referencePrice * (isShort ? 1 + fallbackStepPct : 1 - fallbackStepPct)).toPrecision(7)
+    (anchorPrice * (isShort ? 1 + fallbackStepPct : 1 - fallbackStepPct)).toPrecision(7)
   );
   const absExtreme = isShort ? absHighest : absLowest;
   const fallbackPrice2 =
@@ -3061,9 +3072,17 @@ export function canExecuteDca(
     leverage: number;
     totalBalanceUsdt: number;
     usedMarginUsdt: number;
+    otherActiveCoinsCount?: number;
   },
   config: BotConfigData = DEFAULT_SCALPBOT_CONFIG
-): { allowed: boolean; reason: string; multiplier: number; liquidationDistancePct: number } {
+): {
+  allowed: boolean;
+  reason: string;
+  multiplier: number;
+  liquidationDistancePct: number;
+  postDcaLiquidationDistancePct: number;
+  maxAllowedDca: number;
+} {
   const maxDca = config.max_dca_orders;
   const maxMultiplier = config.max_position_multiplier;
   const minLiqDistPct = config.min_liquidation_distance_pct;
@@ -3072,14 +3091,49 @@ export function canExecuteDca(
 
   const baseAmt = params.initialAmount > 0 ? params.initialAmount : params.currentAmount;
   const currentMultiplier = baseAmt > 0 ? Number((params.currentAmount / baseAmt).toFixed(2)) : 1.0;
+  const lev = Math.max(1, params.leverage || config.leverage);
+  const minExchangeMargin = Math.max(0.5, Number((5.5 / lev).toFixed(2)));
+  const totalBalance = params.totalBalanceUsdt > 0 ? params.totalBalanceUsdt : config.dry_run_wallet;
+  const availableBalance = Math.max(0, totalBalance - params.usedMarginUsdt);
 
-  // 1. Step count limit
-  if (params.dcaCount >= maxDca) {
+  const currentPairNotional = params.currentAmount * params.currentPrice;
+  const currentPairMargin = currentPairNotional / lev;
+  const basePairMargin = Math.max(minExchangeMargin, (baseAmt * params.openRate) / lev);
+  const maxPairMarginLimit = (maxPairMarginPct / 100.0) * totalBalance;
+  const remainingPairMargin = Math.max(0, maxPairMarginLimit - currentPairMargin);
+
+  // Динамический расчёт: сколько раз вообще можно усреднить эту монету с учётом депозита, занятой маржи, других открытых монет и защиты от ликвидации
+  const maxTotalAccountMarginForDca = (maxMarginForDcaPct / 100.0) * totalBalance;
+  const remainingAccountBudget = Math.max(
+    0,
+    maxTotalAccountMarginForDca - params.usedMarginUsdt
+  );
+  // Резервируем долю свободной маржи аккаунта для других открытых монет в просадке
+  const multiCoinShareDivisor = 1 + Math.max(0, params.otherActiveCoinsCount || 0) * 0.25;
+  const remainingCoinBudget = Math.min(
+    remainingPairMargin,
+    remainingAccountBudget / multiCoinShareDivisor
+  );
+  const meaningfulStepMargin = Math.max(minExchangeMargin, basePairMargin * 0.85);
+  let extraStepsByMargin = 0;
+  if (remainingCoinBudget >= minExchangeMargin) {
+    extraStepsByMargin = Math.floor(remainingCoinBudget / Math.max(minExchangeMargin, meaningfulStepMargin));
+    // Если маржи осталось меньше полного шага, но хватает хотя бы на частичное безопасное усреднение (>=35% начального шага) — разрешаем 1 последний шаг
+    if (extraStepsByMargin === 0 && remainingCoinBudget >= Math.max(minExchangeMargin * 2, basePairMargin * 0.35)) {
+      extraStepsByMargin = 1;
+    }
+  }
+  const dynamicMaxDca = Math.min(maxDca, params.dcaCount + extraStepsByMargin);
+
+  // 1. Step count limit (с учётом динамического лимита монеты)
+  if (params.dcaCount >= dynamicMaxDca) {
     return {
       allowed: false,
-      reason: `Достигнут лимит шагов усреднения (${params.dcaCount}/${maxDca})`,
+      reason: `Достигнут лимит шагов усреднения для ${params.pair} (${params.dcaCount}/${dynamicMaxDca}) с учётом маржи и защиты от ликвидации`,
       multiplier: currentMultiplier,
       liquidationDistancePct: 100,
+      postDcaLiquidationDistancePct: 100,
+      maxAllowedDca: dynamicMaxDca,
     };
   }
 
@@ -3090,11 +3144,12 @@ export function canExecuteDca(
       reason: `Позиция уже в ${currentMultiplier}x от начальной (лимит ${maxMultiplier}x)`,
       multiplier: currentMultiplier,
       liquidationDistancePct: 100,
+      postDcaLiquidationDistancePct: 100,
+      maxAllowedDca: dynamicMaxDca,
     };
   }
 
   // 3. Account margin utilization
-  const totalBalance = params.totalBalanceUsdt > 0 ? params.totalBalanceUsdt : config.dry_run_wallet;
   const usedPct = (params.usedMarginUsdt / totalBalance) * 100.0;
   if (usedPct >= maxMarginForDcaPct) {
     return {
@@ -3102,25 +3157,19 @@ export function canExecuteDca(
       reason: `Занято ${usedPct.toFixed(1)}% маржи аккаунта (лимит ${maxMarginForDcaPct}%)`,
       multiplier: currentMultiplier,
       liquidationDistancePct: 100,
+      postDcaLiquidationDistancePct: 100,
+      maxAllowedDca: dynamicMaxDca,
     };
   }
 
   // 4. Portfolio Margin Guard: max margin share on a single coin (<= 20%)
-  const lev = Math.max(1, params.leverage || config.leverage);
-  // Минимальный объём ордера на фьючерсах биржи = 5.5 USDT нотионала (при 25x плече это ~0.22 USDT маржи, минимум 0.50 USDT маржи)
-  const minExchangeMargin = Math.max(0.5, Number((5.5 / lev).toFixed(2)));
-  const currentPairNotional = params.currentAmount * params.currentPrice;
-  const currentPairMargin = currentPairNotional / lev;
-  const maxPairMarginLimit = (maxPairMarginPct / 100.0) * totalBalance;
-  const remainingPairMargin = Math.max(0, maxPairMarginLimit - currentPairMargin);
-
   const nextAddAmount =
     config.dca_scale_mode === 'linear' ? baseAmt : params.currentAmount;
   const nextAddNotional = nextAddAmount * params.currentPrice;
   const rawNextAddMargin = nextAddNotional / lev;
   const effectiveNextMargin = Math.max(
     minExchangeMargin,
-    Math.min(rawNextAddMargin, remainingPairMargin)
+    Math.min(rawNextAddMargin, remainingPairMargin, availableBalance * 0.75)
   );
 
   if (remainingPairMargin < minExchangeMargin) {
@@ -3130,21 +3179,24 @@ export function canExecuteDca(
       reason: `Portfolio Guard: монета ${params.pair} уже занимает ${curSharePct.toFixed(1)}% маржи депозита (лимит ${maxPairMarginPct}%)`,
       multiplier: currentMultiplier,
       liquidationDistancePct: 100,
+      postDcaLiquidationDistancePct: 100,
+      maxAllowedDca: params.dcaCount,
     };
   }
 
   // 5. Free balance check
-  const availableBalance = Math.max(0, totalBalance - params.usedMarginUsdt);
   if (availableBalance < minExchangeMargin) {
     return {
       allowed: false,
       reason: `Не хватает свободной маржи: нужно минимум ${minExchangeMargin.toFixed(2)} USDT, доступно ${availableBalance.toFixed(2)} USDT`,
       multiplier: currentMultiplier,
       liquidationDistancePct: 100,
+      postDcaLiquidationDistancePct: 100,
+      maxAllowedDca: params.dcaCount,
     };
   }
 
-  // 6. Liquidation distance check (Cross-Margin aware + scaled for high leverage like 25x)
+  // 6. Liquidation distance check ДО и ПОСЛЕ симуляции усреднения (чтобы усреднение никогда не приблизило позицию к ликвидации!)
   const crossMarginBuffer = Math.min(
     0.85,
     Math.max(
@@ -3159,14 +3211,41 @@ export function canExecuteDca(
     params.currentPrice > 0
       ? (Math.abs(params.currentPrice - approxLiqPrice) / params.currentPrice) * 100.0
       : 100;
+
+  // Симулируем состояние позиции ПОСЛЕ добавления ордера усреднения
+  const simAddAmt = (effectiveNextMargin * lev) / Math.max(1e-8, params.currentPrice);
+  const simPostAmount = params.currentAmount + simAddAmt;
+  const simPostAvgEntry =
+    (params.openRate * params.currentAmount + params.currentPrice * simAddAmt) /
+    Math.max(1e-8, simPostAmount);
+  const simPostNotional = simPostAmount * params.currentPrice;
+  const simPostPairMargin = currentPairMargin + effectiveNextMargin;
+  const simPostFreeBalance = Math.max(0, availableBalance - effectiveNextMargin);
+  const postCrossMarginBuffer = Math.min(
+    0.85,
+    Math.max(
+      0.92 / lev,
+      (simPostPairMargin + simPostFreeBalance * 0.35) / Math.max(1, simPostNotional)
+    )
+  );
+  const postApproxLiqPrice = params.isShort
+    ? simPostAvgEntry * (1 + postCrossMarginBuffer)
+    : simPostAvgEntry * (1 - postCrossMarginBuffer);
+  const postDcaLiqDistancePct =
+    params.currentPrice > 0
+      ? (Math.abs(params.currentPrice - postApproxLiqPrice) / params.currentPrice) * 100.0
+      : 100;
+
   const effectiveMinLiqPct = Math.min(minLiqDistPct, Number((25.0 / lev).toFixed(2)));
 
-  if (liqDistancePct < effectiveMinLiqPct) {
+  if (liqDistancePct < effectiveMinLiqPct || postDcaLiqDistancePct < effectiveMinLiqPct) {
     return {
       allowed: false,
-      reason: `Слишком близко к ликвидации: ${liqDistancePct.toFixed(1)}% (лимит ${effectiveMinLiqPct}%)`,
+      reason: `Защита от ликвидации: дистанция до ликвидации ${Math.min(liqDistancePct, postDcaLiqDistancePct).toFixed(1)}% (безопасный минимум ${effectiveMinLiqPct}%)`,
       multiplier: currentMultiplier,
       liquidationDistancePct: Number(liqDistancePct.toFixed(2)),
+      postDcaLiquidationDistancePct: Number(postDcaLiqDistancePct.toFixed(2)),
+      maxAllowedDca: params.dcaCount,
     };
   }
 
@@ -3175,6 +3254,8 @@ export function canExecuteDca(
     reason: 'OK',
     multiplier: currentMultiplier,
     liquidationDistancePct: Number(liqDistancePct.toFixed(2)),
+    postDcaLiquidationDistancePct: Number(postDcaLiqDistancePct.toFixed(2)),
+    maxAllowedDca: dynamicMaxDca,
   };
 }
 
@@ -3183,6 +3264,7 @@ export function canExecuteDca(
  * to the current market price as possible (within ~0.8%), strictly respecting:
  * - remaining single-pair margin quota (max 20% of deposit)
  * - available free margin & fair share across active coins
+ * - post-DCA liquidation safety buffer
  * - minimum order stake (default $5, never forcing $25 over quota)
  */
 export function calculateDynamicDcaAmount(params: {
@@ -3209,7 +3291,7 @@ export function calculateDynamicDcaAmount(params: {
   const currentPairMargin = currentPairNotional / lev;
   const remainingPairMargin = Math.max(0, maxPairMarginLimit - currentPairMargin);
 
-  // Reserve margin for other coins: allocate up to 60% of free margin or fair share, never exceeding remainingPairMargin
+  // Reserve margin for other coins: allocate up to 75% of free margin or fair share, never exceeding remainingPairMargin
   const fairShareMargin = freeMargin / Math.max(1, params.otherActiveCoinsCount + 1);
   const budgetPool = Math.min(freeMargin * 0.75, Math.max(preferredMinStake, fairShareMargin * 1.5));
   const maxSafeMarginForThisStep = Math.min(remainingPairMargin, budgetPool, freeMargin);
@@ -3237,13 +3319,59 @@ export function calculateDynamicDcaAmount(params: {
   }
 
   const desiredMargin = (desiredAddAmount * params.currentPrice) / lev;
-  const finalStake = Math.min(
+  let finalStake = Math.min(
     maxSafeMarginForThisStep,
     Math.max(minExchangeMargin, desiredMargin)
   );
-  const finalAddAmount = Number(
+  let finalAddAmount = Number(
     ((finalStake * lev) / Math.max(1e-8, params.currentPrice)).toFixed(4)
   );
+
+  // Проверка безопасности ликвидации ПОСЛЕ усреднения фактическим объёмом finalStake
+  // Если выбранный объём приближает цену ликвидации ближе допустимого порога — пробуем уменьшить объём или отменяем шаг
+  const effectiveMinLiqPct = Math.min(18.0, Number((25.0 / lev).toFixed(2)));
+  const computePostLiqDistPct = (candidateStake: number): number => {
+    const addAmt = (candidateStake * lev) / Math.max(1e-8, params.currentPrice);
+    const totalAmt = params.currentAmount + addAmt;
+    const avgEntry =
+      (params.openRate * params.currentAmount + params.currentPrice * addAmt) /
+      Math.max(1e-8, totalAmt);
+    const postNotional = totalAmt * params.currentPrice;
+    const postPairMargin = currentPairMargin + candidateStake;
+    const postFree = Math.max(0, freeMargin - candidateStake);
+    const crossBuf = Math.min(
+      0.85,
+      Math.max(0.92 / lev, (postPairMargin + postFree * 0.35) / Math.max(1, postNotional))
+    );
+    const approxLiq = params.isShort ? avgEntry * (1 + crossBuf) : avgEntry * (1 - crossBuf);
+    return params.currentPrice > 0
+      ? (Math.abs(params.currentPrice - approxLiq) / params.currentPrice) * 100
+      : 100;
+  };
+
+  if (computePostLiqDistPct(finalStake) < effectiveMinLiqPct) {
+    // Попробуем уменьшить размер усреднения ступенчато до 50% и до минимального шага биржи
+    let safeFound = false;
+    for (const ratio of [0.65, 0.4, 0.25]) {
+      const scaledStake = Math.max(minExchangeMargin, finalStake * ratio);
+      if (scaledStake <= maxSafeMarginForThisStep && computePostLiqDistPct(scaledStake) >= effectiveMinLiqPct) {
+        finalStake = scaledStake;
+        finalAddAmount = Number(
+          ((finalStake * lev) / Math.max(1e-8, params.currentPrice)).toFixed(4)
+        );
+        safeFound = true;
+        break;
+      }
+    }
+    if (!safeFound) {
+      return {
+        addAmount: 0,
+        addStake: 0,
+        targetAvgPrice: Number(params.openRate.toPrecision(7)),
+        pullDistancePct: 0,
+      };
+    }
+  }
 
   const newTotalAmt = params.currentAmount + finalAddAmount;
   const simulatedNewAvg =

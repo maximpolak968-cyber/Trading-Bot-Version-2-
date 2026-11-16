@@ -54,6 +54,7 @@ import {
   getFuturesExecutionPrice,
   getAllLiveWsTickers,
   getWebSocketEngineStatus,
+  getWsAccountLiveState,
   sanitizePositionMarginUsdt,
   sanitizeWalletUsedMarginUsdt,
   LiveWsTicker,
@@ -357,6 +358,11 @@ async function processFastWsTradeClose(
 
       const tradeUserId = resolveTradeUserId(trade);
       cooldownPairs.set(`${targetAcc?.id || targetAccId}:${trade.pair}`, Date.now());
+      if (targetAcc && !isSimulatedTestApiKey(targetAcc.api_key_raw) && typeof trade.exchange_realized_pnl !== 'number') {
+        setTimeout(() => {
+          void syncRealExchangeBalancesIfNeeded(true);
+        }, 2200);
+      }
       appendLog(
         'freqtrade.bot.exit',
         'INFO',
@@ -1610,7 +1616,9 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     typeof trade.exchange_unrealized_pnl === 'number' &&
     Number.isFinite(trade.exchange_unrealized_pnl) &&
     trade.exchange_synced_at &&
-    Date.now() - trade.exchange_synced_at < 60_000;
+    Date.now() - trade.exchange_synced_at < 5_000 &&
+    (!trade.exchange_mark_price ||
+      Math.abs(trade.exchange_mark_price - refRate) / Math.max(1e-8, refRate) < 0.0003);
 
   if (!trade.is_open && typeof trade.exchange_realized_pnl === 'number' && Number.isFinite(trade.exchange_realized_pnl)) {
     const exactNet = Number(trade.exchange_realized_pnl.toFixed(4));
@@ -1622,17 +1630,24 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     trade.profit_ratio = Number((trade.net_profit_percent / 100).toFixed(4));
     trade.profit_pct = trade.net_profit_percent;
     trade.profit_abs = Number(exactNet.toFixed(4));
-  } else if (hasFreshExchangeUnrealized) {
-    const exactUnrealized = Number(trade.exchange_unrealized_pnl!.toFixed(4));
-    const netAfterFees = exactUnrealized - trade.fee_total;
-    trade.gross_profit = exactUnrealized;
-    trade.net_profit = Number(netAfterFees.toFixed(4));
+  } else if (trade.is_open) {
+    // Для открытой сделки: нереализованный PnL (profit_abs и profit_pct) считается 1:1 как на бирже (по Mark Price без двойного вычета будущей комиссии закрытия),
+    // а чистый PnL после всех комиссий хранится в trade.net_profit для защиты безубытка
+    const rawUnrealized = hasFreshExchangeUnrealized
+      ? Number(trade.exchange_unrealized_pnl!.toFixed(4))
+      : Number(((trade.is_short ? openRate - refRate : refRate - openRate) * totalAmount).toFixed(4));
+    const netAfterFees = Number((rawUnrealized - trade.fee_total).toFixed(4));
+    trade.gross_profit = rawUnrealized;
+    trade.net_profit = netAfterFees;
     trade.net_profit_percent = Number(
       ((netAfterFees / Math.max(1e-8, trade.stake_amount)) * 100).toFixed(2)
     );
-    trade.profit_ratio = Number((trade.net_profit_percent / 100).toFixed(4));
-    trade.profit_pct = trade.net_profit_percent;
-    trade.profit_abs = Number(netAfterFees.toFixed(3));
+    const exchangeRoiPct = Number(
+      ((rawUnrealized / Math.max(1e-8, trade.stake_amount)) * 100).toFixed(2)
+    );
+    trade.profit_ratio = Number((exchangeRoiPct / 100).toFixed(4));
+    trade.profit_pct = exchangeRoiPct;
+    trade.profit_abs = Number(rawUnrealized.toFixed(4));
   } else {
     const grossProfit = (trade.is_short ? openRate - refRate : refRate - openRate) * totalAmount;
     const netProfit = grossProfit - trade.fee_total;
@@ -1643,7 +1658,7 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     );
     trade.profit_ratio = Number((trade.net_profit_percent / 100).toFixed(4));
     trade.profit_pct = trade.net_profit_percent;
-    trade.profit_abs = Number(netProfit.toFixed(3));
+    trade.profit_abs = Number(netProfit.toFixed(4));
   }
 
   const feeOpenPerCoin = trade.fee_open / totalAmount;
@@ -1927,6 +1942,7 @@ const botLogs: Array<{
   publicMarket?: boolean;
 }> = [];
 const cooldownPairs = new Map<string, number>();
+const dcaRiskSkipLogTs = new Map<number, number>();
 let ownerManuallyStoppedBot = false;
 const stoppedUsers = new Set<string>();
 const pausedNewEntriesUsers = new Set<string>();
@@ -2942,7 +2958,25 @@ async function enrichImportedPositionMtfLevelsAsync(
       }
 
       if (!liveTrade.dca_manual_override) {
-        const strongDca = findStrongestDcaLevel(c4h, c1d, entryRate, liveTrade.is_short, 3.0, 95.0, c1w);
+        const orderPrices = Array.isArray(liveTrade.orders)
+          ? liveTrade.orders.map((o) => Number(o.price)).filter((p) => p > 0)
+          : [];
+        const prevDcaExtreme =
+          orderPrices.length > 0
+            ? liveTrade.is_short
+              ? Math.max(entryRate, ...orderPrices)
+              : Math.min(entryRate, ...orderPrices)
+            : undefined;
+        const strongDca = findStrongestDcaLevel(
+          c4h,
+          c1d,
+          entryRate,
+          liveTrade.is_short,
+          3.0,
+          95.0,
+          c1w,
+          prevDcaExtreme
+        );
         const dcaPrice1 =
           !liveTrade.is_short && manualDcaSup
             ? roundPrice(manualDcaSup.price)
@@ -2954,11 +2988,13 @@ async function enrichImportedPositionMtfLevelsAsync(
           (!liveTrade.is_short && manualDcaSup) || (liveTrade.is_short && manualDcaRes)
             ? 'MANUAL_LVL'
             : strongDca.source;
+        const nextStep1 = (liveTrade.dca_count || 0) + 1;
+        const nextStep2 = (liveTrade.dca_count || 0) + 2;
 
         liveTrade.planned_dca_levels = [
           {
-            step: 1,
-            label: `DCA 1 (${dcaSource})`,
+            step: nextStep1,
+            label: `DCA ${nextStep1} (${dcaSource})`,
             price: dcaPrice1,
             stake_amount: stakeUsdt,
             amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice1)).toFixed(4)),
@@ -2966,8 +3002,8 @@ async function enrichImportedPositionMtfLevelsAsync(
             manual_override: (!liveTrade.is_short && hasManualSup) || (liveTrade.is_short && hasManualRes),
           },
           {
-            step: 2,
-            label: `DCA 2 (${liveTrade.is_short ? 'Strong Res #2' : 'Strong Sup #2'})`,
+            step: nextStep2,
+            label: `DCA ${nextStep2} (${liveTrade.is_short ? 'Strong Res #2' : 'Strong Sup #2'})`,
             price: dcaPrice2,
             stake_amount: stakeUsdt,
             amount: Number(((stakeUsdt * lev) / Math.max(1e-8, dcaPrice2)).toFixed(4)),
@@ -2976,7 +3012,7 @@ async function enrichImportedPositionMtfLevelsAsync(
           },
         ];
         liveTrade.next_dca_price = dcaPrice1;
-        liveTrade.plan_notes = `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) и проанализирована (1D=${mtf.d1_trend} | SUP=${liveTrade.support_level}$ | RES=${liveTrade.resistance_level}$ | TP=${liveTrade.take_profit_abs}$ | DCA1=${dcaPrice1}$ | DCA2=${dcaPrice2}$)`;
+        liveTrade.plan_notes = `Открытая позиция синхронизирована с биржи ${acc.exchange.toUpperCase()} (${acc.name}) и проанализирована (1D=${mtf.d1_trend} | SUP=${liveTrade.support_level}$ | RES=${liveTrade.resistance_level}$ | TP=${liveTrade.take_profit_abs}$ | DCA${nextStep1}=${dcaPrice1}$ | DCA${nextStep2}=${dcaPrice2}$)`;
       }
 
       recalculateTradeMetrics(liveTrade, false);
@@ -3065,16 +3101,15 @@ async function syncPositionsAndHistoryFromExchanges(
             pos.entry_price > 0 ? pos.entry_price : existingOpen.open_rate,
             pos.leverage || existingOpen.leverage || 25
           );
-          if (sanitizedPosMargin > 0) {
-            existingOpen.stake_amount = Number(sanitizedPosMargin.toFixed(2));
-          }
-          existingOpen.leverage = pos.leverage || existingOpen.leverage;
+          const prevAmount = existingOpen.amount;
+          const prevStake = existingOpen.stake_amount || 0;
+          const prevOpenRate = existingOpen.open_rate;
 
-          const sizeIncreased = pos.size > existingOpen.amount * 1.02;
-          const sizeChanged = Math.abs(existingOpen.amount - pos.size) > 1e-5;
+          const sizeIncreased = pos.size > prevAmount * 1.02;
+          const sizeChanged = Math.abs(prevAmount - pos.size) > 1e-5;
           const entryShifted =
             pos.entry_price > 0 &&
-            Math.abs(existingOpen.open_rate - pos.entry_price) / Math.max(1e-8, pos.entry_price) >
+            Math.abs(prevOpenRate - pos.entry_price) / Math.max(1e-8, pos.entry_price) >
               0.0003;
           const isInitialFillAlignment =
             !sizeIncreased &&
@@ -3082,6 +3117,11 @@ async function syncPositionsAndHistoryFromExchanges(
             pos.entry_price > 0 &&
             entryShifted &&
             Date.now() - (existingOpen.open_timestamp || 0) < 120_000;
+
+          if (sanitizedPosMargin > 0) {
+            existingOpen.stake_amount = Number(sanitizedPosMargin.toFixed(2));
+          }
+          existingOpen.leverage = pos.leverage || existingOpen.leverage;
 
           if (sizeChanged) {
             existingOpen.amount = Number(pos.size.toFixed(4));
@@ -3096,29 +3136,53 @@ async function syncPositionsAndHistoryFromExchanges(
               existingOpen.orders[0].amount = existingOpen.amount;
               existingOpen.orders[0].stake_amount = existingOpen.stake_amount;
             }
-          } else if (sizeIncreased && entryShifted && pos.entry_price > 0) {
-            const addedQty = Math.max(0, Number((pos.size - existingOpen.amount).toFixed(4)));
+          } else if (sizeIncreased && pos.entry_price > 0) {
+            const addedQty = Math.max(0, Number((pos.size - prevAmount).toFixed(4)));
             const addedStake = Math.max(
               0,
-              Number((sanitizedPosMargin - (existingOpen.stake_amount || 0)).toFixed(2))
+              Number((sanitizedPosMargin - prevStake).toFixed(2))
             );
+            const inferredFillPrice =
+              addedQty > 0 && prevAmount > 0
+                ? roundPrice(
+                    Math.max(
+                      1e-8,
+                      (pos.entry_price * pos.size - prevOpenRate * prevAmount) / addedQty
+                    )
+                  )
+                : roundPrice(pos.entry_price);
             existingOpen.open_rate = roundPrice(pos.entry_price);
             const nextStep = (existingOpen.dca_count || 0) + 1;
             existingOpen.dca_count = nextStep;
+            existingOpen.trade_state = 'DCA_ACTIVE';
             const nowTs = Date.now();
             const nowDateStr = new Date(nowTs).toISOString().replace('T', ' ').slice(0, 19);
             existingOpen.last_dca_date = nowDateStr;
             if (!Array.isArray(existingOpen.orders)) existingOpen.orders = [];
+            const dcaOrdId = `ord-ex-dca-${existingOpen.trade_id}-${nextStep}-${nowTs}`;
             existingOpen.orders.push({
-              id: `ord-ex-dca-${existingOpen.trade_id}-${nextStep}-${nowTs}`,
+              id: dcaOrdId,
               step: nextStep,
               label: `DCA #${nextStep} (Синхр. с биржи ${acc.exchange.toUpperCase()})`,
               side: existingOpen.is_short ? 'short' : 'long',
-              price: existingOpen.open_rate,
+              price: inferredFillPrice,
               amount: addedQty > 0 ? addedQty : existingOpen.amount,
               stake_amount: addedStake > 0 ? addedStake : existingOpen.stake_amount,
               timestamp: nowTs,
               date: nowDateStr,
+            });
+            sqliteDb.recordOrder({
+              trade_id: existingOpen.trade_id,
+              pair: existingOpen.pair,
+              order_type: 'market',
+              side: existingOpen.is_short ? 'sell' : 'buy',
+              price: inferredFillPrice,
+              amount: addedQty > 0 ? addedQty : existingOpen.amount,
+              cost: addedStake > 0 ? addedStake : existingOpen.stake_amount,
+              fee: 0,
+              realized_pnl: 0,
+              action_type: `DCA_STEP_${nextStep}`,
+              notes: `Exchange DCA sync #${nextStep} @ ${inferredFillPrice}, New Avg: ${existingOpen.open_rate}`,
             });
             if (!existingOpen.tp_manual_override) {
               const exTpValid =
@@ -3348,13 +3412,22 @@ async function syncPositionsAndHistoryFromExchanges(
       acc.unrealized_pnl = Number(totalPosUnrealized.toFixed(4));
       acc.used_margin_usdt = Number(totalPosMargin.toFixed(2));
       const walletRef = acc.wallet_balance_usdt ?? acc.balance_usdt ?? 0;
+      const liveWsStateForAvail = getWsAccountLiveState(sanitizeCredentialString(acc.api_key_raw), 120_000);
       if (walletRef > 0) {
         acc.equity_usdt = Number((walletRef + acc.unrealized_pnl).toFixed(4));
-        if (acc.used_margin_usdt === 0) {
+        if (
+          liveWsStateForAvail &&
+          typeof liveWsStateForAvail.availableBalanceUsdt === 'number' &&
+          Number.isFinite(liveWsStateForAvail.availableBalanceUsdt) &&
+          liveWsStateForAvail.availableBalanceUsdt >= 0 &&
+          liveWsStateForAvail.availableBalanceUsdt <= walletRef + Math.max(0, acc.unrealized_pnl) + 1.0
+        ) {
+          acc.available_balance_usdt = Number(liveWsStateForAvail.availableBalanceUsdt.toFixed(2));
+        } else if (acc.used_margin_usdt === 0) {
           acc.available_balance_usdt = Number(walletRef.toFixed(2));
         } else {
           acc.available_balance_usdt = Number(
-            Math.max(0, walletRef - acc.used_margin_usdt).toFixed(2)
+            Math.max(0, walletRef + Math.min(0, acc.unrealized_pnl || 0) - acc.used_margin_usdt).toFixed(2)
           );
         }
       }
@@ -3501,6 +3574,64 @@ async function syncPositionsAndHistoryFromExchanges(
             `🏁 [EXCHANGE CLOSE SYNC] Позиция #${localTrade.trade_id} [${localTrade.pair}] закрыта на бирже ${acc.exchange.toUpperCase()} (Вход: ${localTrade.open_rate}$ ➔ Выход: ${closePrice}$) | Реальный PnL биржи: ${localTrade.profit_abs}$ (Комиссия: ${localTrade.fee_total}$)`,
             { userId: acc.user_id || 'owner' }
           );
+        }
+      }
+
+      // 4. Догоняющая сверка недавно закрытых сделок (за последние 10 минут), у которых в момент мгновенного закрытия по WS/API
+      // биржа ещё не успела проиндексировать запись (или Binance WS прислал оценку openFee вместо userTrades)
+      const recentlyClosedPendingExactPnl = tradesStore.filter(
+        (t) =>
+          !t.is_open &&
+          t.exchange === acc.exchange &&
+          tradeMatchesAccount(t, acc, targetAccountId) &&
+          (typeof t.exchange_realized_pnl !== 'number' ||
+            (t.exit_reason === 'exchange_ws_tp_sync' &&
+              !String(t.plan_notes || '').includes('[EXACT_EXCHANGE_RECONCILED]'))) &&
+          t.close_timestamp &&
+          Date.now() - t.close_timestamp < 600_000
+      );
+      if (recentlyClosedPendingExactPnl.length > 0) {
+        const pendingPairs = Array.from(new Set(recentlyClosedPendingExactPnl.map((t) => t.pair)));
+        const reconcilRes = await fetchExchangeClosedPnl(creds, 50, pendingPairs, true).catch(() => ({
+          success: false,
+          closed: [],
+        }));
+        if (reconcilRes.success && reconcilRes.closed.length > 0) {
+          const usedOrderIds = new Set<string>();
+          for (const closedTrade of recentlyClosedPendingExactPnl) {
+            const exactRec = reconcilRes.closed.find(
+              (c) =>
+                !usedOrderIds.has(c.order_id) &&
+                c.pair === closedTrade.pair &&
+                (c.is_short === closedTrade.is_short || c.order_id.startsWith('inc-')) &&
+                c.updated_time >= (closedTrade.open_timestamp || 0) - 60_000 &&
+                Math.abs(c.updated_time - (closedTrade.close_timestamp || Date.now())) < 300_000
+            );
+            if (exactRec) {
+              usedOrderIds.add(exactRec.order_id);
+              if (exactRec.entry_price > 0 && !exactRec.order_id.startsWith('inc-')) {
+                closedTrade.open_rate = roundPrice(exactRec.entry_price);
+              }
+              if (exactRec.exit_price > 0) {
+                closedTrade.close_rate = roundPrice(exactRec.exit_price);
+                closedTrade.current_rate = closedTrade.close_rate;
+              }
+              if (exactRec.open_fee > 0) closedTrade.fee_open = exactRec.open_fee;
+              if (exactRec.close_fee > 0) closedTrade.fee_close = exactRec.close_fee;
+              closedTrade.fee_total = Number(
+                ((closedTrade.fee_open || 0) + (closedTrade.fee_close || 0)).toFixed(4)
+              );
+              closedTrade.exchange_realized_pnl = exactRec.closed_pnl;
+              const baseNote = String(closedTrade.plan_notes || '').trim();
+              closedTrade.plan_notes = baseNote.includes('[EXACT_EXCHANGE_RECONCILED]')
+                ? baseNote
+                : `${baseNote ? `${baseNote} ` : ''}[EXACT_EXCHANGE_RECONCILED]`;
+              recalculateTradeMetrics(closedTrade, false);
+              sqliteDb.upsertTrade(closedTrade);
+              broadcastTradeLifecycleEvent('trade:updated', closedTrade);
+              anyLifecycleChange = true;
+            }
+          }
         }
       }
 
@@ -3825,6 +3956,11 @@ async function runScalpBotCycle(waitForActive = false) {
             });
 
             cooldownPairs.set(`${tradeAcc.id}:${trade.pair}`, Date.now());
+            if (!isSimulatedTestApiKey(tradeAcc.api_key_raw) && typeof trade.exchange_realized_pnl !== 'number') {
+              setTimeout(() => {
+                void syncRealExchangeBalancesIfNeeded(true);
+              }, 2200);
+            }
             appendLog(
               'freqtrade.bot.exit',
               'INFO',
@@ -3935,6 +4071,11 @@ async function runScalpBotCycle(waitForActive = false) {
                 }
               });
               cooldownPairs.set(`${tradeAcc.id}:${trade.pair}`, Date.now());
+              if (!isSimulatedTestApiKey(tradeAcc.api_key_raw) && typeof trade.exchange_realized_pnl !== 'number') {
+                setTimeout(() => {
+                  void syncRealExchangeBalancesIfNeeded(true);
+                }, 2200);
+              }
               appendLog(
                 'freqtrade.bot.hedge',
                 'INFO',
@@ -3955,17 +4096,39 @@ async function runScalpBotCycle(waitForActive = false) {
         trade.dca_manual_override || trade.planned_dca_levels?.[0]?.manual_override
       );
       if (botConfig.dca_enabled && nextDcaTarget > 0) {
-        // Если уровень автоматический, но стоит слишком близко ко входу (< 2.8%) или ещё ожидает MTF-расчёта (PENDING_MTF),
-        // сначала пересчитываем его по сильным уровням 1W/1D/4H и НЕ усредняем в воздухе рядом со входом!
-        const dcaDistPctFromEntry =
-          trade.open_rate > 0
-            ? (Math.abs(nextDcaTarget - trade.open_rate) / trade.open_rate) * 100
+        const dcaLockKey = getPosLockKey(tradeAccScopeId, trade.pair, trade.is_short);
+        if (activePositionKeys.has(dcaLockKey)) {
+          continue;
+        }
+        // Находим самую дальнюю цену среди уже исполненных ордеров (вход + все предыдущие шаги DCA),
+        // чтобы следующий уровень усреднения ВСЕГДА стоял дальше предыдущего ордера усреднения минимум на 3.0%–3.4%!
+        const executedOrderPrices = Array.isArray(trade.orders)
+          ? trade.orders.map((o) => Number(o.price)).filter((p) => p > 0)
+          : [];
+        const furthestExecutedPrice =
+          executedOrderPrices.length > 0
+            ? trade.is_short
+              ? Math.max(trade.open_rate, ...executedOrderPrices)
+              : Math.min(trade.open_rate, ...executedOrderPrices)
+            : trade.open_rate;
+
+        const dcaDistPctFromAnchor =
+          furthestExecutedPrice > 0
+            ? (Math.abs(nextDcaTarget - furthestExecutedPrice) / furthestExecutedPrice) * 100
             : 0;
+        const isWrongSideOfAnchor =
+          furthestExecutedPrice > 0 &&
+          (trade.is_short
+            ? nextDcaTarget <= furthestExecutedPrice
+            : nextDcaTarget >= furthestExecutedPrice);
         const isPendingPlaceholderDca = Boolean(
           trade.planned_dca_levels?.[0] &&
             String(trade.planned_dca_levels[0].label || '').includes('PENDING_MTF')
         );
-        if (!isManualDcaTarget && (dcaDistPctFromEntry < 2.8 || isPendingPlaceholderDca)) {
+        if (
+          !isManualDcaTarget &&
+          (isWrongSideOfAnchor || dcaDistPctFromAnchor < 2.8 || isPendingPlaceholderDca)
+        ) {
           const [{ candles: c1wPre }, { candles: c4hPre }, { candles: c1dPre }] = await Promise.all([
             fetchRealCandles(trade.pair, '1w', 300),
             fetchRealCandles(trade.pair, '4h', 1000),
@@ -3979,7 +4142,8 @@ async function runScalpBotCycle(waitForActive = false) {
               trade.is_short,
               3.0,
               95.0,
-              c1wPre
+              c1wPre,
+              furthestExecutedPrice
             );
             const updatedDca1 = roundPrice(strongPreDca.price);
             const updatedDca2 = roundPrice(strongPreDca.second_price);
@@ -4017,9 +4181,18 @@ async function runScalpBotCycle(waitForActive = false) {
           }
         }
 
-        const reachedDcaLevel = !trade.is_short
-          ? currentPrice <= nextDcaTarget
-          : currentPrice >= nextDcaTarget;
+        // Защита от повторного усреднения на одной и той же свече/минуте: минимум 3 минуты между шагами авто-DCA
+        const lastDcaOrderTs = Array.isArray(trade.orders)
+          ? trade.orders
+              .filter((o) => Number(o.step) > 0)
+              .reduce((maxTs, o) => Math.max(maxTs, Number(o.timestamp || 0)), 0)
+          : 0;
+        const dcaCooldownActive =
+          !isManualDcaTarget && lastDcaOrderTs > 0 && Date.now() - lastDcaOrderTs < 180_000;
+
+        const reachedDcaLevel =
+          !dcaCooldownActive &&
+          (!trade.is_short ? currentPrice <= nextDcaTarget : currentPrice >= nextDcaTarget);
 
         if (reachedDcaLevel) {
           const { compoundedBalance: totalDeposit } = getCompoundedAccountBalance(tradeAcc.id);
@@ -4028,8 +4201,16 @@ async function runScalpBotCycle(waitForActive = false) {
             .reduce((acc, t) => acc + t.stake_amount, 0);
           const isRealOwner = Boolean(tradeAcc?.api_key_raw && !isSimulatedTestApiKey(tradeAcc.api_key_raw));
           const usedMargin = isRealOwner
-            ? Math.max(localUsedMargin, Number(tradeAcc?.used_margin_usdt || 0))
+            ? Number(tradeAcc?.used_margin_usdt || 0) > 0
+              ? Number(tradeAcc?.used_margin_usdt || 0)
+              : localUsedMargin
             : localUsedMargin;
+          const otherActiveCoins = tradesStore.filter(
+            (t) =>
+              t.is_open &&
+              tradeMatchesAccount(t, tradeAcc, tradeAccScopeId) &&
+              t.pair !== trade.pair
+          ).length;
 
           const riskCheck = canExecuteDca(
             {
@@ -4043,9 +4224,23 @@ async function runScalpBotCycle(waitForActive = false) {
               leverage: trade.leverage || botConfig.leverage,
               totalBalanceUsdt: totalDeposit,
               usedMarginUsdt: usedMargin,
+              otherActiveCoinsCount: otherActiveCoins,
             },
             scalpBotConfig
           );
+
+          if (!riskCheck.allowed) {
+            const lastSkipLog = dcaRiskSkipLogTs.get(trade.trade_id) || 0;
+            if (Date.now() - lastSkipLog > 600_000) {
+              dcaRiskSkipLogTs.set(trade.trade_id, Date.now());
+              appendLog(
+                'freqtrade.bot.dca',
+                'WARNING',
+                `🛡️ [DCA RISK GUARD] ${trade.pair} #${trade.trade_id} (${tradeAcc.name}): усреднение #${(trade.dca_count || 0) + 1} остановлено — ${riskCheck.reason} (Лимит по монете: ${riskCheck.maxAllowedDca}, Ликв. до/после: ${riskCheck.liquidationDistancePct}% / ${riskCheck.postDcaLiquidationDistancePct ?? riskCheck.liquidationDistancePct}%)`,
+                { userId: tradeUserId }
+              );
+            }
+          }
 
           if (riskCheck.allowed) {
             const candles1hForDca =
@@ -4127,6 +4322,16 @@ async function runScalpBotCycle(waitForActive = false) {
               });
 
               if (dynamicDca.addAmount <= 0 || dynamicDca.addStake <= 0) {
+                const lastSkipLog = dcaRiskSkipLogTs.get(trade.trade_id) || 0;
+                if (Date.now() - lastSkipLog > 600_000) {
+                  dcaRiskSkipLogTs.set(trade.trade_id, Date.now());
+                  appendLog(
+                    'freqtrade.bot.dca',
+                    'WARNING',
+                    `🛡️ [DCA MARGIN/LIQ GUARD] ${trade.pair} #${trade.trade_id} (${tradeAcc.name}): недостаточно безопасной маржи/дистанции ликвидации для усреднения (Исп. маржа: ${usedMargin.toFixed(2)} / ${totalDeposit.toFixed(2)} USDT)`,
+                    { userId: tradeUserId }
+                  );
+                }
                 continue;
               }
 
@@ -4135,15 +4340,24 @@ async function runScalpBotCycle(waitForActive = false) {
               const prevMasterStake = trade.stake_amount || 25;
               const dcaMultiplierRatio = addStake / Math.max(1, prevMasterStake);
 
-              // Исполняем реальный рыночный ордер усреднения (DCA) на бирже владельца
-              const dcaOrderRes = await dispatchOrderToExchangeAccount(tradeAcc, {
-                pair: trade.pair,
-                action: 'DCA',
-                isShort: trade.is_short,
-                quantity: addAmount,
-                referencePrice: currentPrice,
-                leverage: trade.leverage || botConfig.leverage || 25,
-              });
+              // Блокируем позицию на время отправки ордера DCA, чтобы фоновый WS/REST не перезаписал amount до записи шага в БД
+              const preDcaAmount = trade.amount;
+              const preDcaStake = trade.stake_amount;
+              const preDcaOpenRate = trade.open_rate;
+              activePositionKeys.add(dcaLockKey);
+              let dcaOrderRes: PlacedOrderResult | null = null;
+              try {
+                dcaOrderRes = await dispatchOrderToExchangeAccount(tradeAcc, {
+                  pair: trade.pair,
+                  action: 'DCA',
+                  isShort: trade.is_short,
+                  quantity: addAmount,
+                  referencePrice: currentPrice,
+                  leverage: trade.leverage || botConfig.leverage || 25,
+                });
+              } finally {
+                activePositionKeys.delete(dcaLockKey);
+              }
               if (tradeAcc && !isSimulatedTestApiKey(tradeAcc.api_key_raw) && !dcaOrderRes?.success) {
                 continue;
               }
@@ -4155,11 +4369,11 @@ async function runScalpBotCycle(waitForActive = false) {
                   ? roundPrice(dcaOrderRes.price)
                   : currentPrice;
 
-              const prevOpenRate = trade.open_rate;
-              const newTotalAmount = Number((trade.amount + addAmount).toFixed(4));
-              const newTotalStake = Number((trade.stake_amount + addStake).toFixed(2));
+              const prevOpenRate = preDcaOpenRate;
+              const newTotalAmount = Number((preDcaAmount + addAmount).toFixed(4));
+              const newTotalStake = Number((preDcaStake + addStake).toFixed(2));
               const newAvgOpenRate = roundPrice(
-                (prevOpenRate * trade.amount + actualDcaPrice * addAmount) /
+                (prevOpenRate * preDcaAmount + actualDcaPrice * addAmount) /
                   Math.max(1e-8, newTotalAmount)
               );
 
@@ -4169,18 +4383,19 @@ async function runScalpBotCycle(waitForActive = false) {
                   ? dcaOrderRes.exchange_time
                   : Date.now();
               const nowStr = new Date(now).toISOString().replace('T', ' ').slice(0, 19);
-              // Ищем следующий уровень усреднения (DCA) строго за пределами текущей цены исполнения DCA (по следующим глобальным максимумам для Шорта / минимумам для Лонга, мин. 3.0% дальше!)
-              const dcaAnchorPrice = trade.is_short
-                ? Math.max(newAvgOpenRate, actualDcaPrice)
-                : Math.min(newAvgOpenRate, actualDcaPrice);
+              // Ищем следующий уровень усреднения (DCA) строго за пределами самой дальней цены исполнения DCA (мин. 3.4% дальше!)
+              const postDcaFurthestPrice = trade.is_short
+                ? Math.max(furthestExecutedPrice, newAvgOpenRate, actualDcaPrice)
+                : Math.min(furthestExecutedPrice, newAvgOpenRate, actualDcaPrice);
               const nextStrongDca = findStrongestDcaLevel(
                 c4h,
                 c1d,
-                dcaAnchorPrice,
+                newAvgOpenRate,
                 trade.is_short,
                 3.0,
                 95.0,
-                c1w
+                c1w,
+                postDcaFurthestPrice
               );
 
               // 1. Before DB transaction: if this trade is part of a 2-way hedge campaign, close profitable sibling leg on exchange first
@@ -5561,25 +5776,27 @@ async function startServer() {
       }
       const aUsed =
         aIsReal && sanitizedAccUsed > 0
-          ? aOpen.length > 0
-            ? Math.max(sanitizedAccUsed, aLocalUsed)
+          ? aOpen.length > 0 && a.open_trades_count === aOpen.length
+            ? sanitizedAccUsed
+            : aOpen.length > 0
+            ? aLocalUsed
             : sanitizedAccUsed
           : aLocalUsed;
-      const computedFree = Math.max(0, wBal - aUsed);
-      const aFree =
-        aIsReal &&
-        typeof a.available_balance_usdt === 'number' &&
-        Number.isFinite(a.available_balance_usdt) &&
-        a.available_balance_usdt > 0 &&
-        a.available_balance_usdt <= wBal - aUsed + 0.5
-          ? a.available_balance_usdt
-          : computedFree;
       const aPnl =
         aOpen.length > 0
           ? aLocalPnl
           : aIsReal && typeof a.unrealized_pnl === 'number'
           ? a.unrealized_pnl
           : 0;
+      const computedFree = Math.max(0, wBal + Math.min(0, aPnl) - aUsed);
+      const aFree =
+        aIsReal &&
+        typeof a.available_balance_usdt === 'number' &&
+        Number.isFinite(a.available_balance_usdt) &&
+        a.available_balance_usdt >= 0 &&
+        a.available_balance_usdt <= wBal + Math.max(0, aPnl) + 1.0
+          ? a.available_balance_usdt
+          : computedFree;
       sumWallet += wBal;
       sumOpenPnl += aPnl;
       sumUsedStake += aUsed;
@@ -7523,16 +7740,20 @@ async function startServer() {
     );
     const usedMargin =
       sanitizedAccUsed > 0
-        ? accOpen.length > 0
-          ? Number(Math.max(sanitizedAccUsed, accLocalUsed).toFixed(2))
+        ? accOpen.length > 0 && acc.open_trades_count === accOpen.length
+          ? Number(sanitizedAccUsed.toFixed(2))
+          : accOpen.length > 0
+          ? accLocalUsed
           : Number(sanitizedAccUsed.toFixed(2))
         : accLocalUsed;
-    const computedAvail = Number(Math.max(0, walletBal - usedMargin).toFixed(2));
+    const computedAvail = Number(
+      Math.max(0, walletBal + Math.min(0, liveUnrealized) - usedMargin).toFixed(2)
+    );
     const availBal =
       typeof acc.available_balance_usdt === 'number' &&
       Number.isFinite(acc.available_balance_usdt) &&
-      acc.available_balance_usdt > 0 &&
-      acc.available_balance_usdt <= walletBal - usedMargin + 0.5
+      acc.available_balance_usdt >= 0 &&
+      acc.available_balance_usdt <= walletBal + Math.max(0, liveUnrealized) + 1.0
         ? Number(acc.available_balance_usdt.toFixed(2))
         : computedAvail;
     return serializeAccountForClient({
@@ -8292,6 +8513,11 @@ async function startServer() {
         broadcastTradeLifecycleEvent('trade:closed', t);
       }
       if (closedCount > 0) {
+        if (tradesToClose.some(({ trade }) => typeof trade.exchange_realized_pnl !== 'number')) {
+          setTimeout(() => {
+            void syncRealExchangeBalancesIfNeeded(true);
+          }, 2200);
+        }
         for (const userAcc of getAccountsForUser(auth)) {
           const accScopeId = getTargetAccountIdForRecord(userAcc);
           const remainingOpen = tradesStore.filter(
@@ -8543,9 +8769,11 @@ async function startServer() {
       let closePrice =
         params.closePrice && params.closePrice > 0
           ? roundPrice(params.closePrice)
+          : trade.current_rate && trade.current_rate > 0
+          ? roundPrice(trade.current_rate)
           : execInfo && execInfo.executionPrice > 0
           ? roundPrice(execInfo.executionPrice)
-          : roundPrice(trade.take_profit_abs > 0 ? trade.take_profit_abs : trade.current_rate);
+          : roundPrice(trade.open_rate);
       let closeTs = params.closedTime && params.closedTime > 0 ? params.closedTime : Date.now();
       let closeFee = params.fee && params.fee > 0 ? Number(params.fee.toFixed(4)) : trade.fee_close || 0;
       let realizedNetPnl: number | undefined;
@@ -8557,24 +8785,33 @@ async function startServer() {
       } else {
         const creds = getAccountCredentialsFromStore(matchedAcc);
         if (creds && !isSimulatedTestApiKey(creds.apiKey)) {
-          const closedPnlRes = await fetchExchangeClosedPnl(creds, 10, [trade.pair], true).catch(() => ({
-            success: false,
-            closed: [],
-          }));
-          if (closedPnlRes.success && closedPnlRes.closed.length > 0) {
-            const matched = closedPnlRes.closed.find(
-              (c) =>
-                c.pair === trade.pair &&
-                (c.is_short === trade.is_short || c.order_id.startsWith('inc-')) &&
-                c.updated_time >= (trade.open_timestamp || 0) - 120_000
-            );
-            if (matched) {
-              if (matched.exit_price > 0) closePrice = roundPrice(matched.exit_price);
-              if (matched.updated_time > 0) closeTs = matched.updated_time;
-              if (matched.open_fee > 0) trade.fee_open = matched.open_fee;
-              if (matched.close_fee > 0) closeFee = matched.close_fee;
-              realizedNetPnl = matched.closed_pnl;
-              if (matched.order_id) exOrderId = matched.order_id;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            if (attempt === 1) {
+              await new Promise((r) => setTimeout(r, 1200));
+            }
+            const closedPnlRes = await fetchExchangeClosedPnl(creds, 15, [trade.pair], true).catch(() => ({
+              success: false,
+              closed: [],
+            }));
+            if (closedPnlRes.success && closedPnlRes.closed.length > 0) {
+              const matched = closedPnlRes.closed.find(
+                (c) =>
+                  c.pair === trade.pair &&
+                  (c.is_short === trade.is_short || c.order_id.startsWith('inc-')) &&
+                  c.updated_time >= (trade.open_timestamp || 0) - 120_000
+              );
+              if (matched) {
+                if (matched.entry_price > 0 && !matched.order_id.startsWith('inc-')) {
+                  trade.open_rate = roundPrice(matched.entry_price);
+                }
+                if (matched.exit_price > 0) closePrice = roundPrice(matched.exit_price);
+                if (matched.updated_time > 0) closeTs = matched.updated_time;
+                if (matched.open_fee > 0) trade.fee_open = matched.open_fee;
+                if (matched.close_fee > 0) closeFee = matched.close_fee;
+                realizedNetPnl = matched.closed_pnl;
+                if (matched.order_id) exOrderId = matched.order_id;
+                break;
+              }
             }
           }
         }
@@ -8743,30 +8980,47 @@ async function startServer() {
         );
 
         if (sanitizedWsMargin > 0) {
-          acc.used_margin_usdt = Number(Math.max(sanitizedWsMargin, localOpenMargin).toFixed(2));
+          acc.used_margin_usdt = Number(
+            (wsState.positionsSynced ? sanitizedWsMargin : Math.max(sanitizedWsMargin, localOpenMargin)).toFixed(2)
+          );
         } else if (wsState.positionsSynced && wsState.positions.length === 0) {
           acc.used_margin_usdt = 0;
         } else if (localOpenMargin > 0) {
           acc.used_margin_usdt = localOpenMargin;
         }
 
-        acc.available_balance_usdt = Number(
-          Math.max(0, acc.wallet_balance_usdt - (acc.used_margin_usdt || 0)).toFixed(2)
-        );
+        acc.available_balance_usdt =
+          typeof wsState.availableBalanceUsdt === 'number' &&
+          Number.isFinite(wsState.availableBalanceUsdt) &&
+          wsState.availableBalanceUsdt >= 0 &&
+          wsState.availableBalanceUsdt <= acc.wallet_balance_usdt + Math.max(0, acc.unrealized_pnl || 0) + 1.0
+            ? Number(wsState.availableBalanceUsdt.toFixed(2))
+            : Number(
+                Math.max(0, acc.wallet_balance_usdt + Math.min(0, acc.unrealized_pnl || 0) - (acc.used_margin_usdt || 0)).toFixed(2)
+              );
         if (wsState.positionsSynced) {
           acc.open_trades_count = wsState.positions.length;
         }
         acc.status = 'connected';
 
         // Мгновенно синхронизируем объём, маржу и PnL открытых позиций по приватным WS-событиям биржи,
-        // НО цену входа (open_rate) обновляем ТОЛЬКО при реальном увеличении объёма (DCA) или первичном выравнивании после открытия!
+        // НО если объём увеличился (внешний DCA) — НЕ перезаписываем existing.amount вслепую без сохранения шага DCA,
+        // а вызываем syncPositionsAndHistoryFromExchanges, чтобы шаг DCA сохранился в orders и dca_count!
         let needsFullPositionSync = false;
         for (const pos of wsState.positions) {
+          const posLockKey = getPosLockKey(targetAccountId, pos.pair, pos.is_short);
+          if (activePositionKeys.has(posLockKey)) {
+            continue;
+          }
           const existing = accOpenTrades.find(
             (t) => t.pair === pos.pair && t.is_short === pos.is_short
           );
           if (existing) {
             const sizeIncreased = pos.size > existing.amount * 1.02;
+            if (sizeIncreased) {
+              needsFullPositionSync = true;
+              continue;
+            }
             const isInitialFillAlign =
               !sizeIncreased &&
               (existing.dca_count || 0) === 0 &&
@@ -8780,8 +9034,6 @@ async function startServer() {
               if (Array.isArray(existing.orders) && existing.orders.length === 1) {
                 existing.orders[0].price = exactEntry;
               }
-            } else if (sizeIncreased && pos.entry_price > 0) {
-              existing.open_rate = roundPrice(pos.entry_price);
             }
             if (pos.size > 0) existing.amount = Number(pos.size.toFixed(4));
             const sanitizedPosIm = sanitizePositionMarginUsdt(

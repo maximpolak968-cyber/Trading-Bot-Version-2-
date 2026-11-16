@@ -956,6 +956,10 @@ export class SqliteBotDatabase {
           trade.user_id || 'owner'
         );
       } else {
+        const effectiveDcaCount = Math.max(
+          Number(trade.dca_count || 0),
+          Array.isArray(rawOrders) ? rawOrders.filter((o: any) => Number(o?.step) > 0).length : 0
+        );
         const stmt = this.db.prepare(`
           UPDATE trades SET
             open_rate = ?, close_rate = ?, stake_amount = ?, amount = ?,
@@ -964,7 +968,8 @@ export class SqliteBotDatabase {
             dca_count = ?, last_dca_date = ?, target_tp_rate = ?, stoploss_rate = ?,
             support_level = ?, resistance_level = ?, plan_notes = ?,
             fee_open = ?, fee_close = ?, fee_total = ?, gross_profit = ?,
-            net_profit = ?, net_profit_percent = ?, dca_history = ?,
+            net_profit = ?, net_profit_percent = ?, initial_amount = ?, initial_stake = ?,
+            dca_history = ?,
             campaign_id = ?, campaign_banked_profit = ?, trade_state = ?,
             next_dca_price = ?, tp_manual_override = ?, sl_manual_override = ?,
             dca_manual_override = ?, planned_dca_json = ?, orders_json = ?,
@@ -988,7 +993,7 @@ export class SqliteBotDatabase {
           trade.profit_pct ?? 0,
           trade.enter_tag || '',
           trade.exit_reason ?? null,
-          trade.dca_count || 0,
+          effectiveDcaCount,
           trade.last_dca_date ?? null,
           trade.take_profit_abs || null,
           trade.stop_loss_abs || null,
@@ -1001,10 +1006,12 @@ export class SqliteBotDatabase {
           trade.gross_profit ?? trade.profit_abs ?? 0,
           trade.net_profit ?? trade.profit_abs ?? 0,
           trade.net_profit_percent ?? trade.profit_pct ?? 0,
+          trade.initial_amount ?? trade.amount,
+          trade.initial_stake ?? trade.stake_amount,
           dcaHistJson,
           trade.campaign_id ?? null,
           trade.campaign_banked_profit ?? null,
-          trade.trade_state || (trade.is_open ? (trade.dca_count > 0 ? 'DCA_ACTIVE' : 'WAITING_PULLBACK') : 'CLOSED'),
+          trade.trade_state || (trade.is_open ? (effectiveDcaCount > 0 ? 'DCA_ACTIVE' : 'WAITING_PULLBACK') : 'CLOSED'),
           nextDca,
           trade.tp_manual_override ? 1 : 0,
           trade.sl_manual_override ? 1 : 0,
@@ -1091,48 +1098,49 @@ export class SqliteBotDatabase {
         const tradeIdNum = Number(r.id);
         const isShortBool = Boolean(r.is_short);
 
-        // Резервное восстановление цепочки ордеров (Нач. вход + все шаги DCA) из таблицы orders, если orders_json был пуст
-        if (!Array.isArray(orders) || orders.length === 0) {
-          try {
-            const dbOrderRows = this.db
-              .prepare(
-                `SELECT * FROM orders WHERE trade_id = ? AND action_type NOT LIKE '%EXIT%' AND action_type NOT LIKE '%PROFIT%' ORDER BY id ASC`
-              )
-              .all(tradeIdNum);
-            if (dbOrderRows.length > 0) {
-              orders = dbOrderRows.map((o: any, idx: number) => ({
-                id: `ord-${tradeIdNum}-${idx}`,
-                step: idx,
-                label:
-                  idx === 0
-                    ? `Нач. вход #1 (${isShortBool ? 'Шорт' : 'Лонг'})`
-                    : `Усреднение #${idx}`,
+        // Резервное восстановление цепочки ордеров (Нач. вход + все шаги DCA) из таблицы orders, если orders_json был пуст или не содержал все шаги
+        try {
+          const dbOrderRows = this.db
+            .prepare(
+              `SELECT * FROM orders WHERE trade_id = ? AND action_type NOT LIKE '%EXIT%' AND action_type NOT LIKE '%PROFIT%' AND action_type NOT LIKE '%CLOSE%' ORDER BY id ASC`
+            )
+            .all(tradeIdNum);
+          if (
+            dbOrderRows.length > 0 &&
+            (!Array.isArray(orders) || orders.length === 0 || dbOrderRows.length > orders.length)
+          ) {
+            orders = dbOrderRows.map((o: any, idx: number) => ({
+              id: `ord-${tradeIdNum}-${idx}`,
+              step: idx,
+              label:
+                idx === 0
+                  ? `Нач. вход #1 (${isShortBool ? 'Шорт' : 'Лонг'})`
+                  : `Усреднение #${idx}`,
+              side: isShortBool ? 'short' : 'long',
+              price: Number(o.price || r.open_rate),
+              amount: Number(o.amount || r.amount),
+              stake_amount: Number(o.cost || r.stake_amount),
+              timestamp:
+                this.parseStoredUtcTimestamp(String(o.created_at || openDateStr)) ?? openTs,
+              date: String(o.created_at || openDateStr),
+            }));
+          } else if (!Array.isArray(orders) || orders.length === 0) {
+            orders = [
+              {
+                id: `ord-${tradeIdNum}-0`,
+                step: 0,
+                label: `Нач. вход #1 (${isShortBool ? 'Шорт' : 'Лонг'})`,
                 side: isShortBool ? 'short' : 'long',
-                price: Number(o.price || r.open_rate),
-                amount: Number(o.amount || r.amount),
-                stake_amount: Number(o.cost || r.stake_amount),
-                timestamp:
-                  this.parseStoredUtcTimestamp(String(o.created_at || openDateStr)) ?? openTs,
-                date: String(o.created_at || openDateStr),
-              }));
-            } else {
-              orders = [
-                {
-                  id: `ord-${tradeIdNum}-0`,
-                  step: 0,
-                  label: `Нач. вход #1 (${isShortBool ? 'Шорт' : 'Лонг'})`,
-                  side: isShortBool ? 'short' : 'long',
-                  price: Number(r.initial_open_rate || r.open_rate || 0),
-                  amount: Number(r.initial_amount || r.amount || 0),
-                  stake_amount: Number(r.initial_stake || r.stake_amount || 0),
-                  timestamp: openTs,
-                  date: openDateStr,
-                },
-              ];
-            }
-          } catch {
-            // fallback
+                price: Number(r.initial_open_rate || r.open_rate || 0),
+                amount: Number(r.initial_amount || r.amount || 0),
+                stake_amount: Number(r.initial_stake || r.stake_amount || 0),
+                timestamp: openTs,
+                date: openDateStr,
+              },
+            ];
           }
+        } catch {
+          // fallback
         }
 
         if ((!Array.isArray(dcaHistory) || dcaHistory.length === 0) && orders.length > 1) {
@@ -1150,20 +1158,51 @@ export class SqliteBotDatabase {
         }
 
         const rawAmount = Number(r.amount || 0);
-        const rawInitialAmount = Number(r.initial_amount || rawAmount || 0);
+        const orderDcaSteps = Array.isArray(orders)
+          ? orders.filter((o: any) => Number(o?.step) > 0).length
+          : 0;
+        const dcaCountNum = Math.max(
+          Number(r.dca_count || 0),
+          Array.isArray(dcaHistory) ? dcaHistory.length : 0,
+          orderDcaSteps
+        );
+        const firstOrder = Array.isArray(orders) && orders.length > 0 ? orders[0] : null;
+        const storedInitAmt = Number(r.initial_amount || 0);
+        const rawInitialAmount =
+          dcaCountNum > 0 &&
+          firstOrder &&
+          Number(firstOrder.amount) > 0 &&
+          (storedInitAmt <= 0 || (rawAmount > 0 && Math.abs(storedInitAmt - rawAmount) < 1e-6 && orders.length > 1))
+            ? Number(firstOrder.amount)
+            : storedInitAmt > 0
+            ? storedInitAmt
+            : rawAmount;
         const rawOpenRate = Number(r.open_rate || 0);
-        const dcaCountNum = Number(r.dca_count || 0);
         const rawInitialOpenRate =
           dcaCountNum === 0 && rawOpenRate > 0
             ? rawOpenRate
-            : Number(r.initial_open_rate || rawOpenRate || 0);
+            : Number(
+                (firstOrder && Number(firstOrder.price) > 0 ? firstOrder.price : 0) ||
+                  r.initial_open_rate ||
+                  rawOpenRate ||
+                  0
+              );
         const rawLev = Math.max(1, Number(r.leverage || 25));
         const rawStake = Number(r.stake_amount || 0);
         const sanitizedStake =
           rawAmount > 0 && rawOpenRate > 0
             ? sanitizePositionMarginUsdt(rawStake, rawAmount, rawOpenRate, rawLev)
             : rawStake;
-        const rawInitialStake = Number(r.initial_stake || sanitizedStake || 0);
+        const storedInitStake = Number(r.initial_stake || 0);
+        const rawInitialStake =
+          dcaCountNum > 0 &&
+          firstOrder &&
+          Number(firstOrder.stake_amount) > 0 &&
+          (storedInitStake <= 0 || (sanitizedStake > 0 && Math.abs(storedInitStake - sanitizedStake) < 0.05 && orders.length > 1))
+            ? Number(firstOrder.stake_amount)
+            : storedInitStake > 0
+            ? storedInitStake
+            : sanitizedStake;
         const sanitizedInitialStake =
           rawInitialAmount > 0 && rawInitialOpenRate > 0
             ? sanitizePositionMarginUsdt(rawInitialStake, rawInitialAmount, rawInitialOpenRate, rawLev)
@@ -1176,15 +1215,25 @@ export class SqliteBotDatabase {
 
         if (
           Math.abs(rawStake - sanitizedStake) > 1.0 ||
-          Math.abs(rawInitialStake - sanitizedInitialStake) > 1.0 ||
+          Math.abs(storedInitStake - sanitizedInitialStake) > 1.0 ||
+          Math.abs(storedInitAmt - rawInitialAmount) > 1e-5 ||
+          dcaCountNum !== Number(r.dca_count || 0) ||
           (dcaCountNum === 0 && Math.abs(Number(r.initial_open_rate || rawOpenRate) - rawOpenRate) > 1e-8)
         ) {
           try {
             this.db
               .prepare(
-                `UPDATE trades SET stake_amount = ?, initial_stake = ?, initial_open_rate = ?, orders_json = ? WHERE id = ?`
+                `UPDATE trades SET stake_amount = ?, initial_stake = ?, initial_amount = ?, dca_count = ?, initial_open_rate = ?, orders_json = ? WHERE id = ?`
               )
-              .run(sanitizedStake, sanitizedInitialStake, rawInitialOpenRate, JSON.stringify(orders), tradeIdNum);
+              .run(
+                sanitizedStake,
+                sanitizedInitialStake,
+                rawInitialAmount,
+                dcaCountNum,
+                rawInitialOpenRate,
+                JSON.stringify(orders),
+                tradeIdNum
+              );
           } catch {
             // ignore self-heal error
           }
@@ -1222,7 +1271,9 @@ export class SqliteBotDatabase {
           close_rate: r.close_rate !== null && r.close_rate !== undefined ? Number(r.close_rate) : null,
           profit_ratio: Number(((r.profit_percent || 0) / 100).toFixed(4)),
           profit_pct: Number(r.profit_percent || 0),
-          profit_abs: Number(r.net_profit ?? r.profit ?? 0),
+          profit_abs: Boolean(r.is_open)
+            ? Number(r.gross_profit ?? r.profit ?? 0)
+            : Number(r.net_profit ?? r.profit ?? 0),
           take_profit_abs: Number(r.target_tp_rate || 0),
           take_profit_pct: 1.8,
           tp_manual_override: Boolean(r.tp_manual_override),
@@ -1237,7 +1288,7 @@ export class SqliteBotDatabase {
           support_level: r.support_level ? Number(r.support_level) : undefined,
           resistance_level: r.resistance_level ? Number(r.resistance_level) : undefined,
           next_dca_price: r.next_dca_price ? Number(r.next_dca_price) : undefined,
-          trade_state: String(r.trade_state || (Number(r.dca_count || 0) > 0 ? 'AVERAGED' : 'WAITING_PULLBACK')),
+          trade_state: String(r.trade_state || (dcaCountNum > 0 ? 'DCA_ACTIVE' : 'WAITING_PULLBACK')),
           pullback_min_profit_pct: Number(r.pullback_min_profit_pct ?? 0.5),
           plan_notes: r.plan_notes ? String(r.plan_notes) : undefined,
           campaign_id: r.campaign_id ? String(r.campaign_id) : undefined,

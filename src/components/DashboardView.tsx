@@ -164,7 +164,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       ? balance.equity_balance
       : walletBalance + openProfitAbs;
   const freeMargin =
-    typeof balance?.available_balance === 'number' && balance.available_balance > 0
+    typeof balance?.available_balance === 'number' &&
+    Number.isFinite(balance.available_balance) &&
+    balance.available_balance >= 0 &&
+    balance.available_balance < 1e8
       ? balance.available_balance
       : Math.max(0, currentEquity - openStakeSum);
   const marginUsagePct = walletBalance > 0 ? (openStakeSum / walletBalance) * 100 : 0;

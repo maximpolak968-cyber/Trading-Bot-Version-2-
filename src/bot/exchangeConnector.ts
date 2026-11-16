@@ -2872,10 +2872,12 @@ export async function testExchangeConnection(
                       p.avgPrice || p.entryPrice || 0
                     );
                     if (!(entryPrice > 0)) continue;
+                    const restMarkPrice = Number(p.markPrice || 0);
                     const markPrice = Number(
-                      (liveTick && liveTick.markPrice > 0 ? liveTick.markPrice : 0) ||
-                        p.markPrice ||
-                        entryPrice
+                      restMarkPrice > 0
+                        ? restMarkPrice
+                        : (liveTick && liveTick.markPrice > 0 ? liveTick.markPrice : 0) ||
+                          entryPrice
                     );
                     const lev = Math.max(1, Math.round(Number(p.leverage || 25)));
                     const sideStr = String(p.side || '').toLowerCase();
@@ -2885,10 +2887,16 @@ export async function testExchangeConnection(
                     seenBybitPos.add(posKey);
                     const rawIm = Number(p.positionIM || p.positionBalance || 0);
                     const marginUsdt = sanitizePositionMarginUsdt(rawIm, size, entryPrice, lev);
-                    const unreal =
-                      liveTick && liveTick.markPrice > 0
-                        ? Number(((isShort ? entryPrice - markPrice : markPrice - entryPrice) * size).toFixed(4))
-                        : Number(p.unrealisedPnl || 0);
+                    const hasExactRestUpl =
+                      p.unrealisedPnl !== undefined &&
+                      p.unrealisedPnl !== null &&
+                      String(p.unrealisedPnl).trim() !== '' &&
+                      Number.isFinite(Number(p.unrealisedPnl));
+                    const unreal = hasExactRestUpl
+                      ? Number(Number(p.unrealisedPnl).toFixed(4))
+                      : markPrice > 0
+                      ? Number(((isShort ? entryPrice - markPrice : markPrice - entryPrice) * size).toFixed(4))
+                      : 0;
                     posUnrealizedSum += unreal;
                     posMarginSum += marginUsdt;
                     const tp = Number(p.takeProfit || 0);
@@ -3564,10 +3572,16 @@ export async function fetchExchangeOpenPositions(
               const sl = Number(p.stopLoss || 0);
               const cTime = Number(p.createdTime || p.updatedTime || Date.now());
               const uTime = Number(p.updatedTime || cTime);
-              const unrealPnl =
-                liveTick && liveTick.markPrice > 0
-                  ? Number(((isShort ? entryPrice - markPrice : markPrice - entryPrice) * size).toFixed(4))
-                  : Number(p.unrealisedPnl || 0);
+              const hasExactRestUpl =
+                p.unrealisedPnl !== undefined &&
+                p.unrealisedPnl !== null &&
+                String(p.unrealisedPnl).trim() !== '' &&
+                Number.isFinite(Number(p.unrealisedPnl));
+              const unrealPnl = hasExactRestUpl
+                ? Number(Number(p.unrealisedPnl).toFixed(4))
+                : markPrice > 0
+                ? Number(((isShort ? entryPrice - markPrice : markPrice - entryPrice) * size).toFixed(4))
+                : 0;
               const posItem: ExchangePositionItem = {
                 pair: symbolToFreqtradePair(sym),
                 symbol: sym,
@@ -3785,10 +3799,17 @@ export async function fetchExchangeOpenPositions(
             );
             const marginUsdt = sanitizePositionMarginUsdt(initialMargin, size, entryPrice, lev);
             const uTime = Number(p.updateTime || Date.now());
-            const unrealPnl =
-              liveTick && liveTick.markPrice > 0
-                ? Number(((isShort ? entryPrice - markPrice : markPrice - entryPrice) * size).toFixed(4))
-                : Number(p.unRealizedProfit ?? p.unrealizedProfit ?? 0);
+            const rawRestUpl = p.unRealizedProfit ?? p.unrealizedProfit;
+            const hasExactRestUpl =
+              rawRestUpl !== undefined &&
+              rawRestUpl !== null &&
+              String(rawRestUpl).trim() !== '' &&
+              Number.isFinite(Number(rawRestUpl));
+            const unrealPnl = hasExactRestUpl
+              ? Number(Number(rawRestUpl).toFixed(4))
+              : markPrice > 0
+              ? Number(((isShort ? entryPrice - markPrice : markPrice - entryPrice) * size).toFixed(4))
+              : 0;
             const posItem: ExchangePositionItem = {
               pair: symbolToFreqtradePair(sym),
               symbol: sym,
@@ -4091,70 +4112,103 @@ export async function fetchExchangeClosedPnl(
   // 1. BYBIT V5 (/v5/position/closed-pnl)
   if (creds.exchange === 'bybit') {
     const candidateHosts = getBybitCandidateHosts(cleanKey, creds.isTestnet);
+    const specificSyms = Array.from(
+      new Set(
+        (knownSymbols || [])
+          .map((s) => pairToCleanSymbol(s))
+          .filter((s) => s.length >= 4 && isSupportedFuturesSymbol(s))
+      )
+    ).slice(0, 3);
     for (const baseUrl of candidateHosts) {
       try {
-        const timestamp = await getBybitTimestamp(baseUrl, false);
         const recvWindow = '15000';
-        const queryString = `category=linear&limit=${Math.min(100, Math.max(10, limit))}`;
-        const signature = signBybitV5(timestamp, cleanKey, recvWindow, queryString, cleanSecret);
-        const res = await makeHttpsRequest(`${baseUrl}/v5/position/closed-pnl?${queryString}`, {
-          method: 'GET',
-          headers: {
-            'X-BAPI-API-KEY': cleanKey,
-            'X-BAPI-TIMESTAMP': timestamp,
-            'X-BAPI-SIGN': signature,
-            'X-BAPI-RECV-WINDOW': recvWindow,
-            'Content-Type': 'application/json',
-          },
-          timeoutMs: 6500,
-        });
-        if (res.statusCode === 401 || res.statusCode === 403) {
-          continue;
-        }
-        if (res.statusCode === 200) {
-          const json = JSON.parse(res.data);
-          if (json.retCode === 10003 || json.retCode === 10004 || json.retCode === 33004) {
-            continue;
+        const queriesToRun =
+          specificSyms.length > 0 && specificSyms.length <= 2
+            ? [
+                ...specificSyms.map(
+                  (sym) => `category=linear&symbol=${encodeURIComponent(sym)}&limit=${Math.min(50, Math.max(10, limit))}`
+                ),
+                `category=linear&limit=${Math.min(100, Math.max(10, limit))}`,
+              ]
+            : [`category=linear&limit=${Math.min(100, Math.max(10, limit))}`];
+
+        const closed: ExchangeClosedPnlItem[] = [];
+        const seenOrderKeys = new Set<string>();
+        let anySuccess = false;
+        let authFailedOnHost = false;
+
+        for (const queryString of queriesToRun) {
+          const timestamp = await getBybitTimestamp(baseUrl, false);
+          const signature = signBybitV5(timestamp, cleanKey, recvWindow, queryString, cleanSecret);
+          const res = await makeHttpsRequest(`${baseUrl}/v5/position/closed-pnl?${queryString}`, {
+            method: 'GET',
+            headers: {
+              'X-BAPI-API-KEY': cleanKey,
+              'X-BAPI-TIMESTAMP': timestamp,
+              'X-BAPI-SIGN': signature,
+              'X-BAPI-RECV-WINDOW': recvWindow,
+              'Content-Type': 'application/json',
+            },
+            timeoutMs: 6500,
+          });
+          if (res.statusCode === 401 || res.statusCode === 403) {
+            authFailedOnHost = true;
+            break;
           }
-          if (json.retCode === 0 && Array.isArray(json.result?.list)) {
-            bybitHostCache.set(cleanKey, baseUrl);
-            const closed: ExchangeClosedPnlItem[] = [];
-            for (const item of json.result.list) {
-              const sym = String(item.symbol || '');
-              const qty = Math.abs(Number(item.qty || item.closedSize || 0));
-              const entryPrice = Number(item.avgEntryPrice || item.orderPrice || 0);
-              const exitPrice = Number(item.avgExitPrice || item.execPrice || 0);
-              if (!sym || !(qty > 0) || !(entryPrice > 0) || !(exitPrice > 0)) continue;
-              const closingSide = String(item.side || '').toLowerCase();
-              const isShort = closingSide === 'buy';
-              const lev = Math.max(1, Math.round(Number(item.leverage || 25)));
-              const closedPnl = Number(item.closedPnl || 0);
-              const openFee = Math.abs(
-                Number(item.openFee || entryPrice * qty * 0.00055)
-              );
-              const closeFee = Math.abs(
-                Number(item.closeFee || exitPrice * qty * 0.00055)
-              );
-              const cTime = Number(item.createdTime || item.updatedTime || Date.now());
-              const uTime = Number(item.updatedTime || cTime);
-              closed.push({
-                order_id: String(item.orderId || `${sym}-${uTime}`),
-                pair: symbolToFreqtradePair(sym),
-                symbol: sym,
-                is_short: isShort,
-                qty,
-                entry_price: entryPrice,
-                exit_price: exitPrice,
-                leverage: lev,
-                closed_pnl: Number(closedPnl.toFixed(4)),
-                open_fee: Number(openFee.toFixed(4)),
-                close_fee: Number(closeFee.toFixed(4)),
-                created_time: cTime,
-                updated_time: uTime,
-              });
+          if (res.statusCode === 200) {
+            const json = JSON.parse(res.data);
+            if (json.retCode === 10003 || json.retCode === 10004 || json.retCode === 33004) {
+              authFailedOnHost = true;
+              break;
             }
-            return { success: true, closed };
+            if (json.retCode === 0 && Array.isArray(json.result?.list)) {
+              bybitHostCache.set(cleanKey, baseUrl);
+              anySuccess = true;
+              for (const item of json.result.list) {
+                const sym = String(item.symbol || '');
+                const qty = Math.abs(Number(item.qty || item.closedSize || 0));
+                const entryPrice = Number(item.avgEntryPrice || item.orderPrice || 0);
+                const exitPrice = Number(item.avgExitPrice || item.execPrice || 0);
+                if (!sym || !(qty > 0) || !(entryPrice > 0) || !(exitPrice > 0)) continue;
+                const closingSide = String(item.side || '').toLowerCase();
+                const isShort = closingSide === 'buy';
+                const lev = Math.max(1, Math.round(Number(item.leverage || 25)));
+                const closedPnl = Number(item.closedPnl || 0);
+                const openFee = Math.abs(
+                  Number(item.openFee || entryPrice * qty * 0.00055)
+                );
+                const closeFee = Math.abs(
+                  Number(item.closeFee || exitPrice * qty * 0.00055)
+                );
+                const cTime = Number(item.createdTime || item.updatedTime || Date.now());
+                const uTime = Number(item.updatedTime || cTime);
+                const ordId = String(item.orderId || `${sym}-${uTime}`);
+                const dedupKey = `${ordId}:${uTime}`;
+                if (seenOrderKeys.has(dedupKey)) continue;
+                seenOrderKeys.add(dedupKey);
+                closed.push({
+                  order_id: ordId,
+                  pair: symbolToFreqtradePair(sym),
+                  symbol: sym,
+                  is_short: isShort,
+                  qty,
+                  entry_price: entryPrice,
+                  exit_price: exitPrice,
+                  leverage: lev,
+                  closed_pnl: Number(closedPnl.toFixed(4)),
+                  open_fee: Number(openFee.toFixed(4)),
+                  close_fee: Number(closeFee.toFixed(4)),
+                  created_time: cTime,
+                  updated_time: uTime,
+                });
+              }
+            }
           }
+        }
+        if (authFailedOnHost) continue;
+        if (anySuccess) {
+          closed.sort((a, b) => b.updated_time - a.updated_time);
+          return { success: true, closed };
         }
       } catch {
         // try next host

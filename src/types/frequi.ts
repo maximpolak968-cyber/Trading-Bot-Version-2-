@@ -179,7 +179,9 @@ export interface FreqtradeTrade {
   fee_open?: number;
   fee_close?: number;
   fee_total?: number;
+  gross_profit?: number;
   net_profit?: number;
+  net_profit_percent?: number;
   initial_stop_loss_abs: number;
   initial_stop_loss_pct: number;
   exit_reason: string | null;

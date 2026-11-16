@@ -260,10 +260,16 @@ export const TradeView: React.FC<TradeViewProps> = ({
       return raw;
     };
     const openMarginSum = openTrades.reduce((s, t) => s + sanitizeTradeStake(t), 0);
-    const openPnlSum = openTrades.reduce(
-      (s, t) => s + Number(t.net_profit ?? t.profit_abs ?? 0),
+    const tradesOpenPnlSum = openTrades.reduce(
+      (s, t) => s + Number(t.profit_abs ?? t.gross_profit ?? 0),
       0
     );
+    const openPnlSum =
+      typeof balance?.unrealized_pnl === 'number' &&
+      Number.isFinite(balance.unrealized_pnl) &&
+      (balance.unrealized_pnl !== 0 || openTrades.length === 0)
+        ? balance.unrealized_pnl
+        : tradesOpenPnlSum;
     const closedPnlSum = closedTrades.reduce(
       (s, t) => s + Number(t.net_profit ?? t.profit_abs ?? 0),
       0
@@ -279,18 +285,16 @@ export const TradeView: React.FC<TradeViewProps> = ({
         : 0;
     const usedMargin =
       validBalanceUsedMargin > 0
-        ? openTrades.length > 0
-          ? Math.max(validBalanceUsedMargin, openMarginSum)
-          : validBalanceUsedMargin
+        ? validBalanceUsedMargin
         : openMarginSum;
     const rawAvail = Number(balance?.available_balance);
     const freeMargin =
       Number.isFinite(rawAvail) &&
-      rawAvail > 0 &&
+      rawAvail >= 0 &&
       rawAvail < 1e8 &&
-      (usedMargin === 0 || rawAvail <= walletBal - usedMargin + 0.5)
+      (walletBal <= 0 || rawAvail <= walletBal + Math.max(0, openPnlSum) + 1.0)
         ? rawAvail
-        : Math.max(0, walletBal - usedMargin);
+        : Math.max(0, walletBal + Math.min(0, openPnlSum) - usedMargin);
     const equityBal = walletBal + openPnlSum;
     return {
       walletBal,
@@ -641,13 +645,13 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                 <div className="text-white">{fmtComma(trade.stake_amount, 2)}$</div>
                                 <div
                                   className={`text-[9.5px] font-semibold ${
-                                    (trade.net_profit ?? trade.profit_abs ?? 0) >= 0
+                                    (trade.profit_abs ?? trade.gross_profit ?? 0) >= 0
                                       ? 'text-[#10b981]'
                                       : 'text-[#ef4444]'
                                   }`}
                                 >
-                                  {(trade.net_profit ?? trade.profit_abs ?? 0) >= 0 ? '+' : ''}
-                                  {fmtComma(trade.net_profit ?? trade.profit_abs ?? 0, 2)}$
+                                  {(trade.profit_abs ?? trade.gross_profit ?? 0) >= 0 ? '+' : ''}
+                                  {fmtComma(trade.profit_abs ?? trade.gross_profit ?? 0, 2)}$
                                 </div>
                               </td>
 
@@ -950,13 +954,13 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                 <div className="text-white">{fmtComma(trade.stake_amount, 2)}$</div>
                                 <div
                                   className={`text-[9.5px] font-semibold ${
-                                    (trade.net_profit ?? trade.profit_abs ?? 0) >= 0
+                                    (trade.profit_abs ?? trade.gross_profit ?? 0) >= 0
                                       ? 'text-[#10b981]'
                                       : 'text-[#ef4444]'
                                   }`}
                                 >
-                                  {(trade.net_profit ?? trade.profit_abs ?? 0) >= 0 ? '+' : ''}
-                                  {fmtComma(trade.net_profit ?? trade.profit_abs ?? 0, 2)}$
+                                  {(trade.profit_abs ?? trade.gross_profit ?? 0) >= 0 ? '+' : ''}
+                                  {fmtComma(trade.profit_abs ?? trade.gross_profit ?? 0, 2)}$
                                 </div>
                               </td>
 
