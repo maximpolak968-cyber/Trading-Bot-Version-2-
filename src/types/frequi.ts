@@ -51,6 +51,7 @@ export interface PlannedDcaLevel {
   amount: number;
   distance_pct: number;
   manual_override?: boolean;
+  filled?: boolean;
 }
 
 export interface BotChartLevel {
@@ -192,6 +193,10 @@ export interface FreqtradeTrade {
   parent_trade_id?: number;
   campaign_id?: string;
   campaign_banked_profit?: number;
+  trade_state?: string;
+  rehedge_stop_price?: number;
+  rehedge_stop_qty?: number;
+  whipsaw_stop_price?: number;
 }
 
 export interface ProfitSummary {

@@ -234,7 +234,7 @@ function refreshTradeLivePriceFromWs(t: FreqtradeTrade): boolean {
 async function processFastWsTradeClose(
   tradeId: number,
   execInfo: NonNullable<ReturnType<typeof getFuturesExecutionPrice>>,
-  reasonTag: 'roi_target_tp' | 'hedge_breakeven_profit'
+  reasonTag: 'roi_target_tp' | 'hedge_breakeven_profit' | 'trailed_breakeven_stop_profit'
 ): Promise<void> {
   if (fastTpInFlightIds.has(tradeId)) return;
   const candidate = tradesStore.find((t) => t.trade_id === tradeId && t.is_open);
@@ -441,6 +441,45 @@ function evaluateFastWsTpExit(wsTick: LiveWsTicker): void {
 
     const mark = execInfo.markPrice;
     const execPrice = execInfo.executionPrice;
+
+    // Мгновенный триггер основного цикла при пересечении отложенного ордера перестраховки (Сценарий 4) или анти-распил стопа (Сценарий 1Б)
+    if (t.rehedge_stop_price && t.rehedge_stop_price > 0) {
+      const triggeredRehedge = t.is_short
+        ? mark >= t.rehedge_stop_price || execPrice >= t.rehedge_stop_price
+        : mark <= t.rehedge_stop_price || execPrice <= t.rehedge_stop_price;
+      if (triggeredRehedge) {
+        void runScalpBotCycle();
+        continue;
+      }
+    }
+    if (t.whipsaw_stop_price && t.whipsaw_stop_price > 0) {
+      const triggeredWhipsaw = t.is_short
+        ? mark >= t.whipsaw_stop_price || execPrice >= t.whipsaw_stop_price
+        : mark <= t.whipsaw_stop_price || execPrice <= t.whipsaw_stop_price;
+      if (triggeredWhipsaw) {
+        void runScalpBotCycle();
+        continue;
+      }
+    }
+
+    // Если активен подтянутый стоп в безубыток/плюс (Раздел 5Б/5В или Сценарий 2) и цена вернулась к нему — мгновенное закрытие по стоп-профиту
+    const hasLockedBeStop =
+      t.stop_loss_abs > 0 &&
+      t.min_profitable_tp &&
+      (t.is_short
+        ? t.stop_loss_abs <= t.min_profitable_tp * 1.001
+        : t.stop_loss_abs >= t.min_profitable_tp * 0.999);
+
+    if (t.stop_loss_abs > 0) {
+      const hitStop = t.is_short
+        ? mark >= t.stop_loss_abs || execPrice >= t.stop_loss_abs
+        : mark <= t.stop_loss_abs || execPrice <= t.stop_loss_abs;
+      if (hitStop) {
+        void processFastWsTradeClose(t.trade_id, execInfo, 'trailed_breakeven_stop_profit');
+        continue;
+      }
+    }
+
     const minSafeTp =
       t.tp_manual_override && t.take_profit_abs > 0
         ? t.take_profit_abs
@@ -460,6 +499,7 @@ function evaluateFastWsTpExit(wsTick: LiveWsTicker): void {
     }
 
     if (
+      !hasLockedBeStop &&
       t.campaign_banked_profit !== undefined &&
       t.campaign_banked_profit !== null &&
       t.campaign_banked_profit > 0 &&
@@ -1801,9 +1841,22 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
 
   const tpMove = (trade.dca_count || 0) > 0 ? 0.018 : 0.024;
 
+  // Проверяем, не переведена ли позиция в режим сопровождения импульса со стопом в БУ/плюс (Раздел 5Б / 5В / Сценарий 2)
+  const hasActiveBounceTrailTp =
+    trade.stop_loss_abs > 0 &&
+    trade.take_profit_abs > 0 &&
+    trade.min_profitable_tp > 0 &&
+    (trade.is_short
+      ? trade.stop_loss_abs <= trade.min_profitable_tp * 1.001 &&
+        trade.take_profit_abs < trade.min_profitable_tp
+      : trade.stop_loss_abs >= trade.min_profitable_tp * 0.999 &&
+        trade.take_profit_abs > trade.min_profitable_tp);
+
   // Защита ручного TP: если пользователь сам перетащил TP (tp_manual_override === true), бот НИКОГДА не сбрасывает его в фоновых циклах!
   if (trade.tp_manual_override && trade.take_profit_abs > 0) {
     // Оставляем ровно тот TP, который выставил пользователь
+  } else if (hasActiveBounceTrailTp) {
+    // Сохраняем целевой тейк на продолжение отскока при защищённом стопе в БУ (Раздел 5Б / 5В / Сценарий 2)
   } else if (((trade.dca_count || 0) >= 1 || bankedProfitUsdt > 0) && trade.min_profitable_tp) {
     // После разворотного усреднения и/или фиксации страховочной ноги (Сценарий 3.4 и Раздел 5Б/5В)
     // подтягиваем рабочий TP к точке схлопывания корзины P_BE_cycle!
@@ -4455,23 +4508,26 @@ async function runScalpBotCycle(waitForActive = false) {
             trade.rehedge_stop_price = undefined;
             trade.rehedge_stop_qty = undefined;
 
-            // Раздел 5Б («Закрытие через стоп в безубыток + тейк»):
-            // На 1-м уровне усреднения (dca_count === 1), если свеча отскока идёт сильным импульсом в нашу сторону,
-            // подтягиваем жёсткий стоп в точку безубытка с покрытием комиссий (min_profitable_tp) и даём отскоку шанс пройти ещё +0.6%
+            // Раздел 5Б («Первое усреднение: закрытие через стоп в безубыток + тейк»)
+            // и Раздел 5В («Второе усреднение: режим приоритета разгрузки — закрывается минимум половина или вся тяжелая позиция; если импульс отскока сильный — остаток дотягивается до полного безубытка»):
             const lastCandle = candles1h[candles1h.length - 1];
-            const strongBounceImpulse =
-              (trade.dca_count || 0) === 1 &&
-              lastCandle &&
+            const isStrongCandleInOurDirection =
+              Boolean(lastCandle) &&
               (trade.is_short
                 ? lastCandle.close < lastCandle.open && currentPrice <= trade.min_profitable_tp * 0.9985
                 : lastCandle.close > lastCandle.open && currentPrice >= trade.min_profitable_tp * 1.0015);
             const alreadyLockedBeStop =
               trade.stop_loss_abs > 0 &&
               (trade.is_short
-                ? trade.stop_loss_abs <= trade.min_profitable_tp * 1.0005
-                : trade.stop_loss_abs >= trade.min_profitable_tp * 0.9995);
+                ? trade.stop_loss_abs <= trade.min_profitable_tp * 1.001
+                : trade.stop_loss_abs >= trade.min_profitable_tp * 0.999);
 
-            if (strongBounceImpulse && !alreadyLockedBeStop && !trade.tp_manual_override) {
+            if (
+              (trade.dca_count || 0) === 1 &&
+              isStrongCandleInOurDirection &&
+              !alreadyLockedBeStop &&
+              !trade.tp_manual_override
+            ) {
               trade.stop_loss_abs = roundPrice(trade.min_profitable_tp);
               trade.take_profit_abs = roundPrice(
                 currentPrice * (trade.is_short ? 0.994 : 1.006)
@@ -4485,6 +4541,82 @@ async function runScalpBotCycle(waitForActive = false) {
               );
               broadcastTradeLifecycleEvent('trade:updated', trade);
               continue;
+            }
+
+            if (
+              (trade.dca_count || 0) >= 2 &&
+              isStrongCandleInOurDirection &&
+              !alreadyLockedBeStop &&
+              !trade.tp_manual_override &&
+              trade.amount > 0
+            ) {
+              // Раздел 5В: При сильном импульсе отскока от 2-го уровня усреднения закрываем 50% (половину) тяжелой позиции,
+              // фиксируем стоп в точке разгрузки и дотягиваем оставшиеся 50% до полного безубытка (breakeven_price)!
+              const unloadQty = Number((trade.amount * 0.5).toFixed(6));
+              const remainQty = Number((trade.amount - unloadQty).toFixed(6));
+              if (unloadQty > 0 && remainQty > 0) {
+                const partialRes = await dispatchOrderToExchangeAccount(tradeAcc, {
+                  pair: trade.pair,
+                  action: 'CLOSE',
+                  isShort: trade.is_short,
+                  quantity: unloadQty,
+                  referencePrice: closeExecPrice,
+                  leverage: trade.leverage || 25,
+                });
+                if (!tradeAcc || isSimulatedTestApiKey(tradeAcc.api_key_raw) || partialRes?.success) {
+                  const fillPrice =
+                    partialRes?.success && partialRes.price > 0
+                      ? roundPrice(partialRes.price)
+                      : closeExecPrice;
+                  const partialGross = trade.is_short
+                    ? (trade.open_rate - fillPrice) * unloadQty
+                    : (fillPrice - trade.open_rate) * unloadQty;
+                  const partialFee =
+                    partialRes?.commission_usdt && partialRes.commission_usdt > 0
+                      ? partialRes.commission_usdt
+                      : fillPrice * unloadQty * 0.00055;
+                  const partialNet = Number((partialGross - partialFee).toFixed(4));
+                  sqliteDb.runInTransaction(() => {
+                    trade.amount = remainQty;
+                    trade.stake_amount = Number(
+                      ((remainQty * trade.open_rate) / (trade.leverage || 1)).toFixed(4)
+                    );
+                    trade.fee_open = Number(((trade.fee_open || 0) * 0.5).toFixed(4));
+                    trade.campaign_banked_profit = Number(
+                      ((trade.campaign_banked_profit || 0) + partialNet).toFixed(4)
+                    );
+                    trade.stop_loss_abs = roundPrice(
+                      trade.min_profitable_tp || trade.breakeven_price || currentPrice
+                    );
+                    trade.take_profit_abs = roundPrice(
+                      trade.breakeven_price || currentPrice * (trade.is_short ? 0.995 : 1.005)
+                    );
+                    recalculateTradeMetrics(trade, false);
+                    sqliteDb.upsertTrade(trade);
+                    sqliteDb.recordOrder({
+                      trade_id: trade.trade_id,
+                      pair: trade.pair,
+                      order_type: 'market',
+                      side: trade.is_short ? 'buy' : 'sell',
+                      price: fillPrice,
+                      amount: unloadQty,
+                      cost: Number((fillPrice * unloadQty).toFixed(4)),
+                      fee: Number(partialFee.toFixed(4)),
+                      realized_pnl: partialNet,
+                      action_type: 'HEDGE_L2_PARTIAL_UNLOAD',
+                      notes: `[Раздел 5В] Частичная разгрузка 50% на 2-м усреднении по ${fillPrice}$`,
+                    });
+                  });
+                  appendLog(
+                    'freqtrade.bot.hedge',
+                    'INFO',
+                    `⚖️ [Раздел 5В: Частичная разгрузка 50% на 2-м усреднении] [${trade.pair}] #${trade.trade_id}: разгружена половина тяжелой позиции (${unloadQty}) по ${fillPrice}$, стоп закреплён на ${trade.stop_loss_abs}$, остаток (${remainQty}) дотягивается до полного безубытка ${trade.take_profit_abs}$!`,
+                    { userId: tradeUserId }
+                  );
+                  broadcastTradeLifecycleEvent('trade:updated', trade);
+                  continue;
+                }
+              }
             }
 
             let closedHedgeInCycle = false;
@@ -7194,9 +7326,12 @@ async function startServer() {
     const auth = requireAuth(req, res);
     if (!auth) return;
     await initializeBotTrades();
-    const { tradeid, level_type, price } = req.body || {};
-    if (level_type === 'dca') {
-      res.status(400).json({ error: 'Усреднение (DCA) полностью отключено в боте.' });
+    const { tradeid, level_type, price, dca_index } = req.body || {};
+    if (level_type === 'rehedge_stop' && (!Number.isFinite(Number(price)) || Number(price) <= 0)) {
+      res.status(400).json({
+        error:
+          'Раздел 6.3 (Табу №3): Запрет на ручную отмену отложенного ордера перестраховки (Re-Hedge Stop) пока позиция в просадке.',
+      });
       return;
     }
     const id = Number(tradeid);
@@ -7275,6 +7410,13 @@ async function startServer() {
         prevPrice = trade.resistance_level || 0;
         trade.resistance_level = effectivePrice;
         recalculateTradeMetrics(trade, false);
+      } else if (level_type === 'dca') {
+        const idx = Number.isFinite(Number(dca_index)) ? Number(dca_index) : 0;
+        if (Array.isArray(trade.planned_dca_levels) && trade.planned_dca_levels[idx]) {
+          prevPrice = trade.planned_dca_levels[idx].price;
+          trade.planned_dca_levels[idx].price = effectivePrice;
+          recalculateTradeMetrics(trade, false);
+        }
       }
 
       sqliteDb.upsertTrade(trade);

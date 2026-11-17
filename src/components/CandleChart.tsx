@@ -1461,7 +1461,52 @@ export const CandleChart: React.FC<CandleChartProps> = ({
         const dcaCount = t.dca_count || 0;
         const sideEng = isShort ? 'SHORT' : 'LONG';
 
-        // Усреднение (DCA) полностью отключено: линии DCA на графике не отображаются
+        // 2) Planned HTF Reversal Averaging Levels (L1 / L2 — Раздел 4 & Сценарий 3/5)
+        if (Array.isArray(t.planned_dca_levels) && t.planned_dca_levels.length > 0) {
+          t.planned_dca_levels.forEach((lvl: any, dcaIdx: number) => {
+            if (!lvl || !(lvl.price > 0) || lvl.filled) return;
+            const dcaY = priceToY(lvl.price);
+            drawHorizontalLevel(ctx, {
+              y: dcaY,
+              plotLeft,
+              plotRight,
+              plotTop,
+              plotBottom,
+              rightPriceAxisWidth,
+              priceText: formatAxisPrice(lvl.price),
+              badgeText: `⚓ ${lvl.label || `Усреднение L${dcaIdx + 1} (3-фазный разворот)`}`,
+              lineColor: '#f59e0b',
+              badgeBg: 'rgba(69, 26, 3, 0.94)',
+              badgeBorder: '#f59e0b',
+              badgeTextColor: '#fde68a',
+              axisTagBg: '#d97706',
+              lineWidth: 1.4,
+              dash: [6, 4],
+            });
+          });
+        }
+
+        // 2B) Active Pending Re-Hedge Stop Order (Сценарий 4 — Отложенный стоп-ордер перестраховки)
+        if (t.rehedge_stop_price && t.rehedge_stop_price > 0) {
+          const rhY = priceToY(t.rehedge_stop_price);
+          drawHorizontalLevel(ctx, {
+            y: rhY,
+            plotLeft,
+            plotRight,
+            plotTop,
+            plotBottom,
+            rightPriceAxisWidth,
+            priceText: formatAxisPrice(t.rehedge_stop_price),
+            badgeText: `🛡️ RE-HEDGE STOP (${t.rehedge_stop_qty || ''})`,
+            lineColor: '#a855f7',
+            badgeBg: 'rgba(59, 7, 100, 0.94)',
+            badgeBorder: '#a855f7',
+            badgeTextColor: '#e9d5ff',
+            axisTagBg: '#9333ea',
+            lineWidth: 1.5,
+            dash: [4, 3],
+          });
+        }
 
         // 3) Take-Profit Level (↕ TP — GREEN #10b981, draggable!)
         if (t.take_profit_abs && t.take_profit_abs > 0) {
@@ -1519,7 +1564,27 @@ export const CandleChart: React.FC<CandleChartProps> = ({
           });
         }
 
-        // Stop loss is removed: we trade two-way hedging & DCA without stop loss.
+        // 4) Locked Breakeven / Profit Stop Level (Раздел 5Б / 5В / Сценарий 2)
+        if (t.stop_loss_abs && t.stop_loss_abs > 0) {
+          const slY = priceToY(t.stop_loss_abs);
+          drawHorizontalLevel(ctx, {
+            y: slY,
+            plotLeft,
+            plotRight,
+            plotTop,
+            plotBottom,
+            rightPriceAxisWidth,
+            priceText: formatAxisPrice(t.stop_loss_abs),
+            badgeText: `🔒 СТОП В БУ / ПРОФИТ (${sideEng[0]})`,
+            lineColor: '#38bdf8',
+            badgeBg: 'rgba(12, 74, 110, 0.94)',
+            badgeBorder: '#38bdf8',
+            badgeTextColor: '#bae6fd',
+            axisTagBg: '#0284c7',
+            lineWidth: 1.5,
+            dash: [4, 3],
+          });
+        }
 
         // 5) MAIN ENTRY / SHIFTED WEIGHTED-AVERAGE ENTRY LINE
         const mainEntryY = priceToY(t.open_rate);
