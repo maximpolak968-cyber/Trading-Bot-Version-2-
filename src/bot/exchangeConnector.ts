@@ -543,6 +543,137 @@ async function ensureBybitInstrumentsInfo(
   return existing?.symbols || new Map<string, BybitSymbolFilterMeta>();
 }
 
+// ==========================================================================
+// OKX V5 SWAP: размер ордера и позиций задаётся в КОНТРАКТАХ, а не в монетах.
+// 1 контракт = ctVal монет и отличается по парам (BTC 0.01, DOGE 1000, PEPE 10 000 000),
+// поэтому монеты нужно пересчитывать в контракты при отправке ордера и обратно при чтении позиций.
+// ==========================================================================
+interface OkxSwapInstrumentMeta {
+  instId: string;
+  ctVal: number;
+  lotSz: number;
+  minSz: number;
+  maxMktSz: number;
+  state: string;
+}
+
+let okxSwapInstrumentsCache: { syncTs: number; instruments: Map<string, OkxSwapInstrumentMeta> } = {
+  syncTs: 0,
+  instruments: new Map(),
+};
+
+export function pairToOkxSwapInstId(pair: string): string {
+  const base = String(pair || '').toUpperCase().split(':')[0].split('/')[0].replace(/[^A-Z0-9]/g, '');
+  return `${base}-USDT-SWAP`;
+}
+
+/**
+ * Загружает параметры всех USDT-SWAP контрактов OKX (ctVal, lotSz, minSz) из публичного API.
+ * Кэш живёт 30 минут; параметры одинаковы для Mainnet и Demo Trading.
+ */
+export async function ensureOkxSwapInstruments(
+  forceRefresh = false
+): Promise<Map<string, OkxSwapInstrumentMeta>> {
+  if (
+    !forceRefresh &&
+    okxSwapInstrumentsCache.instruments.size > 50 &&
+    Date.now() - okxSwapInstrumentsCache.syncTs < 30 * 60_000
+  ) {
+    return okxSwapInstrumentsCache.instruments;
+  }
+  try {
+    const res = await makeHttpsRequest('https://www.okx.com/api/v5/public/instruments?instType=SWAP', {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      timeoutMs: 7000,
+    });
+    if (res.statusCode === 200) {
+      const json = JSON.parse(res.data);
+      if (json?.code === '0' && Array.isArray(json.data)) {
+        const next = new Map<string, OkxSwapInstrumentMeta>();
+        for (const item of json.data) {
+          const instId = String(item.instId || '');
+          if (!instId.endsWith('-USDT-SWAP')) continue;
+          const ctVal = Number(item.ctVal);
+          const lotSz = Number(item.lotSz);
+          const minSz = Number(item.minSz);
+          if (!(ctVal > 0) || !(lotSz > 0)) continue;
+          next.set(instId, {
+            instId,
+            ctVal,
+            lotSz,
+            minSz: minSz > 0 ? minSz : lotSz,
+            maxMktSz: Number(item.maxMktSz) > 0 ? Number(item.maxMktSz) : Number.POSITIVE_INFINITY,
+            state: String(item.state || 'live'),
+          });
+        }
+        if (next.size > 0) {
+          okxSwapInstrumentsCache = { syncTs: Date.now(), instruments: next };
+          return next;
+        }
+      }
+    }
+  } catch {
+    // сеть недоступна — используем последний удачный кэш (если есть)
+  }
+  return okxSwapInstrumentsCache.instruments;
+}
+
+/** Количество контрактов OKX → количество монет. Возвращает null, если ctVal неизвестен. */
+export async function okxContractsToCoins(instId: string, contracts: number): Promise<number | null> {
+  const meta = (await ensureOkxSwapInstruments()).get(instId);
+  if (!meta) return null;
+  return Number((Math.abs(contracts) * meta.ctVal).toPrecision(12));
+}
+
+/**
+ * Пересчитывает количество монет в контракты OKX с округлением вниз до lotSz
+ * (для закрытия — до ближайшего шага, чтобы закрыть позицию целиком).
+ * Возвращает ошибку вместо «примерного» объёма, если параметры контракта неизвестны
+ * или объём меньше минимального: лучше не отправить ордер, чем отправить неверный.
+ */
+export async function formatOkxSwapContracts(
+  instId: string,
+  coinQty: number,
+  isClose: boolean
+): Promise<
+  | { ok: true; contractsStr: string; contracts: number; coinQty: number }
+  | { ok: false; error: string }
+> {
+  const meta = (await ensureOkxSwapInstruments()).get(instId);
+  if (!meta) {
+    return {
+      ok: false,
+      error: `OKX: не удалось получить параметры контракта ${instId} (ctVal/lotSz) — ордер не отправлен`,
+    };
+  }
+  if (meta.state !== 'live') {
+    return { ok: false, error: `OKX: контракт ${instId} сейчас не торгуется (state=${meta.state})` };
+  }
+  const rawContracts = Math.abs(Number(coinQty) || 0) / meta.ctVal;
+  const steps = isClose
+    ? Math.round(rawContracts / meta.lotSz)
+    : Math.floor(rawContracts / meta.lotSz + 1e-9);
+  let contracts = steps * meta.lotSz;
+  if (!isClose && contracts > meta.maxMktSz) {
+    contracts = Math.floor(meta.maxMktSz / meta.lotSz) * meta.lotSz;
+  }
+  const decimals = countStepDecimals(meta.lotSz);
+  const contractsStr = contracts.toFixed(decimals);
+  if (!(Number(contractsStr) >= meta.minSz)) {
+    return {
+      ok: false,
+      error: `OKX: объём ${coinQty} монет = ${rawContracts.toPrecision(6)} контр. меньше минимума ${meta.minSz} контр. (1 контракт ${instId} = ${meta.ctVal} монет)`,
+    };
+  }
+  return {
+    ok: true,
+    contractsStr,
+    contracts: Number(contractsStr),
+    coinQty: Number((Number(contractsStr) * meta.ctVal).toPrecision(12)),
+  };
+}
+
 function countStepDecimals(step: number): number {
   const str = step.toFixed(10).replace(/0+$/, '');
   const dotIdx = str.indexOf('.');
@@ -590,6 +721,15 @@ export async function isPairTradableOnExchange(
       if (!meta) return false;
       if (meta.status && meta.status !== 'Trading') return false;
       return true;
+    }
+    return true;
+  }
+
+  if (exchange === 'okx') {
+    const instruments = await ensureOkxSwapInstruments();
+    if (instruments.size > 50) {
+      const meta = instruments.get(pairToOkxSwapInstId(pair));
+      return Boolean(meta && meta.state === 'live');
     }
     return true;
   }
@@ -1915,14 +2055,24 @@ export async function executeExchangeFuturesOrder(
       };
     }
     try {
-      const cleanBase = String(params.pair || 'ETH/USDT:USDT').split(':')[0].split('/')[0];
-      const instId = `${cleanBase}-USDT-SWAP`;
-      const formattedQtyStr = await formatBybitFuturesQuantity(
-        symbol,
-        params.quantity,
-        params.referencePrice,
-        isClose
-      );
+      const instId = pairToOkxSwapInstId(params.pair || 'ETH/USDT:USDT');
+      // OKX принимает sz в контрактах: пересчитываем монеты → контракты по ctVal конкретной пары
+      const okxSize = await formatOkxSwapContracts(instId, params.quantity, isClose);
+      if (!okxSize.ok) {
+        return {
+          success: false,
+          order_id: '',
+          symbol,
+          side,
+          price: params.referencePrice,
+          qty: params.quantity,
+          status: 'REJECTED',
+          exchange_time: Date.now(),
+          error: okxSize.error,
+        };
+      }
+      const formattedQtyStr = okxSize.contractsStr;
+      const filledCoinQty = okxSize.coinQty;
       const isDemo = creds.isTestnet ?? okxDemoCache.get(cleanKey) ?? false;
 
       const sendOkxOrder = async (withPosSide: boolean, simulatedFlag: boolean) => {
@@ -1982,7 +2132,7 @@ export async function executeExchangeFuturesOrder(
             symbol,
             side,
             price: params.referencePrice,
-            qty: Number(formattedQtyStr),
+            qty: filledCoinQty,
             status: 'FILLED',
             exchange_time: Date.now(),
             network_label: (okxDemoCache.get(cleanKey) ?? isDemo) ? 'OKX Demo' : 'OKX Mainnet',
@@ -1994,7 +2144,7 @@ export async function executeExchangeFuturesOrder(
           symbol,
           side,
           price: params.referencePrice,
-          qty: Number(formattedQtyStr),
+          qty: filledCoinQty,
           status: 'REJECTED',
           exchange_time: Date.now(),
           error: `OKX V5 [${json.code}]: ${json.data?.[0]?.sMsg || json.msg}`,
@@ -4019,9 +4169,15 @@ export async function fetchExchangeOpenPositions(
           const positions: ExchangePositionItem[] = [];
           for (const p of json.data) {
             const rawPos = Number(p.pos || 0);
-            const size = Math.abs(rawPos);
-            if (!(size > 0)) continue;
+            if (!(Math.abs(rawPos) > 0)) continue;
             const instId = String(p.instId || '');
+            // p.pos — это контракты; переводим в монеты по ctVal. Если ctVal неизвестен, весь ответ
+            // считаем неуспешным: иначе синхронизация решила бы, что позиция закрыта.
+            const coinSize = await okxContractsToCoins(instId, rawPos);
+            if (coinSize === null) {
+              return { success: false, positions: [] };
+            }
+            const size = coinSize;
             const entryPrice = Number(p.avgPx || 0);
             if (!(entryPrice > 0)) continue;
             const markPrice = Number(p.markPx || entryPrice);
@@ -4685,7 +4841,12 @@ export async function fetchExchangeClosedPnl(
           const closed: ExchangeClosedPnlItem[] = [];
           for (const item of json.data) {
             const instId = String(item.instId || '');
-            const qty = Math.abs(Number(item.closeTotalPos || item.openMaxPos || 0));
+            // closeTotalPos / openMaxPos — в контрактах; переводим в монеты по ctVal
+            const qtyContracts = Math.abs(Number(item.closeTotalPos || item.openMaxPos || 0));
+            const qty = qtyContracts > 0 ? await okxContractsToCoins(instId, qtyContracts) : 0;
+            if (qty === null) {
+              return { success: false, closed: [] };
+            }
             const entryPrice = Number(item.openAvgPx || 0);
             const exitPrice = Number(item.closeAvgPx || 0);
             if (!instId || !(qty > 0) || !(entryPrice > 0) || !(exitPrice > 0)) continue;
