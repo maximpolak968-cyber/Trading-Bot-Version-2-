@@ -259,8 +259,21 @@ export default function App() {
     [authToken, selectedPair]
   );
 
-  const restoringVaultRef = useRef<boolean>(false);
-  const vaultStorageKey = `scalpbot_saved_accounts_vault_v1_${authState.user_id || authState.role || 'owner'}`;
+  // Раньше сайт хранил API-ключи и секреты бирж открытым текстом в localStorage браузера и сам загружал их
+  // обратно на сервер, если там не было аккаунтов. Так на сервер возвращались старые ключи от чужих/устаревших
+  // счетов. Ключи теперь хранятся только на сервере; оставшиеся в браузере копии стираются при открытии сайта.
+  useEffect(() => {
+    try {
+      const staleKeys: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith('scalpbot_saved_accounts_vault_')) staleKeys.push(key);
+      }
+      staleKeys.forEach((key) => localStorage.removeItem(key));
+    } catch {
+      // localStorage недоступен — нечего чистить
+    }
+  }, []);
 
   const fetchAccounts = useCallback(async () => {
     try {
@@ -269,61 +282,12 @@ export default function App() {
       });
       if (res.ok) {
         const data = await res.json();
-        const serverAccounts: ExchangeAccount[] = data.accounts || [];
-        if (serverAccounts.length === 0 && !restoringVaultRef.current) {
-          try {
-            const rawVault = localStorage.getItem(vaultStorageKey);
-            const rawItems = rawVault ? JSON.parse(rawVault) : [];
-            const vaultItems = Array.isArray(rawItems)
-              ? rawItems.filter((item: any) => {
-                  const k = String(item?.api_key || '').trim().toLowerCase();
-                  return (
-                    k &&
-                    !k.startsWith('test_') &&
-                    !k.startsWith('mock_') &&
-                    !k.startsWith('sim_') &&
-                    !k.startsWith('ownr9988') &&
-                    !k.startsWith('clnt1122')
-                  );
-                })
-              : [];
-            if (vaultItems.length > 0) {
-              restoringVaultRef.current = true;
-              let latestAccounts: ExchangeAccount[] = [];
-              for (const item of vaultItems) {
-                if (item && item.api_key && item.api_secret) {
-                  const restoreRes = await fetch('/api/v1/accounts', {
-                    method: 'POST',
-                    headers: {
-                      'Content-Type': 'application/json',
-                      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-                    },
-                    body: JSON.stringify(item),
-                  });
-                  if (restoreRes.ok) {
-                    const restoreData = await restoreRes.json();
-                    if (Array.isArray(restoreData.accounts)) {
-                      latestAccounts = restoreData.accounts;
-                    }
-                  }
-                }
-              }
-              restoringVaultRef.current = false;
-              if (latestAccounts.length > 0) {
-                setAccounts(latestAccounts);
-                return;
-              }
-            }
-          } catch {
-            restoringVaultRef.current = false;
-          }
-        }
-        setAccounts(serverAccounts);
+        setAccounts(data.accounts || []);
       }
     } catch (err) {
       console.error('Failed to fetch accounts:', err);
     }
-  }, [authToken, vaultStorageKey]);
+  }, [authToken]);
 
   const fetchBotState = useCallback(async () => {
     const reqStartTs = Date.now();
@@ -1375,38 +1339,6 @@ export default function App() {
     if (res.ok) {
       const data = await res.json();
       if (data.accounts) setAccounts(data.accounts);
-      try {
-        if (payload.api_key && payload.api_secret) {
-          const rawPayload = payload as Record<string, any>;
-          const rawVault = localStorage.getItem(vaultStorageKey);
-          const vaultItems = rawVault ? JSON.parse(rawVault) : [];
-          const list = Array.isArray(vaultItems) ? vaultItems : [];
-          const createdId = data.account?.id;
-          const nextList = list.filter(
-            (item: any) =>
-              item.api_key !== payload.api_key && (!createdId || item.id !== createdId)
-          );
-          nextList.push({
-            id: createdId,
-            name: payload.name,
-            exchange: payload.exchange,
-            market_type: payload.market_type,
-            network_mode: rawPayload.network_mode,
-            is_testnet: payload.is_testnet,
-            api_key: payload.api_key,
-            api_secret: payload.api_secret,
-            passphrase: payload.passphrase,
-            subaccount: rawPayload.subaccount,
-            enabled: payload.enabled ?? true,
-            max_leverage: payload.max_leverage,
-            balance_usdt: data.account?.balance_usdt ?? payload.balance_usdt,
-            client_access_code: payload.client_access_code,
-          });
-          localStorage.setItem(vaultStorageKey, JSON.stringify(nextList));
-        }
-      } catch {
-        // ignore storage error
-      }
       await fetchBotState();
       return data;
     }
@@ -1430,36 +1362,11 @@ export default function App() {
     if (res.ok) {
       const data = await res.json();
       if (data.accounts) setAccounts(data.accounts);
-      try {
-        const rawVault = localStorage.getItem(vaultStorageKey);
-        const vaultItems = rawVault ? JSON.parse(rawVault) : [];
-        if (Array.isArray(vaultItems)) {
-          const nextList = vaultItems.map((item: any) =>
-            item.id === id ? { ...item, enabled } : item
-          );
-          localStorage.setItem(vaultStorageKey, JSON.stringify(nextList));
-        }
-      } catch {
-        // ignore
-      }
       await fetchBotState();
     }
   };
 
   const handleDeleteAccount = async (id: string) => {
-    try {
-      const targetAcc = accounts.find((a) => a.id === id);
-      const rawVault = localStorage.getItem(vaultStorageKey);
-      const vaultItems = rawVault ? JSON.parse(rawVault) : [];
-      if (Array.isArray(vaultItems)) {
-        const nextList = vaultItems.filter(
-          (item: any) => item.id !== id && (!targetAcc || item.name !== targetAcc.name)
-        );
-        localStorage.setItem(vaultStorageKey, JSON.stringify(nextList));
-      }
-    } catch {
-      // ignore
-    }
     const res = await fetch(`/api/v1/accounts/${encodeURIComponent(id)}`, {
       method: 'DELETE',
       headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
@@ -1472,11 +1379,6 @@ export default function App() {
   };
 
   const handleClearAllAccounts = async () => {
-    try {
-      localStorage.removeItem(vaultStorageKey);
-    } catch {
-      // ignore
-    }
     const res = await fetch('/api/v1/accounts?confirm=true', {
       method: 'DELETE',
       headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
