@@ -9,3 +9,12 @@ coverage/
 .env
 .env.*
 !.env.example
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+.exchange_accounts.backup.json
+.trades.backup.json
+public/assets/aistudio/

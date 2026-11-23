@@ -46,6 +46,11 @@ git push -u origin main
    - `OWNER_LOGIN` = `admin` (или ваш логин владельца)
    - `OWNER_PASSWORD` = ваш надежный пароль владельца
    - `SQLITE_DB_PATH` = `/data/trades.sqlite` (если подключен диск `/data`)
+   - `SESSION_SECRET` = длинная случайная строка (секрет подписи сессий; в Blueprint генерируется автоматически)
+
+> ⚠️ Файл `trades.sqlite` и JSON-бэкапы (`.exchange_accounts.backup.json`, `.trades.backup.json`) нельзя коммитить:
+> в них хранятся секрет подписи сессий и API-ключи бирж. Они исключены в `.gitignore` и `.dockerignore`,
+> а сервер при первом запуске сам создаёт пустую базу.
 4. В разделе **Disks** (на тарифе Starter и выше) добавьте диск:
    - **Name**: `trading-data`
    - **Mount Path**: `/data`

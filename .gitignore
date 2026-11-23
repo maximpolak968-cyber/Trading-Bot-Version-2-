@@ -6,3 +6,13 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Локальная база и бэкапы: содержат секрет подписи сессий и API-ключи бирж — никогда не коммитить
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+.exchange_accounts.backup.json
+.trades.backup.json
