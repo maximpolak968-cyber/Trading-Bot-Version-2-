@@ -45,15 +45,9 @@ function resolveSqliteDbPath(): string {
   const localDbPath = path.resolve(process.cwd(), 'trades.sqlite');
   try {
     if (fs.existsSync('/data') && fs.statSync('/data').isDirectory()) {
-      const renderDiskDbPath = '/data/trades.sqlite';
-      if (!fs.existsSync(renderDiskDbPath) && fs.existsSync(localDbPath)) {
-        try {
-          fs.copyFileSync(localDbPath, renderDiskDbPath);
-        } catch {
-          // ignore copy error
-        }
-      }
-      return renderDiskDbPath;
+      // Локальную trades.sqlite на диск /data не копируем: если база попала в образ,
+      // вместе с ней на сервер уехал бы чужой session_secret. Пустая база создаётся автоматически.
+      return '/data/trades.sqlite';
     }
   } catch {
     // fallback to localDbPath
@@ -75,6 +69,33 @@ function resolveSqliteDbPath(): string {
 }
 
 const DB_PATH = resolveSqliteDbPath();
+
+/**
+ * Версия секрета подписи сессий. Секреты с версией ниже текущей считаются скомпрометированными:
+ * до версии 2 файл trades.sqlite (вместе с session_secret) лежал в репозитории и Docker-образе.
+ * При старте такой секрет заменяется новым, и все старые токены перестают работать.
+ */
+const SESSION_SECRET_VERSION = 2;
+
+function generateRandomOwnerPassword(): string {
+  return crypto.randomBytes(12).toString('base64url');
+}
+
+function announceGeneratedOwnerPassword(login: string, password: string): void {
+  console.warn(
+    [
+      '',
+      '================================================================',
+      ' OWNER_PASSWORD не задан — сгенерирован случайный пароль владельца:',
+      `   логин:  ${login}`,
+      `   пароль: ${password}`,
+      ' Сохраните его или задайте OWNER_PASSWORD в переменных окружения.',
+      ' Повторно этот пароль показан не будет.',
+      '================================================================',
+      '',
+    ].join('\n')
+  );
+}
 
 export interface SqliteBotLevelRow {
   id: string;
@@ -259,6 +280,12 @@ export class SqliteBotDatabase {
       );
     `);
 
+    try {
+      this.db.exec(`ALTER TABLE site_auth ADD COLUMN secret_version INTEGER DEFAULT 0`);
+    } catch {
+      // column already exists
+    }
+
     // Initialize default owner credentials if not yet present
     try {
       const row = this.db.prepare(`SELECT id FROM site_auth WHERE id = 1`).get();
@@ -266,21 +293,27 @@ export class SqliteBotDatabase {
       const envPass = (process.env.OWNER_PASSWORD || '').trim();
       if (!row) {
         const defaultLogin = envLogin || 'admin';
-        const defaultPass = envPass || 'admin123';
+        // Без OWNER_PASSWORD генерируем случайный пароль вместо общеизвестного admin123
+        const defaultPass = envPass || generateRandomOwnerPassword();
         const salt = crypto.randomBytes(16).toString('hex');
         const hash = crypto.scryptSync(defaultPass, salt, 64).toString('hex');
         const secret = crypto.randomBytes(32).toString('hex');
         const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
         this.db
           .prepare(
-            `INSERT INTO site_auth (id, owner_login, password_hash, password_salt, password_changed, require_login, session_secret, updated_at)
-             VALUES (1, ?, ?, ?, ?, 1, ?, ?)`
+            `INSERT INTO site_auth (id, owner_login, password_hash, password_salt, password_changed, require_login, session_secret, updated_at, secret_version)
+             VALUES (1, ?, ?, ?, ?, 1, ?, ?, ?)`
           )
-          .run(defaultLogin, hash, salt, envPass ? 1 : 0, secret, now);
+          .run(defaultLogin, hash, salt, envPass ? 1 : 0, secret, now, SESSION_SECRET_VERSION);
+        if (!envPass) {
+          announceGeneratedOwnerPassword(defaultLogin, defaultPass);
+        }
       }
     } catch (e) {
       console.error('site_auth init error:', e);
     }
+
+    this.migrateLeakedAuthSecrets();
 
     const extraTradeCols = [
       ['tp_manual_override', 'INTEGER DEFAULT 0'],
@@ -1778,6 +1811,85 @@ export class SqliteBotDatabase {
     }
   }
 
+  /**
+   * Одноразовая миграция: заменяет session_secret, утёкший вместе с trades.sqlite,
+   * и общеизвестный пароль admin123, если владелец его так и не сменил.
+   */
+  private migrateLeakedAuthSecrets() {
+    try {
+      const row = this.db
+        .prepare(`SELECT owner_login, password_changed, secret_version FROM site_auth WHERE id = 1`)
+        .get() as any;
+      if (!row) return;
+      if (Number(row.secret_version || 0) >= SESSION_SECRET_VERSION) return;
+
+      const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+      const envLogin = (process.env.OWNER_LOGIN || '').trim();
+      const envPass = (process.env.OWNER_PASSWORD || '').trim();
+      if (!envPass && !Number(row.password_changed)) {
+        const newPass = generateRandomOwnerPassword();
+        const salt = crypto.randomBytes(16).toString('hex');
+        const hash = crypto.scryptSync(newPass, salt, 64).toString('hex');
+        this.db
+          .prepare(`UPDATE site_auth SET password_hash = ?, password_salt = ? WHERE id = 1`)
+          .run(hash, salt);
+        announceGeneratedOwnerPassword(envLogin || String(row.owner_login || 'admin'), newPass);
+      }
+
+      // Инвайт-ссылки и коды клиентов хранились в той же утёкшей базе и дают вход без пароля —
+      // перевыпускаем их (владелец увидит новые значения в интерфейсе и разошлёт заново).
+      const invites = this.db.prepare(`SELECT id FROM invite_links`).all() as any[];
+      const updInvite = this.db.prepare(`UPDATE invite_links SET token = ? WHERE id = ?`);
+      for (const inv of invites) {
+        updInvite.run(crypto.randomBytes(24).toString('base64url'), inv.id);
+      }
+      const accounts = this.db.prepare(`SELECT id, exchange FROM exchange_accounts`).all() as any[];
+      const updAcc = this.db.prepare(`UPDATE exchange_accounts SET client_access_code = ? WHERE id = ?`);
+      for (const acc of accounts) {
+        updAcc.run(
+          `${String(acc.exchange || 'BYBIT').toUpperCase()}-${crypto.randomBytes(6).toString('hex').toUpperCase()}`,
+          acc.id
+        );
+      }
+
+      this.db
+        .prepare(`UPDATE site_auth SET session_secret = ?, secret_version = ?, updated_at = ? WHERE id = 1`)
+        .run(crypto.randomBytes(32).toString('hex'), SESSION_SECRET_VERSION, now);
+      console.warn(
+        `site_auth: секрет подписи сессий заменён — все ранее выданные токены недействительны, войдите заново. ` +
+          `Перевыпущено инвайт-ссылок: ${invites.length}, кодов доступа клиентов: ${accounts.length}.`
+      );
+      if (accounts.length > 0) {
+        this.syncAccountsBackupFile();
+      }
+    } catch (e) {
+      console.error('site_auth secret migration error:', e);
+    }
+  }
+
+  /**
+   * Ключ подписи токенов. Основа — SESSION_SECRET из окружения или session_secret из БД.
+   * В ключ подмешаны логин и хеш пароля владельца (и OWNER_LOGIN/OWNER_PASSWORD из окружения),
+   * поэтому любая смена логина или пароля сразу делает все выданные ранее токены недействительными.
+   */
+  private getSessionSigningKey(): string {
+    const row = this.db
+      .prepare(`SELECT session_secret, owner_login, password_hash FROM site_auth WHERE id = 1`)
+      .get() as any;
+    const base = (process.env.SESSION_SECRET || '').trim() || String(row?.session_secret || '');
+    if (!base) {
+      throw new Error('session secret is not initialized');
+    }
+    const envLogin = (process.env.OWNER_LOGIN || '').trim().toLowerCase();
+    const envPass = (process.env.OWNER_PASSWORD || '').trim();
+    return crypto
+      .createHash('sha256')
+      .update(
+        [base, String(row?.owner_login || ''), String(row?.password_hash || ''), envLogin, envPass].join('\u0000')
+      )
+      .digest('hex');
+  }
+
   public getSiteAuthConfig(): {
     owner_login: string;
     password_changed: boolean;
@@ -2017,8 +2129,7 @@ export class SqliteBotDatabase {
     userId?: string;
   }): string {
     try {
-      const row = this.db.prepare(`SELECT session_secret FROM site_auth WHERE id = 1`).get() as any;
-      const secret = String(row?.session_secret || 'scalpbot-fallback-secret');
+      const secret = this.getSessionSigningKey();
       const data = JSON.stringify({
         role: payload.role,
         login: payload.login,
@@ -2046,10 +2157,16 @@ export class SqliteBotDatabase {
     try {
       if (!token || !token.includes('.')) return { valid: false };
       const [b64, sig] = token.split('.');
-      const row = this.db.prepare(`SELECT session_secret FROM site_auth WHERE id = 1`).get() as any;
-      const secret = String(row?.session_secret || 'scalpbot-fallback-secret');
-      const expectedSig = crypto.createHmac('sha256', secret).update(b64).digest('base64url');
-      if (sig !== expectedSig) return { valid: false };
+      if (!b64 || !sig) return { valid: false };
+      const secret = this.getSessionSigningKey();
+      const expectedSig = crypto.createHmac('sha256', secret).update(b64).digest();
+      const providedSig = Buffer.from(sig, 'base64url');
+      if (
+        providedSig.length !== expectedSig.length ||
+        !crypto.timingSafeEqual(providedSig, expectedSig)
+      ) {
+        return { valid: false };
+      }
       const parsed = JSON.parse(Buffer.from(b64, 'base64url').toString('utf8'));
       if (!parsed || typeof parsed.exp !== 'number' || Date.now() > parsed.exp) {
         return { valid: false };

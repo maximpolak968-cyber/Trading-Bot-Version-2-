@@ -5833,8 +5833,43 @@ async function createScalpBotPosition(
   return createdTrade;
 }
 
+// Ограничение перебора паролей и кодов на /api/v1/auth/login: 5 неудачных попыток за 15 минут с одного IP
+const LOGIN_MAX_FAILURES = 5;
+const LOGIN_WINDOW_MS = 15 * 60_000;
+const failedLoginAttempts = new Map<string, { count: number; firstAt: number }>();
+
+function getLoginBlockRemainingMs(ip: string): number {
+  const entry = failedLoginAttempts.get(ip);
+  if (!entry) return 0;
+  const elapsed = Date.now() - entry.firstAt;
+  if (elapsed >= LOGIN_WINDOW_MS) {
+    failedLoginAttempts.delete(ip);
+    return 0;
+  }
+  return entry.count >= LOGIN_MAX_FAILURES ? LOGIN_WINDOW_MS - elapsed : 0;
+}
+
+function registerFailedLogin(ip: string): void {
+  const now = Date.now();
+  const entry = failedLoginAttempts.get(ip);
+  if (!entry || now - entry.firstAt >= LOGIN_WINDOW_MS) {
+    failedLoginAttempts.set(ip, { count: 1, firstAt: now });
+  } else {
+    entry.count += 1;
+  }
+  if (failedLoginAttempts.size > 10_000) {
+    for (const [key, val] of failedLoginAttempts) {
+      if (now - val.firstAt >= LOGIN_WINDOW_MS) failedLoginAttempts.delete(key);
+    }
+  }
+}
+
 async function startServer() {
   const app = express();
+  // За прокси Render реальный IP клиента приходит в X-Forwarded-For; локально заголовку не доверяем
+  if (process.env.RENDER || process.env.TRUST_PROXY === 'true') {
+    app.set('trust proxy', 1);
+  }
   app.use(express.json());
 
   initializeBotTrades().catch(console.error);
@@ -6348,6 +6383,21 @@ async function startServer() {
   });
 
   app.post('/api/v1/auth/login', (req, res) => {
+    const clientIp = String(req.ip || req.socket.remoteAddress || 'unknown');
+    const blockedForMs = getLoginBlockRemainingMs(clientIp);
+    if (blockedForMs > 0) {
+      res.setHeader('Retry-After', String(Math.ceil(blockedForMs / 1000)));
+      res.status(429).json({
+        error: `Слишком много неудачных попыток входа. Повторите через ${Math.ceil(blockedForMs / 60_000)} мин.`,
+      });
+      return;
+    }
+    // Любой ответ 401 из этого обработчика считается неудачной попыткой; успешный вход сбрасывает счётчик
+    res.on('finish', () => {
+      if (res.statusCode === 401) registerFailedLogin(clientIp);
+      else if (res.statusCode === 200) failedLoginAttempts.delete(clientIp);
+    });
+
     const { mode = 'owner', login, password, access_code, invite_token } = req.body || {};
     const authHeader = String(req.headers.authorization || '');
     const existingBearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';

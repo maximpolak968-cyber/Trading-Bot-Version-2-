@@ -5,10 +5,8 @@ echo "=== Запуск сайта и торгового терминала FreqU
 
 # Поддержка постоянного диска Render (/data) для сохранения БД trades.sqlite
 if [ -d "/data" ]; then
-  if [ ! -f "/data/trades.sqlite" ] && [ -f "trades.sqlite" ]; then
-    echo "Копирование начальной БД на постоянный диск /data..."
-    cp trades.sqlite /data/trades.sqlite
-  fi
+  # Шаблонная БД из репозитория НЕ копируется: в ней лежит секрет подписи сессий.
+  # Если базы на диске ещё нет, сервер создаст чистую сам.
   ln -sf /data/trades.sqlite trades.sqlite
   echo "Связана база данных с постоянным диском: /data/trades.sqlite"
 fi

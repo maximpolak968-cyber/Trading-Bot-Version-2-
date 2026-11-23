@@ -16,6 +16,8 @@ services:
         value: admin
       - key: OWNER_PASSWORD
         sync: false
+      - key: SESSION_SECRET
+        generateValue: true
       - key: DRY_RUN
         value: "false"
     disk:
