@@ -77,6 +77,17 @@ const DB_PATH = resolveSqliteDbPath();
  */
 const SESSION_SECRET_VERSION = 2;
 
+/**
+ * Читает секрет из окружения: обрезает пробелы и одну пару обрамляющих кавычек.
+ * В панелях Railway/Render значение часто вставляют в формате .env (`"мой-пароль"`),
+ * и кавычки тогда становятся частью пароля — из-за этого вход «не принимал» верный пароль.
+ */
+function readEnvSecret(name: 'OWNER_LOGIN' | 'OWNER_PASSWORD' | 'SESSION_SECRET'): string {
+  const raw = String(process.env[name] || '').trim();
+  const quoted = raw.length >= 2 && (raw[0] === '"' || raw[0] === "'") && raw[raw.length - 1] === raw[0];
+  return (quoted ? raw.slice(1, -1) : raw).trim();
+}
+
 function generateRandomOwnerPassword(): string {
   return crypto.randomBytes(12).toString('base64url');
 }
@@ -289,8 +300,8 @@ export class SqliteBotDatabase {
     // Initialize default owner credentials if not yet present
     try {
       const row = this.db.prepare(`SELECT id FROM site_auth WHERE id = 1`).get();
-      const envLogin = (process.env.OWNER_LOGIN || '').trim();
-      const envPass = (process.env.OWNER_PASSWORD || '').trim();
+      const envLogin = readEnvSecret('OWNER_LOGIN');
+      const envPass = readEnvSecret('OWNER_PASSWORD');
       if (!row) {
         const defaultLogin = envLogin || 'admin';
         // Без OWNER_PASSWORD генерируем случайный пароль вместо общеизвестного admin123
@@ -1824,8 +1835,8 @@ export class SqliteBotDatabase {
       if (Number(row.secret_version || 0) >= SESSION_SECRET_VERSION) return;
 
       const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-      const envLogin = (process.env.OWNER_LOGIN || '').trim();
-      const envPass = (process.env.OWNER_PASSWORD || '').trim();
+      const envLogin = readEnvSecret('OWNER_LOGIN');
+      const envPass = readEnvSecret('OWNER_PASSWORD');
       if (!envPass && !Number(row.password_changed)) {
         const newPass = generateRandomOwnerPassword();
         const salt = crypto.randomBytes(16).toString('hex');
@@ -1876,12 +1887,12 @@ export class SqliteBotDatabase {
     const row = this.db
       .prepare(`SELECT session_secret, owner_login, password_hash FROM site_auth WHERE id = 1`)
       .get() as any;
-    const base = (process.env.SESSION_SECRET || '').trim() || String(row?.session_secret || '');
+    const base = readEnvSecret('SESSION_SECRET') || String(row?.session_secret || '');
     if (!base) {
       throw new Error('session secret is not initialized');
     }
-    const envLogin = (process.env.OWNER_LOGIN || '').trim().toLowerCase();
-    const envPass = (process.env.OWNER_PASSWORD || '').trim();
+    const envLogin = readEnvSecret('OWNER_LOGIN').toLowerCase();
+    const envPass = readEnvSecret('OWNER_PASSWORD');
     return crypto
       .createHash('sha256')
       .update(
@@ -1896,8 +1907,8 @@ export class SqliteBotDatabase {
     require_login: boolean;
     has_env_secrets: boolean;
   } {
-    const envLogin = (process.env.OWNER_LOGIN || '').trim();
-    const envPass = (process.env.OWNER_PASSWORD || '').trim();
+    const envLogin = readEnvSecret('OWNER_LOGIN');
+    const envPass = readEnvSecret('OWNER_PASSWORD');
     const hasEnvSecrets = Boolean(envLogin && envPass);
     try {
       const row = this.db.prepare(`SELECT * FROM site_auth WHERE id = 1`).get() as any;
@@ -1927,8 +1938,8 @@ export class SqliteBotDatabase {
 
   public verifyOwnerCredentials(login: string, password: string): boolean {
     try {
-      const envLogin = (process.env.OWNER_LOGIN || '').trim();
-      const envPass = (process.env.OWNER_PASSWORD || '').trim();
+      const envLogin = readEnvSecret('OWNER_LOGIN');
+      const envPass = readEnvSecret('OWNER_PASSWORD');
 
       const inputLogin = String(login || '').trim().toLowerCase();
       const inputPass = String(password || '');

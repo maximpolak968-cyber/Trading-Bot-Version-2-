@@ -5866,8 +5866,17 @@ function registerFailedLogin(ip: string): void {
 
 async function startServer() {
   const app = express();
-  // За прокси Render реальный IP клиента приходит в X-Forwarded-For; локально заголовку не доверяем
-  if (process.env.RENDER || process.env.TRUST_PROXY === 'true') {
+  // За прокси хостинга (Render, Railway) реальный IP клиента приходит в X-Forwarded-For.
+  // Без trust proxy все посетители выглядят как один IP прокси, и 5 чужих ошибок входа блокируют вход всем.
+  // Локально заголовку не доверяем, чтобы лимит нельзя было обойти подменой IP.
+  const behindHostingProxy = Boolean(
+    process.env.RENDER ||
+      process.env.RAILWAY_ENVIRONMENT ||
+      process.env.RAILWAY_ENVIRONMENT_NAME ||
+      process.env.RAILWAY_PROJECT_ID ||
+      process.env.TRUST_PROXY === 'true'
+  );
+  if (behindHostingProxy) {
     app.set('trust proxy', 1);
   }
   app.use(express.json());
