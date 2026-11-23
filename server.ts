@@ -177,25 +177,65 @@ const tickerCache = new Map<string, { price: number; change24h: number; volume24
 const exchangeTickerCache = new Map<string, LiveWsTicker>();
 const fastTpInFlightIds = new Set<number>();
 
-function refreshTradeLivePriceFromWs(t: FreqtradeTrade): boolean {
-  if (!t.is_open) return false;
-  const matchedAcc =
+/**
+ * Сделка открыта на Testnet/Demo-аккаунте. Публичные WebSocket-тикеры бота — это цены ОСНОВНОЙ сети
+ * (Binance/Bybit Mainnet), а у Testnet свои цены. Для таких сделок цену, Mark Price и PnL берём
+ * только у самой биржи (REST-позиции / приватный поток), иначе сайт расходится с биржей.
+ */
+function isTestnetTrade(t: FreqtradeTrade): boolean {
+  const acc =
     t.account_id && t.account_id !== 'master'
       ? exchangeAccountsStore.find((a) => a.id === t.account_id)
       : resolveExchangeAccountRecord('master');
-  const isTestnetAccount = Boolean(matchedAcc?.is_testnet);
+  return Boolean(acc?.is_testnet);
+}
 
-  // Для Testnet/Demo аккаунтов приоритет всегда у Mark Price и Unrealized PnL самой тестовой/демо биржи,
-  // чтобы публичный Mainnet тикер не искажал PnL и цену входа/выхода
-  if (
-    isTestnetAccount &&
-    t.exchange_mark_price &&
-    t.exchange_mark_price > 0 &&
-    t.exchange_synced_at &&
-    Date.now() - t.exchange_synced_at < 60_000
-  ) {
-    t.current_rate = roundPrice(t.exchange_mark_price);
-    return true;
+/**
+ * Котировка для расчётов по сделке. Для Mainnet — живой WS-тикер (Mark / Bid / Ask).
+ * Для Testnet — последняя Mark Price, полученная с самой тестовой биржи (или undefined, если её ещё нет).
+ */
+function getTradeExecutionQuote(
+  t: FreqtradeTrade,
+  isClose: boolean
+): ReturnType<typeof getFuturesExecutionPrice> {
+  if (!isTestnetTrade(t)) {
+    return getFuturesExecutionPrice(t.pair, t.is_short, isClose, t.exchange);
+  }
+  const mark = Number(t.exchange_mark_price || 0);
+  if (!(mark > 0)) return undefined;
+  return {
+    markPrice: mark,
+    lastPrice: mark,
+    bestBid: mark,
+    bestAsk: mark,
+    executionPrice: mark,
+    source: 'exchange_testnet_rest',
+    updatedAt: t.exchange_synced_at || Date.now(),
+  };
+}
+
+/** Текущая цена пары для сделки: для Testnet — Mark Price тестовой биржи, для Mainnet — общий кэш тикеров. */
+function getTradeReferencePrice(t: FreqtradeTrade): number {
+  if (isTestnetTrade(t)) {
+    const mark = Number(t.exchange_mark_price || 0);
+    return mark > 0 ? roundPrice(mark) : 0;
+  }
+  const tick = tickerCache.get(t.pair);
+  return tick && tick.price > 0 ? roundPrice(tick.price) : 0;
+}
+
+function refreshTradeLivePriceFromWs(t: FreqtradeTrade): boolean {
+  if (!t.is_open) return false;
+  const isTestnetAccount = isTestnetTrade(t);
+
+  // Для Testnet/Demo используем ТОЛЬКО Mark Price и Unrealized PnL самой тестовой биржи (любой давности):
+  // публичный Mainnet-тикер имеет другие цены и искажал бы PnL, маржу и цену закрытия
+  if (isTestnetAccount) {
+    if (t.exchange_mark_price && t.exchange_mark_price > 0) {
+      t.current_rate = roundPrice(t.exchange_mark_price);
+      return true;
+    }
+    return false;
   }
 
   const wsTick =
@@ -251,7 +291,7 @@ async function processFastWsTradeClose(
       if (!trade || botConfig.state === 'stopped') return;
 
       const latestExec =
-        getFuturesExecutionPrice(trade.pair, trade.is_short, true, trade.exchange) || execInfo;
+        getTradeExecutionQuote(trade, true) || execInfo;
       const markPrice = roundPrice(latestExec.markPrice);
       const execPrice = roundPrice(latestExec.executionPrice);
 
@@ -415,6 +455,9 @@ function evaluateFastWsTpExit(wsTick: LiveWsTicker): void {
 
   for (const t of tradesStore) {
     if (!t.is_open || t.pair !== wsTick.pair) continue;
+    // Тикер пришёл из Mainnet — по нему нельзя закрывать Testnet-сделки: у тестовой биржи другие цены.
+    // Testnet-сделки проверяет основной цикл по Mark Price самой тестовой биржи.
+    if (isTestnetTrade(t)) continue;
     if (
       (t.exchange === 'binance' || t.exchange === 'bybit') &&
       t.exchange !== tickExchange &&
@@ -2660,9 +2703,9 @@ async function initializeBotTrades() {
       seenOpenKeys.add(openKey);
 
       // Обновляем текущую цену из живого кэша котировок (или сохраняем последний известный current_rate из trades.sqlite)
-      const liveTicker = tickerCache.get(t.pair);
-      if (liveTicker && liveTicker.price > 0) {
-        t.current_rate = liveTicker.price;
+      const liveRefPrice = getTradeReferencePrice(t);
+      if (liveRefPrice > 0) {
+        t.current_rate = liveRefPrice;
       }
     }
     recalculateTradeMetrics(t, false);
@@ -3858,12 +3901,18 @@ async function runScalpBotCycle(waitForActive = false) {
       const liveExPos = liveExchangePosMap.get(
         `${tradeAcc.id}:${trade.pair}:${trade.is_short ? 'S' : 'L'}`
       );
-      const execInfo = getFuturesExecutionPrice(trade.pair, trade.is_short, true, trade.exchange);
+      // Для Testnet живые Mainnet-тикеры не используем: цена и PnL берутся из позиции самой тестовой биржи
+      const tradeOnTestnet = isTestnetTrade(trade);
+      const execInfo = tradeOnTestnet
+        ? undefined
+        : getFuturesExecutionPrice(trade.pair, trade.is_short, true, trade.exchange);
       const currentPrice =
         execInfo && execInfo.markPrice > 0
           ? roundPrice(execInfo.markPrice)
           : liveExPos && liveExPos.mark_price > 0
           ? roundPrice(liveExPos.mark_price)
+          : tradeOnTestnet && trade.exchange_mark_price && trade.exchange_mark_price > 0
+          ? roundPrice(trade.exchange_mark_price)
           : candles1h[candles1h.length - 1].close;
       const closeExecPrice =
         execInfo && execInfo.executionPrice > 0
@@ -4082,7 +4131,7 @@ async function runScalpBotCycle(waitForActive = false) {
             const legLockKey = getPosLockKey(leg.account_id || tradeAccScopeId, leg.pair, leg.is_short);
             await withPositionLock(legLockKey, async () => {
               if (!leg.is_open) return;
-              const legExec = getFuturesExecutionPrice(leg.pair, leg.is_short, true, leg.exchange);
+              const legExec = getTradeExecutionQuote(leg, true);
               const legClosePrice =
                 legExec && legExec.executionPrice > 0 ? roundPrice(legExec.executionPrice) : currentPrice;
               const closeRes = await dispatchOrderToExchangeAccount(tradeAcc, {
@@ -4152,7 +4201,7 @@ async function runScalpBotCycle(waitForActive = false) {
               const legLockKey = getPosLockKey(leg.account_id || tradeAccScopeId, leg.pair, leg.is_short);
               await withPositionLock(legLockKey, async () => {
                 if (!leg.is_open) return;
-                const legExec = getFuturesExecutionPrice(leg.pair, leg.is_short, true, leg.exchange);
+                const legExec = getTradeExecutionQuote(leg, true);
                 const legClosePrice =
                   legExec && legExec.executionPrice > 0 ? roundPrice(legExec.executionPrice) : currentPrice;
                 const closeRes = await dispatchOrderToExchangeAccount(tradeAcc, {
@@ -4328,7 +4377,7 @@ async function runScalpBotCycle(waitForActive = false) {
             const legLockKey = getPosLockKey(leg.account_id || tradeAccScopeId, leg.pair, leg.is_short);
             await withPositionLock(legLockKey, async () => {
               if (!leg.is_open) return;
-              const legExec = getFuturesExecutionPrice(leg.pair, leg.is_short, true, leg.exchange);
+              const legExec = getTradeExecutionQuote(leg, true);
               const legClosePrice =
                 legExec && legExec.executionPrice > 0 ? roundPrice(legExec.executionPrice) : currentPrice;
               const closeRes = await dispatchOrderToExchangeAccount(tradeAcc, {
@@ -4896,12 +4945,7 @@ async function runScalpBotCycle(waitForActive = false) {
                     );
                     await withPositionLock(insLockKey, async () => {
                       if (!openSibling.is_open) return;
-                      const insExec = getFuturesExecutionPrice(
-                        openSibling.pair,
-                        openSibling.is_short,
-                        true,
-                        openSibling.exchange
-                      );
+                      const insExec = getTradeExecutionQuote(openSibling, true);
                       const insClosePrice =
                         insExec && insExec.executionPrice > 0
                           ? roundPrice(insExec.executionPrice)
@@ -6184,6 +6228,8 @@ async function startServer() {
     let sumOpenPnl = 0;
     let sumUsedStake = 0;
     let sumFree = 0;
+    let sumExchangeEquity = 0;
+    let allEquityFromExchange = true;
     let anySim = false;
     for (const a of enabledAccs) {
       const aIsReal = Boolean(a.api_key_raw && !isSimulatedTestApiKey(a.api_key_raw));
@@ -6216,12 +6262,24 @@ async function startServer() {
         aIsReal && sanitizedAccUsed > 0
           ? sanitizedAccUsed
           : aLocalUsed;
+      // Для реального ключа (включая Testnet) плавающий PnL счёта берём 1 в 1 с биржи:
+      // сумма локальных сделок могла отличаться (другой источник цен, ручные позиции, неполный список).
       const aPnl =
-        aOpen.length > 0
-          ? aLocalPnl
-          : aIsReal && typeof a.unrealized_pnl === 'number'
+        aIsReal && typeof a.unrealized_pnl === 'number' && Number.isFinite(a.unrealized_pnl)
           ? a.unrealized_pnl
+          : aOpen.length > 0
+          ? aLocalPnl
           : 0;
+      if (
+        aIsReal &&
+        typeof a.equity_usdt === 'number' &&
+        Number.isFinite(a.equity_usdt) &&
+        a.equity_usdt > 0
+      ) {
+        sumExchangeEquity += a.equity_usdt;
+      } else {
+        allEquityFromExchange = false;
+      }
       const computedFree = Math.max(0, wBal + Math.min(0, aPnl) - aUsed);
       const aFree =
         aIsReal &&
@@ -6249,7 +6307,11 @@ async function startServer() {
       baseDeposit: compounded.baseDeposit,
       totalBalance,
       openProfitAbs,
-      equityBalance: Number((totalBalance + openProfitAbs).toFixed(4)),
+      // Эквити (Margin Balance) — как показывает биржа, если она его отдала по всем реальным счетам
+      equityBalance:
+        !anySim && allEquityFromExchange
+          ? Number(sumExchangeEquity.toFixed(4))
+          : Number((totalBalance + openProfitAbs).toFixed(4)),
       usedStake: Number(sumUsedStake.toFixed(2)),
       freeBalance,
     };
@@ -8585,9 +8647,8 @@ async function startServer() {
       const tradesToClose: Array<{ trade: FreqtradeTrade; closeRes: PlacedOrderResult | null }> = [];
       for (const t of targetTrades) {
         if (t.is_open) {
-          const liveTicker = tickerCache.get(t.pair);
-          const livePrice =
-            liveTicker && liveTicker.price > 0 ? roundPrice(liveTicker.price) : t.current_rate;
+          const liveRefPrice = getTradeReferencePrice(t);
+          const livePrice = liveRefPrice > 0 ? liveRefPrice : t.current_rate;
           if (livePrice > 0) {
             t.current_rate = livePrice;
           }
@@ -8713,9 +8774,8 @@ async function startServer() {
       return;
     }
 
-    const liveTicker = tickerCache.get(trade.pair);
-    const livePrice =
-      liveTicker && liveTicker.price > 0 ? roundPrice(liveTicker.price) : trade.current_rate;
+    const liveRefPrice = getTradeReferencePrice(trade);
+    const livePrice = liveRefPrice > 0 ? liveRefPrice : trade.current_rate;
     if (livePrice > 0) {
       trade.current_rate = livePrice;
     }
@@ -8914,7 +8974,7 @@ async function startServer() {
       const trade = tradesStore.find((t) => t.trade_id === preMatch.trade_id && t.is_open);
       if (!trade) return;
 
-      const execInfo = getFuturesExecutionPrice(trade.pair, trade.is_short, true, trade.exchange);
+      const execInfo = getTradeExecutionQuote(trade, true);
       let closePrice =
         params.closePrice && params.closePrice > 0
           ? roundPrice(params.closePrice)
