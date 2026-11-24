@@ -4039,7 +4039,7 @@ function journalReversalSignal(params: {
 // Тейк не опускается ниже точки безубытка с запасом (recalculateTradeMetrics), защита от минуса сохраняется.
 // Ордер тейк-профита на бирже обновляет обычный цикл синхронизации.
 // ============================================================================
-const TP_RECALC_MIGRATION = 'tp_atr_rule_open_positions_v1';
+const TP_RECALC_MIGRATION = 'tp_atr_rule_open_positions_v2_cap6';
 
 async function recalculateOpenTradeTakeProfits(): Promise<void> {
   if (sqliteDb.isMigrationApplied(TP_RECALC_MIGRATION)) return;

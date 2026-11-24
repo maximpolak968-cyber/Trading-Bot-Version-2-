@@ -1617,6 +1617,12 @@ export function assessMarketRegime(d1: TimeframeTrendState, h4: TimeframeTrendSt
 export const TP_ATR_MULTIPLE = 1.25;
 export const TP_LEVEL_OFFSET_ATR = 0.35;
 export const TP_MIN_DISTANCE_PCT = 0.8;
+/**
+ * Потолок дистанции тейка. Правило проверялось на монетах с ATR(4H) ~1–5% (тейк до ~6%).
+ * У экстремально волатильных монет (ATR 15–35% за 4 часа) 1.25 ATR дало бы тейк в десятки процентов —
+ * данных, что это работает, нет, а держать такую позицию дольше — больше риска. Поэтому не дальше 6%.
+ */
+export const TP_MAX_DISTANCE_PCT = 6;
 
 /** ATR(14) по закрытым свечам (последняя свеча считается незакрытой и отбрасывается). */
 export function closedCandlesAtr(candles: OhlcvCandle[], period = 14): number {
@@ -1628,7 +1634,7 @@ export function closedCandlesAtr(candles: OhlcvCandle[], period = 14): number {
 
 export interface TakeProfitTarget {
   price: number;
-  source: 'ATR' | 'LEVEL' | 'FLOOR';
+  source: 'ATR' | 'LEVEL' | 'FLOOR' | 'CAP';
   atr: number;
   distance_pct: number;
   distance_atr: number;
@@ -1645,10 +1651,12 @@ export function computeTakeProfitTarget(params: {
   atr: number;
   levels?: Array<number | undefined | null>;
   minDistancePct?: number;
+  maxDistancePct?: number;
 }): TakeProfitTarget {
   const { entry, isShort } = params;
   const sgn = isShort ? -1 : 1;
   const minPct = params.minDistancePct ?? TP_MIN_DISTANCE_PCT;
+  const maxPct = params.maxDistancePct ?? TP_MAX_DISTANCE_PCT;
   const atr = params.atr > 0 ? params.atr : entry * 0.02; // нет истории — считаем ATR ≈ 2% цены
   const floorPrice = entry * (1 + (sgn * minPct) / 100);
   const atrPrice = entry + sgn * TP_ATR_MULTIPLE * atr;
@@ -1670,6 +1678,11 @@ export function computeTakeProfitTarget(params: {
     price = floorPrice;
     source = 'FLOOR';
   }
+  const capPrice = entry * (1 + (sgn * maxPct) / 100);
+  if (isShort ? price < capPrice : price > capPrice) {
+    price = capPrice;
+    source = 'CAP';
+  }
   const distancePct = (Math.abs(price - entry) / entry) * 100;
   const distanceAtr = Math.abs(price - entry) / atr;
   const reason =
@@ -1677,6 +1690,8 @@ export function computeTakeProfitTarget(params: {
       ? `${TP_ATR_MULTIPLE} ATR(4H) от входа (${distancePct.toFixed(2)}%)`
       : source === 'LEVEL'
       ? `за ${TP_LEVEL_OFFSET_ATR} ATR до уровня ${Number(ahead[0].toPrecision(7))} (${distancePct.toFixed(2)}%, ${distanceAtr.toFixed(2)} ATR)`
+      : source === 'CAP'
+      ? `потолок ${maxPct}% (монета очень волатильна: ATR(4H) ${((atr / entry) * 100).toFixed(1)}% цены)`
       : `минимальная дистанция ${minPct}% (покрывает комиссии)`;
   return {
     price: Number(price.toPrecision(7)),
