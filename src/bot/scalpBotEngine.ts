@@ -1716,6 +1716,8 @@ export const PRIMARY_TP_FALLBACK_ATR = 3;
 export const PRIMARY_TP_MAX_DISTANCE_PCT = 12;
 /** Схема «по волатильности»: тейк основной ноги и уровни усреднения в ATR(4H) от входа. */
 export const PRIMARY_TP_ATR = 2;
+/** Вход: цена не дальше стольких ATR(4H) от EMA20(4H) в сторону тренда (не догоняем ушедшую цену). */
+export const ENTRY_MAX_EMA_EXTENSION_ATR = 2;
 export const DCA_L1_ATR = 4;
 export const DCA_L2_ATR = 8;
 /** Потолок дистанции L1/L2 от входа (%): в модели фильтр монет (ATR 4H 2–8%) давал L1 ≤ 32%, L2 ≤ 64%. */
@@ -3073,6 +3075,8 @@ export interface GlobalHedgeEvaluation {
   level_bounce?: { side: 'support' | 'resistance'; level: number };
   /** Результат фильтра монет (ADX, направленность, ATR) */
   coin_quality?: CoinQuality;
+  /** На сколько ATR(4H) цена ушла от EMA20(4H) в сторону тренда в момент оценки */
+  entry_extension_atr?: number;
   should_enter_hedge: boolean;
   should_open_hedge: boolean;
   channel_width_pct: number;
@@ -3205,14 +3209,26 @@ export function evaluateGlobalHedgeStrategy(
   // Фильтр монет: не боковик, направленное движение, свечи не мелкие и не экстремальные
   const coinQuality = assessCoinQuality(candles4h);
 
+  // Правило входа «не догонять ушедшую цену»: цена не дальше ENTRY_MAX_EMA_EXTENSION_ATR ATR(4H) от EMA20(4H)
+  // по закрытым свечам в сторону тренда. Прежний фильтр уровней (середина коридора 25–75%, преграда 1.5%) снят:
+  // на истории (2 629 входов по тренду, 30 монет) отсечённые им входы давали 2.61% против 0.84% у пропущенных,
+  // а вход вдогонку (> 2 ATR от EMA20) — 0.27% и худший 1% −81%. Тренд + ≤ 2 ATR: 1.46%, худший 1% −59%.
+  const entryAtr = closedCandlesAtr(candles4h);
+  const closesForEma = closed4h.map((c) => c.close);
+  const ema20Series = closesForEma.length >= 20 ? calcEmaSeries(closesForEma, 20) : [];
+  const ema20 = ema20Series.length > 0 ? ema20Series[ema20Series.length - 1] : 0;
+  const entryExtensionAtr =
+    ema20 > 0 && entryAtr > 0 ? ((primarySide === 'long' ? 1 : -1) * (currentPrice - ema20)) / entryAtr : 0;
+  const notChasing = ema20 > 0 && entryAtr > 0 && entryExtensionAtr <= ENTRY_MAX_EMA_EXTENSION_ATR;
+
   const shouldEnter =
     regimeAllowsEntry &&
     coinQuality.ok &&
-    channelWidthPct >= 3.0 &&
-    (inMidRangeCorridor || confirmedLevelBounceEntry) &&
-    obstacleCheckOk &&
+    notChasing &&
     safeRsiZone &&
     noExtremeImpulse;
+  void inMidRangeCorridor;
+  void obstacleCheckOk;
 
   // Тейки ног (схема «основная до следующего уровня, дошла — закрываем обе»):
   //  • основная нога (по тренду) — ближайший уровень по ходу не ближе 1 ATR(4H), иначе 3 ATR;
@@ -3255,12 +3271,11 @@ export function evaluateGlobalHedgeStrategy(
       rejectDetail = regime ? regime.summary : 'режим рынка не определён';
     } else if (!coinQuality.ok) {
       rejectDetail = `фильтр монет: ${coinQuality.reason}`;
-    } else if (channelWidthPct < 3.0) {
-      rejectDetail = `узкий коридор ${channelWidthPct.toFixed(1)}% (< 3.0%)`;
-    } else if (!inMidRangeCorridor && !confirmedLevelBounceEntry) {
-      rejectDetail = `нарушено правило запаса хода (поз. ${posPct.toFixed(0)}%, воздух до SUP=${airToSupPct.toFixed(2)}%, до RES=${airToResPct.toFixed(2)}%, нет 3-фазного отбоя)`;
-    } else if (!obstacleCheckOk) {
-      rejectDetail = `запрет на вход у преграды (основная ${primarySide.toUpperCase()}, воздух=${primarySide === 'long' ? airToResPct.toFixed(2) : airToSupPct.toFixed(2)}% < 1.5%)`;
+    } else if (!notChasing) {
+      rejectDetail =
+        ema20 > 0 && entryAtr > 0
+          ? `цена уже ушла по тренду на ${entryExtensionAtr.toFixed(2)} ATR от EMA20(4H) (> ${ENTRY_MAX_EMA_EXTENSION_ATR}) — не догоняем, ждём отката`
+          : 'недостаточно закрытых свечей 4H для EMA20/ATR';
     } else if (!noExtremeImpulse) {
       rejectDetail = `импульсный пролив/памп, новостной вертолёт или фильтр BTC`;
     } else {
@@ -3289,13 +3304,14 @@ export function evaluateGlobalHedgeStrategy(
     air_to_support_pct: Number(airToSupPct.toFixed(2)),
     air_to_resistance_pct: Number(airToResPct.toFixed(2)),
     coin_quality: coinQuality,
+    entry_extension_atr: Number(entryExtensionAtr.toFixed(2)),
     level_bounce: confirmedLevelBounceEntry
       ? primarySide === 'long'
         ? { side: 'support', level: globalSup }
         : { side: 'resistance', level: globalRes }
       : undefined,
     reason: shouldEnter
-      ? `Асимметричный 2:1 Хедж (${confirmedLevelBounceEntry ? '3-фазный отбой от уровня' : 'середина коридора'} · ${dominantTrend}: основная ${primarySide.toUpperCase()} 1.0x + страховочная ${insuranceSide.toUpperCase()} 0.5x): коридор [${globalSup} .. ${globalRes}] (${channelWidthPct.toFixed(1)}%), поз. ${posPct.toFixed(0)}% (запас хода -${airToSupPct.toFixed(1)}% / +${airToResPct.toFixed(1)}%)`
+      ? `Асимметричный 2:1 Хедж (${dominantTrend}: основная ${primarySide.toUpperCase()} 1.0x + страховочная ${insuranceSide.toUpperCase()} 0.5x): цена ${entryExtensionAtr.toFixed(2)} ATR от EMA20(4H) по тренду (≤ ${ENTRY_MAX_EMA_EXTENSION_ATR}), ${coinQuality.reason || 'монета прошла фильтр'}`
       : `Вход в хедж отклонён: ${rejectDetail}`,
   };
 }
