@@ -10,6 +10,8 @@ import {
   DEFAULT_SCALPBOT_CONFIG,
   analyzeMultiTimeframe,
   computeTakeProfitTarget,
+  computePrimaryLegTarget,
+  findSwingLevels,
   closedCandlesAtr,
   TP_MIN_DISTANCE_PCT,
   assessTimeframeTrend,
@@ -4039,62 +4041,134 @@ function journalReversalSignal(params: {
 // Тейк не опускается ниже точки безубытка с запасом (recalculateTradeMetrics), защита от минуса сохраняется.
 // Ордер тейк-профита на бирже обновляет обычный цикл синхронизации.
 // ============================================================================
-const TP_RECALC_MIGRATION = 'tp_atr_rule_open_positions_v2_cap6';
+const TP_RECALC_MIGRATION = 'tp_hedge_pairs_exit_both_v3';
+/** Старый «Вариант Б» сценария 1 (закрыть только основную ногу у цели) — отключён схемой «закрываем обе ноги вместе». */
+const HEDGE_LEGACY_VARIANT_B_ENABLED = false;
 
-async function recalculateOpenTradeTakeProfits(): Promise<void> {
-  if (sqliteDb.isMigrationApplied(TP_RECALC_MIGRATION)) return;
-  await initializeBotTrades();
-  const candidates = tradesStore.filter(
-    (t) =>
-      t.is_open &&
-      !t.tp_manual_override &&
-      (t.dca_count || 0) === 0 &&
-      !((t.campaign_banked_profit || 0) > 0) &&
-      t.open_rate > 0
-  );
-  let changed = 0;
-  for (const trade of candidates) {
-    try {
-      const [{ candles: c1h }, { candles: c4h }, { candles: c1d }, { candles: c1w }] = await Promise.all([
-        fetchRealCandles(trade.pair, '1h', 500),
-        fetchRealCandles(trade.pair, '4h', 1000),
-        fetchRealCandles(trade.pair, '1d', 1000),
-        fetchRealCandles(trade.pair, '1w', 300),
-      ]);
-      if (c4h.length < 30) continue;
-      const mtf = analyzeMultiTimeframe(trade.pair, c1h, c4h, c1d, undefined, c1w);
-      const target = computeTakeProfitTarget({
-        entry: trade.open_rate,
-        isShort: trade.is_short,
-        atr: closedCandlesAtr(c4h),
-        levels: trade.is_short
-          ? [mtf.key_4h_support, ...(mtf.chart_targets_short || []).map((c) => c.level_price || c.price)]
-          : [mtf.key_4h_resistance, ...(mtf.chart_targets_long || []).map((c) => c.level_price || c.price)],
-      });
-      const oldTp = trade.take_profit_abs;
-      trade.take_profit_abs = roundPrice(target.price);
-      recalculateTradeMetrics(trade, false); // поднимет тейк до безубытка с запасом, если правило дало меньше
-      if (Math.abs((trade.take_profit_abs || 0) - (oldTp || 0)) / Math.max(1e-8, oldTp || 1) > 0.001) {
-        changed++;
-        trade.plan_notes = `${String(trade.plan_notes || '').trim()} | TP пересчитан по правилу ATR: ${oldTp} → ${trade.take_profit_abs} (${target.reason})`.trim();
-        sqliteDb.upsertTrade(trade);
-        broadcastTradeLifecycleEvent('trade:updated', trade);
-        appendLog(
-          'freqtrade.bot.tp',
-          'INFO',
-          `🎯 [${trade.pair}] #${trade.trade_id} ${trade.is_short ? 'SHORT' : 'LONG'}: тейк пересчитан ${oldTp} → ${trade.take_profit_abs} (${target.reason})`,
-          { userId: resolveTradeUserId(trade) }
-        );
-      }
-    } catch {
-      // монета без истории/сети — пропускаем, остальные пересчитываем
-    }
+/** Тейк для ноги по её роли: основная — следующий уровень по ходу; страховка и одиночная — близкий тейк. */
+async function computeLegTakeProfit(trade: FreqtradeTrade): Promise<ReturnType<typeof computeTakeProfitTarget> | null> {
+  const [{ candles: c1h }, { candles: c4h }, { candles: c1d }, { candles: c1w }] = await Promise.all([
+    fetchRealCandles(trade.pair, '1h', 500),
+    fetchRealCandles(trade.pair, '4h', 1000),
+    fetchRealCandles(trade.pair, '1d', 1000),
+    fetchRealCandles(trade.pair, '1w', 300),
+  ]);
+  if (c4h.length < 30) return null;
+  const mtf = analyzeMultiTimeframe(trade.pair, c1h, c4h, c1d, undefined, c1w);
+  const isPrimary = trade.campaign_role === 'primary';
+  const baseLevels = trade.is_short
+    ? [mtf.key_4h_support, ...(mtf.chart_targets_short || []).map((c) => c.level_price || c.price)]
+    : [mtf.key_4h_resistance, ...(mtf.chart_targets_long || []).map((c) => c.level_price || c.price)];
+  // Свинг-уровни 4H нужны только основной ноге (ищем «следующий уровень» по тренду, не ближе 1 ATR)
+  const levels = isPrimary ? [...baseLevels, ...findSwingLevels(c4h, trade.is_short)] : baseLevels;
+  const params = { entry: trade.open_rate, isShort: trade.is_short, atr: closedCandlesAtr(c4h), levels };
+  return isPrimary ? computePrimaryLegTarget(params) : computeTakeProfitTarget(params);
+}
+
+/** Ставит ноге новый тейк (если она не на ручном тейке и без усреднений/банка). Возвращает true, если тейк изменился. */
+async function applyLegTakeProfit(trade: FreqtradeTrade, context: string): Promise<boolean> {
+  if (
+    !trade.is_open ||
+    trade.tp_manual_override ||
+    (trade.dca_count || 0) > 0 ||
+    (trade.campaign_banked_profit || 0) > 0 ||
+    !(trade.open_rate > 0)
+  ) {
+    return false;
   }
-  sqliteDb.markMigrationApplied(TP_RECALC_MIGRATION, `кандидатов ${candidates.length}, изменено ${changed}`);
+  const target = await computeLegTakeProfit(trade);
+  if (!target) return false;
+  const oldTp = trade.take_profit_abs;
+  trade.take_profit_abs = roundPrice(target.price);
+  recalculateTradeMetrics(trade, false); // не ниже безубытка с запасом
+  if (Math.abs((trade.take_profit_abs || 0) - (oldTp || 0)) / Math.max(1e-8, oldTp || 1) <= 0.001) return false;
+  trade.plan_notes = `${String(trade.plan_notes || '').trim()} | TP (${context}): ${oldTp} → ${trade.take_profit_abs} (${target.reason})`.trim();
+  sqliteDb.upsertTrade(trade);
+  broadcastTradeLifecycleEvent('trade:updated', trade);
   appendLog(
     'freqtrade.bot.tp',
     'INFO',
-    `🎯 Тейки открытых позиций пересчитаны по правилу «1.25 ATR или уровень − 0.35 ATR»: изменено ${changed} из ${candidates.length} (ручные тейки и позиции после усреднения не трогались).`,
+    `🎯 [${trade.pair}] #${trade.trade_id} ${trade.is_short ? 'SHORT' : 'LONG'}${trade.campaign_role ? ` (${trade.campaign_role === 'primary' ? 'основная' : 'страховка'})` : ''}: тейк ${oldTp} → ${trade.take_profit_abs} (${target.reason})`,
+    { userId: resolveTradeUserId(trade) }
+  );
+  return true;
+}
+
+/**
+ * Связывает лонг и шорт по одной монете на одном аккаунте в хедж-пару, если они ещё не связаны
+ * (например, позиции подтянуты с биржи). Основная нога — больший номинал; при почти равных — по дневному тренду.
+ * Без связки бот вёл бы ноги по отдельности и закрывал одну, оставляя вторую против тренда.
+ */
+async function linkOppositeLegsIntoCampaigns(): Promise<void> {
+  const groups = new Map<string, FreqtradeTrade[]>();
+  for (const t of tradesStore) {
+    if (!t.is_open) continue;
+    const key = `${t.account_id || 'master'}|${resolveTradeUserId(t)}|${t.pair}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(t);
+  }
+  for (const legs of groups.values()) {
+    const longs = legs.filter((l) => !l.is_short);
+    const shorts = legs.filter((l) => l.is_short);
+    if (longs.length !== 1 || shorts.length !== 1) continue;
+    const L = longs[0];
+    const S = shorts[0];
+    if (L.campaign_id && L.campaign_id === S.campaign_id && L.campaign_role && S.campaign_role) continue;
+    const notional = (t: FreqtradeTrade) => (t.amount || 0) * (t.open_rate || 0);
+    let primary = notional(L) >= notional(S) ? L : S;
+    const big = Math.max(notional(L), notional(S));
+    if (big > 0 && Math.abs(notional(L) - notional(S)) / big < 0.15) {
+      try {
+        const ctx = await getReversalContext(L.pair);
+        if (ctx.dailyDirection === 'UP') primary = L;
+        else if (ctx.dailyDirection === 'DOWN') primary = S;
+      } catch {
+        // без контекста оставляем выбор по номиналу
+      }
+    }
+    const insurance = primary === L ? S : L;
+    const campaignId =
+      L.campaign_id && L.campaign_id === S.campaign_id
+        ? L.campaign_id
+        : `hedge-${L.pair.split(':')[0].replace('/', '')}-linked-${Date.now()}`;
+    for (const leg of [primary, insurance]) {
+      leg.campaign_id = campaignId;
+      leg.campaign_role = leg === primary ? 'primary' : 'insurance';
+    }
+    insurance.planned_dca_levels = [];
+    insurance.next_dca_price = undefined;
+    sqliteDb.upsertTrade(primary);
+    sqliteDb.upsertTrade(insurance);
+    appendLog(
+      'freqtrade.bot.hedge',
+      'INFO',
+      `🔗 [${L.pair}] Лонг #${L.trade_id} и шорт #${S.trade_id} связаны в хедж-пару: основная — ${primary.is_short ? 'SHORT' : 'LONG'} #${primary.trade_id}, страховка — #${insurance.trade_id}. Дойдёт основная до цели — закроются обе.`,
+      { userId: resolveTradeUserId(L) }
+    );
+    await applyLegTakeProfit(primary, 'пара связана');
+    await applyLegTakeProfit(insurance, 'пара связана');
+  }
+}
+
+/** Разовый пересчёт тейков открытых позиций по схеме «основная до уровня, страховка близко». */
+async function recalculateOpenTradeTakeProfits(): Promise<void> {
+  if (sqliteDb.isMigrationApplied(TP_RECALC_MIGRATION)) return;
+  await initializeBotTrades();
+  await linkOppositeLegsIntoCampaigns();
+  const candidates = tradesStore.filter((t) => t.is_open);
+  let changed = 0;
+  for (const trade of candidates) {
+    try {
+      if (await applyLegTakeProfit(trade, 'пересчёт по схеме пары')) changed++;
+    } catch {
+      // монета без истории/сети — пропускаем
+    }
+  }
+  sqliteDb.markMigrationApplied(TP_RECALC_MIGRATION, `open ${candidates.length}, changed ${changed}`);
+  appendLog(
+    'freqtrade.bot.tp',
+    'INFO',
+    `🎯 Тейки открытых позиций пересчитаны по схеме «основная — до следующего уровня, страховка — близкий тейк, дошла основная — закрываем обе»: изменено ${changed} из ${candidates.length}.`,
     { publicMarket: false }
   );
 }
@@ -4208,6 +4282,9 @@ async function runScalpBotCycle(waitForActive = false) {
         }
       }
     }
+
+    // Лонг и шорт по одной монете (например, подтянутые с биржи) ведём как одну хедж-пару
+    await linkOppositeLegsIntoCampaigns().catch(() => {});
 
     const openTrades = tradesStore.filter((t) => {
       if (!t.is_open) return false;
@@ -4529,10 +4606,17 @@ async function runScalpBotCycle(waitForActive = false) {
           const primaryNetPnl = trade.net_profit ?? trade.profit_abs ?? 0;
           const insuranceNetPnl = openSibling.net_profit ?? openSibling.profit_abs ?? 0;
           const combinedCycleNetPnl = Number((primaryNetPnl + insuranceNetPnl).toFixed(4));
+          // Цена дошла до тейка основной ноги (следующий уровень по тренду)
+          const primaryTpHit = trade.is_short
+            ? currentPrice <= trade.take_profit_abs || closeExecPrice <= trade.take_profit_abs
+            : currentPrice >= trade.take_profit_abs || closeExecPrice >= trade.take_profit_abs;
 
-          if (levelReversalAtTp.confirmed && combinedCycleNetPnl > 0.05 && closeProfitGuard.ok) {
-            // СЦЕНАРИЙ 1 (Вариант А — Прямая фиксация цикла): На уровне L1 сформировался разворот -> закрываем ОБЕ позиции одновременно в чистый плюс за счёт перевеса 2:1!
-            for (const leg of [trade, openSibling]) {
+          // Схема C: основная дошла до своего тейка — закрываем ОБЕ ноги вместе, если пара в сумме в плюсе.
+          // Разворот подтверждать не нужно: иначе страховка против тренда оставалась бы одна и уходила в минус.
+          if (primaryTpHit && combinedCycleNetPnl > 0.05 && closeProfitGuard.ok) {
+            // Закрываем ОБЕ позиции: прибыль основной ноги перекрывает минус страховки (перевес 2:1).
+            // Сначала страховку: если биржа отклонит закрытие второй ноги, лучше остаться с плюсовой основной.
+            for (const leg of [openSibling, trade]) {
               const legLockKey = getPosLockKey(leg.account_id || tradeAccScopeId, leg.pair, leg.is_short);
               await withPositionLock(legLockKey, async () => {
                 if (!leg.is_open) return;
@@ -4558,7 +4642,7 @@ async function runScalpBotCycle(waitForActive = false) {
                   leg.current_rate = actualPrice;
                   leg.close_date = nowStr;
                   leg.close_timestamp = now;
-                  leg.exit_reason = 'asymmetric_hedge_cycle_profit';
+                  leg.exit_reason = 'hedge_both_legs_at_primary_target';
                   leg.trade_state = 'CLOSED';
                   leg.planned_dca_levels = [];
                   recalculateTradeMetrics(leg, false);
@@ -4570,11 +4654,14 @@ async function runScalpBotCycle(waitForActive = false) {
             appendLog(
               'freqtrade.bot.hedge',
               'INFO',
-              `🏆 [Сценарий 1А: Прибыль цикла 2:1] На уровне ${trade.take_profit_abs}$ подтверждён 3-фазный разворот (${levelReversalAtTp.reason}). Обе ноги [${trade.pair}] закрыты одновременно с чистым профитом корзины +${combinedCycleNetPnl}$!`,
+              `🏆 [Пара закрыта у цели] Основная нога #${trade.trade_id} [${trade.pair}] дошла до тейка ${trade.take_profit_abs}$ — обе ноги закрыты вместе, итог пары +${combinedCycleNetPnl}$ (страховка не остаётся одна против тренда).`,
               { userId: tradeUserId }
             );
             continue;
           } else if (
+            // Старый «Вариант Б» (закрыть только основную, страховку оставить и усреднять) отключён:
+            // он оставлял страховку против тренда одну — по модели это главный источник брошенных ног в минусе.
+            HEDGE_LEGACY_VARIANT_B_ENABLED &&
             levelReversalAtTp.confirmed &&
             combinedCycleNetPnl <= 0.05 &&
             primaryNetPnl > 0.05 &&
@@ -4738,7 +4825,11 @@ async function runScalpBotCycle(waitForActive = false) {
 
       // 1A. Target TP check (только когда НЕТ активной второй ноги замка — то есть после закрытия страховки при разгрузке основной ноги на отскоке, либо для одиночной сделки).
       // Пока открыты ОБЕ ноги замка (Boolean(openSibling)), касание уровня НЕ закрывает ногу вслепую — работа идёт строго по Сценариям 1А, 1Б, 2, 3, 4 и 5!
-      if (trade.take_profit_abs > 0 && !openSibling) {
+      // Исключение: страховка (против тренда) может забрать свой БЛИЗКИЙ тейк на откате, пока основная нога идёт
+      // к своему уровню — по модели хеджа это добавляет прибыль и не оставляет страховку висеть против тренда.
+      const insuranceTakesOwnTp =
+        Boolean(openSibling) && trade.campaign_role === 'insurance' && openSibling?.campaign_role === 'primary';
+      if (trade.take_profit_abs > 0 && (!openSibling || insuranceTakesOwnTp)) {
         const isTpHit = trade.is_short
           ? currentPrice <= trade.take_profit_abs || closeExecPrice <= trade.take_profit_abs
           : currentPrice >= trade.take_profit_abs || closeExecPrice >= trade.take_profit_abs;
@@ -5960,14 +6051,18 @@ async function createScalpBotPosition(
       tpHorizon = 'MANUAL';
       tpReason = 'Целевой уровень TP кампании';
     } else {
-      const tpTarget = computeTakeProfitTarget({
+      // Основная нога пары — до следующего уровня по ходу (не ближе 1 ATR); остальные — близкий тейк
+      const isPrimaryLeg = customOpts?.campaignRole === 'primary';
+      const baseTpLevels = isShort
+        ? [manualSupLvl?.price, effectiveSup, ...(mtf.chart_targets_short || []).map((c) => c.level_price || c.price)]
+        : [manualResLvl?.price, effectiveRes, ...(mtf.chart_targets_long || []).map((c) => c.level_price || c.price)];
+      const tpParams = {
         entry: entryRate,
         isShort,
         atr: closedCandlesAtr(candles4h),
-        levels: isShort
-          ? [manualSupLvl?.price, effectiveSup, ...(mtf.chart_targets_short || []).map((c) => c.level_price || c.price)]
-          : [manualResLvl?.price, effectiveRes, ...(mtf.chart_targets_long || []).map((c) => c.level_price || c.price)],
-      });
+        levels: isPrimaryLeg ? [...baseTpLevels, ...findSwingLevels(candles4h, isShort)] : baseTpLevels,
+      };
+      const tpTarget = isPrimaryLeg ? computePrimaryLegTarget(tpParams) : computeTakeProfitTarget(tpParams);
       rawTp = tpTarget.price;
       tpHorizon = tpTarget.source;
       tpReason = tpTarget.reason;

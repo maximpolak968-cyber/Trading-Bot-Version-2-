@@ -1703,6 +1703,84 @@ export function computeTakeProfitTarget(params: {
   };
 }
 
+// ============================================================================
+// ТЕЙК ОСНОВНОЙ НОГИ ХЕДЖА: СЛЕДУЮЩИЙ УРОВЕНЬ ПО ХОДУ СДЕЛКИ
+// По модели хедж-кампаний (~9 700 кампаний на 30 монетах): если основная нога закрывается рано на близком тейке,
+// страховка против тренда остаётся одна и в 27% кампаний к концу периода в среднем −14%. Схема «основная идёт до
+// следующего уровня, а дойдя — закрываем обе ноги вместе» дала 82% прибыльных кампаний, меньше брошенных ног (19%)
+// и втрое меньшую медианную просадку. Страховка при этом держит близкий тейк (computeTakeProfitTarget).
+// ============================================================================
+
+export const PRIMARY_TP_MIN_ATR = 1;
+export const PRIMARY_TP_FALLBACK_ATR = 3;
+export const PRIMARY_TP_MAX_DISTANCE_PCT = 12;
+
+/** Свинг-уровни 4H по ходу сделки (пивоты, подтверждённые 3 свечами с каждой стороны) по закрытым свечам. */
+export function findSwingLevels(candles: OhlcvCandle[], isShort: boolean, lookback = 180): number[] {
+  const closed = candles.slice(0, -1).slice(-lookback);
+  const out: number[] = [];
+  for (let j = 3; j < closed.length - 3; j++) {
+    let ok = true;
+    for (let k = j - 3; k <= j + 3; k++) {
+      if (isShort ? closed[k].low < closed[j].low : closed[k].high > closed[j].high) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) out.push(isShort ? closed[j].low : closed[j].high);
+  }
+  return out;
+}
+
+/**
+ * Тейк основной ноги: ближайший уровень по ходу сделки не ближе 1 ATR(4H); если уровня нет — 3 ATR.
+ * Не ближе 0.8% (комиссии) и не дальше 12% (экстремально волатильные монеты).
+ */
+export function computePrimaryLegTarget(params: {
+  entry: number;
+  isShort: boolean;
+  atr: number;
+  levels?: Array<number | undefined | null>;
+}): TakeProfitTarget {
+  const { entry, isShort } = params;
+  const sgn = isShort ? -1 : 1;
+  const atr = params.atr > 0 ? params.atr : entry * 0.02;
+  const ahead = (params.levels || [])
+    .filter((p): p is number => typeof p === 'number' && Number.isFinite(p) && p > 0)
+    .filter((p) => (isShort ? p <= entry - PRIMARY_TP_MIN_ATR * atr : p >= entry + PRIMARY_TP_MIN_ATR * atr))
+    .sort((a, b) => (isShort ? b - a : a - b));
+  let price = ahead.length > 0 ? ahead[0] : entry + sgn * PRIMARY_TP_FALLBACK_ATR * atr;
+  let source: TakeProfitTarget['source'] = ahead.length > 0 ? 'LEVEL' : 'ATR';
+  const floorPrice = entry * (1 + (sgn * TP_MIN_DISTANCE_PCT) / 100);
+  const capPrice = entry * (1 + (sgn * PRIMARY_TP_MAX_DISTANCE_PCT) / 100);
+  if (isShort ? price > floorPrice : price < floorPrice) {
+    price = floorPrice;
+    source = 'FLOOR';
+  }
+  if (isShort ? price < capPrice : price > capPrice) {
+    price = capPrice;
+    source = 'CAP';
+  }
+  const distancePct = (Math.abs(price - entry) / entry) * 100;
+  const distanceAtr = Math.abs(price - entry) / atr;
+  const reason =
+    source === 'LEVEL'
+      ? `основная нога: следующий уровень ${Number(ahead[0].toPrecision(7))} (${distancePct.toFixed(2)}%, ${distanceAtr.toFixed(2)} ATR)`
+      : source === 'ATR'
+      ? `основная нога: уровня впереди нет — ${PRIMARY_TP_FALLBACK_ATR} ATR (${distancePct.toFixed(2)}%)`
+      : source === 'CAP'
+      ? `основная нога: потолок ${PRIMARY_TP_MAX_DISTANCE_PCT}% (монета очень волатильна)`
+      : `основная нога: минимальная дистанция ${TP_MIN_DISTANCE_PCT}%`;
+  return {
+    price: Number(price.toPrecision(7)),
+    source,
+    atr: Number(atr.toPrecision(6)),
+    distance_pct: Number(distancePct.toFixed(2)),
+    distance_atr: Number(distanceAtr.toFixed(2)),
+    reason,
+  };
+}
+
 function trendStateToLegacyLabel(
   s: TimeframeTrendState
 ): 'BULLISH' | 'BEARISH' | 'MILD_BULLISH' | 'MILD_BEARISH' | 'NEUTRAL' {
@@ -3052,20 +3130,34 @@ export function evaluateGlobalHedgeStrategy(
     safeRsiZone &&
     noExtremeImpulse;
 
-  // Тейки обеих ног: 1.25 ATR(4H) или ближайший уровень по ходу − 0.35 ATR (что ближе), не ближе 0.8%.
-  // Уровни-кандидаты: ключевые уровни канала 4H и цели графика 1H/4H/1D/1W.
+  // Тейки ног (схема «основная до следующего уровня, дошла — закрываем обе»):
+  //  • основная нога (по тренду) — ближайший уровень по ходу не ближе 1 ATR(4H), иначе 3 ATR;
+  //  • страховка (против тренда) — близкий тейк: 1.25 ATR или уровень − 0.35 ATR.
   const atr4h = closedCandlesAtr(candles4h);
-  const longTpPrice = computeTakeProfitTarget({
+  // Свинг-уровни 4H — только для основной ноги (ищем «следующий уровень» по тренду)
+  const longLevels = [
+    globalRes,
+    mtf.key_4h_resistance,
+    ...(mtf.chart_targets_long || []).map((c) => c.level_price || c.price),
+    ...(primarySide === 'long' ? findSwingLevels(candles4h, false) : []),
+  ];
+  const shortLevels = [
+    globalSup,
+    mtf.key_4h_support,
+    ...(mtf.chart_targets_short || []).map((c) => c.level_price || c.price),
+    ...(primarySide === 'short' ? findSwingLevels(candles4h, true) : []),
+  ];
+  const longTpPrice = (primarySide === 'long' ? computePrimaryLegTarget : computeTakeProfitTarget)({
     entry: currentPrice,
     isShort: false,
     atr: atr4h,
-    levels: [globalRes, mtf.key_4h_resistance, ...(mtf.chart_targets_long || []).map((c) => c.level_price || c.price)],
+    levels: longLevels,
   }).price;
-  const shortTpPrice = computeTakeProfitTarget({
+  const shortTpPrice = (primarySide === 'short' ? computePrimaryLegTarget : computeTakeProfitTarget)({
     entry: currentPrice,
     isShort: true,
     atr: atr4h,
-    levels: [globalSup, mtf.key_4h_support, ...(mtf.chart_targets_short || []).map((c) => c.level_price || c.price)],
+    levels: shortLevels,
   }).price;
 
   const longDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, false, 3.0, 95.0, candles1w);
