@@ -132,6 +132,15 @@ export default function App() {
 
   // Подключённые API-аккаунты владельца и людей (Binance, Bybit, OKX, Bitget, BingX)
   const [accounts, setAccounts] = useState<ExchangeAccount[]>([]);
+  // Аккаунты на Testnet: их сделки не пересчитываем по тикам основного рынка.
+  // Сделки владельца хранятся с account_id = 'master' — он тоже Testnet, если все включённые аккаунты владельца на Testnet.
+  const testnetAccountIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const ids = new Set<string>(accounts.filter((a) => a.is_testnet).map((a) => a.id));
+    const ownerEnabled = accounts.filter((a) => a.enabled && a.is_owner);
+    if (ownerEnabled.length > 0 && ownerEnabled.every((a) => a.is_testnet)) ids.add('master');
+    testnetAccountIdsRef.current = ids;
+  }, [accounts]);
   const [wsLiveConnected, setWsLiveConnected] = useState<boolean>(false);
 
   const [loadingChart, setLoadingChart] = useState<boolean>(false);
@@ -195,6 +204,7 @@ export default function App() {
         }
       } finally {
         if (candleAbortRef.current === controller) {
+          candleAbortRef.current = null;
           setLoadingChart(false);
         }
       }
@@ -424,6 +434,36 @@ export default function App() {
     };
   }, [authToken]);
 
+  // График Testnet: живых тиков тестовой биржи по WebSocket нет, поэтому раз в 4 с тихо подтягиваем
+  // последние свечи (сервер обновляет только хвост истории) — без индикатора загрузки и сброса запроса.
+  const silentCandleBusyRef = useRef(false);
+  const isTestnetChart = String(dataframe?.exchange_source || '').toLowerCase().includes('testnet');
+  useEffect(() => {
+    if (!isTestnetChart || !autoRefresh || !dynamicUpdate) return;
+    const timer = setInterval(async () => {
+      if (document.hidden || silentCandleBusyRef.current || candleAbortRef.current) return;
+      silentCandleBusyRef.current = true;
+      const pairAtStart = selectedPair;
+      const tfAtStart = timeframe;
+      try {
+        const res = await fetch(
+          `/api/v1/pair_candles?pair=${encodeURIComponent(pairAtStart)}&timeframe=${encodeURIComponent(tfAtStart)}&strategy=${encodeURIComponent(strategy)}&limit=1000`
+        );
+        if (res.ok) {
+          const data: PairCandlesResponse = await res.json();
+          setDataframe((prev) =>
+            prev && prev.pair === pairAtStart && prev.timeframe === tfAtStart ? data : prev
+          );
+        }
+      } catch {
+        // сеть недоступна — попробуем на следующем тике
+      } finally {
+        silentCandleBusyRef.current = false;
+      }
+    }, 4000);
+    return () => clearInterval(timer);
+  }, [isTestnetChart, autoRefresh, dynamicUpdate, selectedPair, timeframe, strategy]);
+
   const fetchCandlesRef = useRef(fetchCandles);
   useEffect(() => {
     fetchCandlesRef.current = fetchCandles;
@@ -607,6 +647,9 @@ export default function App() {
             if (!prev.length) return prev;
             let anyChanged = false;
             const updated = prev.map((t) => {
+              // Цены тиков — с основного рынка. Для сделок на Testnet-аккаунте цену и PnL присылает сервер
+              // по данным самой тестовой биржи, поэтому здесь их не пересчитываем.
+              if (testnetAccountIdsRef.current.has(t.account_id || 'master')) return t;
               const trEx = String(t.exchange || 'bybit').toLowerCase();
               // Strictly match the trade's own exchange so open position prices/PnL never jump between Binance & Bybit
               const tk =
@@ -652,6 +695,8 @@ export default function App() {
           if (dynamicUpdateRef.current) {
             setDataframe((prev) => {
               if (!prev || prev.pair !== selectedPairRef.current || !prev.data.length) return prev;
+              // Живые тики идут с основного рынка — в график Testnet их не подмешиваем (у Testnet свои цены)
+              if (String(prev.exchange_source || '').toLowerCase().includes('testnet')) return prev;
               const dfEx = String(prev.exchange_source || '')
                 .toLowerCase()
                 .includes('binance')
@@ -685,6 +730,7 @@ export default function App() {
             if (!prev || prev.pair !== c.pair || prev.timeframe !== c.interval || !prev.data.length) {
               return prev;
             }
+            if (String(prev.exchange_source || '').toLowerCase().includes('testnet')) return prev;
             const dfEx = String(prev.exchange_source || '')
               .toLowerCase()
               .includes('binance')
@@ -856,17 +902,9 @@ export default function App() {
     fetchCandles(selectedPair, timeframe, strategy);
     fetchPairBotLevels(selectedPair, timeframe);
     fetchPairDrawings(selectedPair);
-    if (authState.role === 'owner') {
-      fetch('/api/v1/config', {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-        },
-        body: JSON.stringify({ timeframe, strategy }),
-      }).catch(() => {});
-    }
-  }, [authState.loading, authState.require_login, authState.authenticated, authState.role, authToken, selectedPair, timeframe, strategy, fetchCandles, fetchPairBotLevels, fetchPairDrawings]);
+    // Таймфрейм графика — только для просмотра. Раньше здесь же менялся рабочий таймфрейм бота
+    // (PATCH /api/v1/config): просмотр минутного графика переводил анализ бота на минутные свечи.
+  }, [authState.loading, authState.require_login, authState.authenticated, selectedPair, timeframe, strategy, fetchCandles, fetchPairBotLevels, fetchPairDrawings]);
 
   const parsedCandles = useMemo(
     () => parseDataframeToCandles(dataframe),
