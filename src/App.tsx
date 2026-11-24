@@ -218,6 +218,8 @@ export default function App() {
   openTradesRef.current = openTrades;
   const botLevelsRef = useRef<BotChartLevel[]>([]);
   botLevelsRef.current = botLevels;
+  const levelsViewKeyRef = useRef('');
+  levelsViewKeyRef.current = `${selectedPair}|${timeframe}`;
 
   const fetchPairBotLevels = useCallback(
     async (pairArg = selectedPair, tfArg = timeframe) => {
@@ -237,6 +239,9 @@ export default function App() {
         );
         if (res.ok) {
           const data = await res.json();
+          // Ответ для уже переключённой пары/таймфрейма отбрасываем: иначе при быстром переключении
+          // на графике оставались уровни предыдущего таймфрейма.
+          if (levelsViewKeyRef.current !== `${pairArg}|${tfArg}`) return;
           if (
             pendingLevelMutationsRef.current === 0 &&
             reqStartTs >= lastLevelMutationTsRef.current &&
@@ -900,6 +905,7 @@ export default function App() {
   useEffect(() => {
     if (authState.loading || (authState.require_login && !authState.authenticated)) return;
     fetchCandles(selectedPair, timeframe, strategy);
+    setBotLevels([]);
     fetchPairBotLevels(selectedPair, timeframe);
     fetchPairDrawings(selectedPair);
     // Таймфрейм графика — только для просмотра. Раньше здесь же менялся рабочий таймфрейм бота

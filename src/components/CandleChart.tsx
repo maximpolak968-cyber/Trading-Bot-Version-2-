@@ -818,10 +818,11 @@ export const CandleChart: React.FC<CandleChartProps> = ({
     if (plotConfig.showTrades && Number.isFinite(minPrice) && Number.isFinite(maxPrice)) {
       const candleMid = (minPrice + maxPrice) / 2;
       const candleSpan = Math.max(candleMid * 0.002, maxPrice - minPrice);
-      const includeIfNear = (p?: number, isManual = false) => {
-        const maxDist = isManual
-          ? Math.max(candleSpan * 4.5, candleMid * 0.35)
-          : Math.max(candleSpan * 1.6, candleMid * 0.08);
+      // Масштаб — по свечам, как в TradingView. Линию подтягиваем в окно, только если она почти рядом
+      // (не дальше 15% высоты свечей за краем). Раньше в окно тянулись линии за 1.6–4.5 высоты свечей
+      // (вход, тейки, L1/L2, уровни 1D/1W): на младших таймфреймах свечи сжимались в полоску среди чужих линий.
+      const includeIfNear = (p?: number, _isManual = false) => {
+        const maxDist = candleSpan * 0.5 + candleSpan * 0.15;
         if (p && Number.isFinite(p) && p > 0 && Math.abs(p - candleMid) <= maxDist) {
           if (p < minPrice) minPrice = p;
           if (p > maxPrice) maxPrice = p;
@@ -1367,7 +1368,22 @@ export const CandleChart: React.FC<CandleChartProps> = ({
 
     if (plotConfig.showTrades && !hideAllDrawings) {
       // 8B. Bot Support / Resistance / Trigger Levels on this coin (draggable + deletable via [×]!)
-      const pairBotLevels = botLevels.filter((l) => l.pair === pair);
+      // Уровень бота на той же цене, что тейк или ближайшее усреднение сделки, не рисуем второй раз:
+      // линия сделки уже стоит там (раньше на одной цене было до трёх подписей).
+      const tradeLinePrices: number[] = [];
+      for (const t of trades) {
+        if (!t.is_open || t.pair !== pair) continue;
+        if (t.take_profit_abs && t.take_profit_abs > 0) tradeLinePrices.push(t.take_profit_abs);
+        const nextDca = Array.isArray(t.planned_dca_levels)
+          ? t.planned_dca_levels.find((l: any) => l && l.price > 0 && !l.filled)
+          : undefined;
+        if (nextDca) tradeLinePrices.push(nextDca.price);
+      }
+      const pairBotLevels = botLevels.filter(
+        (l) =>
+          l.pair === pair &&
+          (l.manual_override || !tradeLinePrices.some((p) => Math.abs(p - l.price) / Math.max(1e-12, l.price) < 0.0015))
+      );
       pairBotLevels.forEach((bl, idx) => {
         const tKey = `bot-${bl.id}`;
         const activePrice =
@@ -1485,8 +1501,10 @@ export const CandleChart: React.FC<CandleChartProps> = ({
 
         // 2) Planned HTF Reversal Averaging Levels (L1 / L2 — Раздел 4 & Сценарий 3/5)
         if (Array.isArray(t.planned_dca_levels) && t.planned_dca_levels.length > 0) {
+          // Показываем только ближайшее невыполненное усреднение: L2 появится, когда сработает L1.
+          const nextDcaIdx = t.planned_dca_levels.findIndex((l: any) => l && l.price > 0 && !l.filled);
           t.planned_dca_levels.forEach((lvl: any, dcaIdx: number) => {
-            if (!lvl || !(lvl.price > 0) || lvl.filled) return;
+            if (!lvl || !(lvl.price > 0) || lvl.filled || dcaIdx !== nextDcaIdx) return;
             const dcaY = priceToY(lvl.price);
             drawHorizontalLevel(ctx, {
               y: dcaY,
@@ -1496,7 +1514,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
               plotBottom,
               rightPriceAxisWidth,
               priceText: formatAxisPrice(lvl.price),
-              badgeText: `⚓ ${lvl.label || `Усреднение L${dcaIdx + 1} (3-фазный разворот)`}`,
+              badgeText: `⚓ L${lvl.step || dcaIdx + 1} усреднение ${sideEng[0]}`,
               lineColor: '#f59e0b',
               badgeBg: 'rgba(69, 26, 3, 0.94)',
               badgeBorder: '#f59e0b',
