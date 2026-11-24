@@ -1714,6 +1714,10 @@ export function computeTakeProfitTarget(params: {
 export const PRIMARY_TP_MIN_ATR = 1;
 export const PRIMARY_TP_FALLBACK_ATR = 3;
 export const PRIMARY_TP_MAX_DISTANCE_PCT = 12;
+/** Схема «по волатильности»: тейк основной ноги и уровни усреднения в ATR(4H) от входа. */
+export const PRIMARY_TP_ATR = 2;
+export const DCA_L1_ATR = 4;
+export const DCA_L2_ATR = 8;
 
 /** Свинг-уровни 4H по ходу сделки (пивоты, подтверждённые 3 свечами с каждой стороны) по закрытым свечам. */
 export function findSwingLevels(candles: OhlcvCandle[], isShort: boolean, lookback = 180): number[] {
@@ -1733,8 +1737,9 @@ export function findSwingLevels(candles: OhlcvCandle[], isShort: boolean, lookba
 }
 
 /**
- * Тейк основной ноги: ближайший уровень по ходу сделки не ближе 1 ATR(4H); если уровня нет — 3 ATR.
- * Не ближе 0.8% (комиссии) и не дальше 12% (экстремально волатильные монеты).
+ * Тейк основной ноги: PRIMARY_TP_ATR ATR(4H) от входа по ходу сделки. Не ближе 0.8% (комиссии) и не дальше 12%.
+ * Уровни (`levels`) больше не используются: на истории (24 монеты, 2 года, >50 000 уровней) цена у уровней бота
+ * разворачивалась не чаще, чем у случайной линии на том же расстоянии. Параметр оставлен для совместимости вызовов.
  */
 export function computePrimaryLegTarget(params: {
   entry: number;
@@ -1745,12 +1750,8 @@ export function computePrimaryLegTarget(params: {
   const { entry, isShort } = params;
   const sgn = isShort ? -1 : 1;
   const atr = params.atr > 0 ? params.atr : entry * 0.02;
-  const ahead = (params.levels || [])
-    .filter((p): p is number => typeof p === 'number' && Number.isFinite(p) && p > 0)
-    .filter((p) => (isShort ? p <= entry - PRIMARY_TP_MIN_ATR * atr : p >= entry + PRIMARY_TP_MIN_ATR * atr))
-    .sort((a, b) => (isShort ? b - a : a - b));
-  let price = ahead.length > 0 ? ahead[0] : entry + sgn * PRIMARY_TP_FALLBACK_ATR * atr;
-  let source: TakeProfitTarget['source'] = ahead.length > 0 ? 'LEVEL' : 'ATR';
+  let price = entry + sgn * PRIMARY_TP_ATR * atr;
+  let source: TakeProfitTarget['source'] = 'ATR';
   const floorPrice = entry * (1 + (sgn * TP_MIN_DISTANCE_PCT) / 100);
   const capPrice = entry * (1 + (sgn * PRIMARY_TP_MAX_DISTANCE_PCT) / 100);
   if (isShort ? price > floorPrice : price < floorPrice) {
@@ -1764,10 +1765,8 @@ export function computePrimaryLegTarget(params: {
   const distancePct = (Math.abs(price - entry) / entry) * 100;
   const distanceAtr = Math.abs(price - entry) / atr;
   const reason =
-    source === 'LEVEL'
-      ? `основная нога: следующий уровень ${Number(ahead[0].toPrecision(7))} (${distancePct.toFixed(2)}%, ${distanceAtr.toFixed(2)} ATR)`
-      : source === 'ATR'
-      ? `основная нога: уровня впереди нет — ${PRIMARY_TP_FALLBACK_ATR} ATR (${distancePct.toFixed(2)}%)`
+    source === 'ATR'
+      ? `основная нога: ${PRIMARY_TP_ATR} ATR(4H) от входа (${distancePct.toFixed(2)}%)`
       : source === 'CAP'
       ? `основная нога: потолок ${PRIMARY_TP_MAX_DISTANCE_PCT}% (монета очень волатильна)`
       : `основная нога: минимальная дистанция ${TP_MIN_DISTANCE_PCT}%`;
@@ -1778,6 +1777,28 @@ export function computePrimaryLegTarget(params: {
     distance_pct: Number(distancePct.toFixed(2)),
     distance_atr: Number(distanceAtr.toFixed(2)),
     reason,
+  };
+}
+
+/**
+ * Уровни усреднения основной ноги по волатильности: L1 = DCA_L1_ATR, L2 = DCA_L2_ATR ATR(4H) от входа против сделки.
+ * Страховка идёт до L1; там бот ждёт подтверждённый разворот (закрытая 4H по дневному тренду), закрывает страховку
+ * и, если позволяет маржа, усредняет основную. Модель (2 793 кампании, 30 монет, обе половины истории по отдельности):
+ * тейк 2 ATR + L1/L2 = 4/8 ATR — средний итог 1.80% против 1.40% у «сильных уровней», 94% прибыльных, худший 1% −55%.
+ */
+export function computeAtrDcaLevels(
+  entry: number,
+  isShort: boolean,
+  atr: number
+): { l1: number; l2: number; atr: number } {
+  const a = atr > 0 ? atr : entry * 0.02;
+  const sgn = isShort ? 1 : -1; // против сделки
+  const l1 = entry + sgn * DCA_L1_ATR * a;
+  const l2 = entry + sgn * DCA_L2_ATR * a;
+  return {
+    l1: l1 > 0 ? Number(l1.toPrecision(7)) : 0,
+    l2: l2 > 0 ? Number(l2.toPrecision(7)) : 0,
+    atr: Number(a.toPrecision(6)),
   };
 }
 
@@ -3217,8 +3238,8 @@ export function evaluateGlobalHedgeStrategy(
     levels: shortLevels,
   }).price;
 
-  const longDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, false, 3.0, 95.0, candles1w);
-  const shortDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, true, 3.0, 95.0, candles1w);
+  const longDca = { price: computeAtrDcaLevels(currentPrice, false, atr4h).l1 };
+  const shortDca = { price: computeAtrDcaLevels(currentPrice, true, atr4h).l1 };
   const horizonLabel: 'MEDIUM_TERM_4H' | 'LONG_TERM_1D' =
     channelWidthPct >= 6.0 ? 'LONG_TERM_1D' : 'MEDIUM_TERM_4H';
 
