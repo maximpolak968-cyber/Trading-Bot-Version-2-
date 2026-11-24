@@ -10,6 +10,7 @@ import {
   DEFAULT_SCALPBOT_CONFIG,
   analyzeMultiTimeframe,
   computeTakeProfitTarget,
+  assessCoinQuality,
   computePrimaryLegTarget,
   findSwingLevels,
   closedCandlesAtr,
@@ -5632,6 +5633,19 @@ async function runScalpBotCycle(waitForActive = false) {
           fetchRealCandles(pair, '1d', 1000),
         ]);
       if (c1h.length < 35 || c4h.length < 25) continue;
+      // Фильтр монет до тяжёлого анализа: боковик, мелкие или экстремальные свечи — сразу пропускаем
+      const coinQuality = assessCoinQuality(c4h);
+      if (!coinQuality.ok) {
+        sqliteDb.recordSignal({
+          pair,
+          signal_type: 'MTF_SCAN',
+          direction: 'skip',
+          confidence: 0,
+          price: c4h[c4h.length - 1].close,
+          reason: `Фильтр монет: ${coinQuality.reason}`,
+        });
+        continue;
+      }
 
       const wsRefTick = getFuturesExecutionPrice(pair, false, false, eligibleAccounts[0]?.exchange);
       const livePrice =
