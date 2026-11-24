@@ -18,6 +18,9 @@ import {
   assessTimeframeTrend,
   assessMarketRegime,
   findStrongestDcaLevel,
+  computeAtrDcaLevels,
+  DCA_L1_ATR,
+  DCA_L2_ATR,
   detectMarketStructure,
   extractStrongTimeframeLevels,
   isHedgeEntryCandidate,
@@ -3245,15 +3248,16 @@ async function enrichImportedPositionMtfLevelsAsync(
         liveTrade.planned_dca_levels = [];
         liveTrade.next_dca_price = undefined;
       } else if (!Array.isArray(liveTrade.planned_dca_levels) || liveTrade.planned_dca_levels.length === 0) {
-        const dcaLvl = findStrongestDcaLevel(c4h, c1d, entryRate, liveTrade.is_short, 2.6, 95.0, c1w);
-        const l1Price = roundPrice(dcaLvl.price);
+        const atrDca = computeAtrDcaLevels(entryRate, liveTrade.is_short, closedCandlesAtr(c4h));
+        const dcaLvl = { source: '', strength_score: 0, second_price: atrDca.l2 };
+        const l1Price = roundPrice(atrDca.l1);
         const lev = Math.max(1, liveTrade.leverage || 25);
         const baseStake = Math.max(5, liveTrade.initial_stake || liveTrade.stake_amount || 5);
         const computedDcaLevels: PlannedDcaLevel[] = [];
         if (l1Price > 0) {
           computedDcaLevels.push({
             step: 1,
-            label: `L1 Усреднение #1 (${dcaLvl.source || '4H/1D S/R'} · сила ${dcaLvl.strength_score || 16}★)`,
+            label: `L1 Усреднение #1 (${DCA_L1_ATR} ATR 4H от входа)`,
             price: l1Price,
             stake_amount: Number(baseStake.toFixed(2)),
             amount: Number(((baseStake * lev) / Math.max(1e-8, l1Price)).toFixed(4)),
@@ -3265,7 +3269,7 @@ async function enrichImportedPositionMtfLevelsAsync(
             const l2Stake = Number((baseStake * 1.5).toFixed(2));
             computedDcaLevels.push({
               step: 2,
-              label: `L2 Экстренная разгрузка #2 (${dcaLvl.source || '1D/1W S/R'})`,
+              label: `L2 Усреднение #2 (${DCA_L2_ATR} ATR 4H от входа)`,
               price: l2Price,
               stake_amount: l2Stake,
               amount: Number(((l2Stake * lev) / Math.max(1e-8, l2Price)).toFixed(4)),
@@ -4042,7 +4046,7 @@ function journalReversalSignal(params: {
 // Тейк не опускается ниже точки безубытка с запасом (recalculateTradeMetrics), защита от минуса сохраняется.
 // Ордер тейк-профита на бирже обновляет обычный цикл синхронизации.
 // ============================================================================
-const TP_RECALC_MIGRATION = 'tp_levels_dca_scheme_v4';
+const TP_RECALC_MIGRATION = 'atr_levels_scheme_v5';
 /** Старый «Вариант Б» сценария 1 (закрыть только основную ногу у цели) — отключён схемой «закрываем обе ноги вместе». */
 const HEDGE_LEGACY_VARIANT_B_ENABLED = false;
 
@@ -4063,7 +4067,9 @@ async function computeLegTakeProfit(trade: FreqtradeTrade): Promise<ReturnType<t
       (s) => s.is_open && s.campaign_id === trade.campaign_id && s.trade_id !== trade.trade_id && s.campaign_role === 'primary'
     );
     const plannedL1 = primaryLeg?.planned_dca_levels?.find((l) => !l.filled && l.price > 0)?.price;
-    const l1 = plannedL1 || findStrongestDcaLevel(c4h, c1d, trade.open_rate, !trade.is_short, 2.6, 95.0, c1w).price;
+    const l1 =
+      plannedL1 ||
+      computeAtrDcaLevels(primaryLeg?.open_rate || trade.open_rate, !trade.is_short, closedCandlesAtr(c4h)).l1;
     const okSide = trade.is_short
       ? l1 > 0 && l1 <= trade.open_rate * (1 - TP_MIN_DISTANCE_PCT / 100)
       : l1 > 0 && l1 >= trade.open_rate * (1 + TP_MIN_DISTANCE_PCT / 100);
@@ -4174,12 +4180,70 @@ async function linkOppositeLegsIntoCampaigns(): Promise<void> {
   }
 }
 
-/** Разовый пересчёт тейков открытых позиций по схеме «основная до уровня, страховка близко». */
+/**
+ * Перестраивает план усреднений (L1/L2) открытой основной/одиночной позиции по волатильности: DCA_L1_ATR и DCA_L2_ATR
+ * ATR(4H) от входа. Не трогает страховку, позиции после усреднения и уровни, переставленные пользователем.
+ */
+async function rebuildAtrDcaPlan(trade: FreqtradeTrade): Promise<boolean> {
+  if (
+    !trade.is_open ||
+    trade.campaign_role === 'insurance' ||
+    (trade.dca_count || 0) > 0 ||
+    trade.dca_manual_override ||
+    !(trade.open_rate > 0) ||
+    !botConfig.dca_enabled
+  ) {
+    return false;
+  }
+  const { candles: c4h } = await fetchRealCandles(trade.pair, '4h', 1000);
+  if (c4h.length < 30) return false;
+  const lvls = computeAtrDcaLevels(trade.open_rate, trade.is_short, closedCandlesAtr(c4h));
+  if (!(lvls.l1 > 0)) return false;
+  const lev = Math.max(1, trade.leverage || 25);
+  const baseStake = Math.max(5, trade.initial_stake || trade.stake_amount || 5);
+  const mk = (step: number, price: number, stakeMult: number, atrMult: number): PlannedDcaLevel => {
+    const st = Number((baseStake * stakeMult).toFixed(2));
+    return {
+      step,
+      label: `L${step} Усреднение #${step} (${atrMult} ATR 4H от входа)`,
+      price: roundPrice(price),
+      stake_amount: st,
+      amount: Number(((st * lev) / Math.max(1e-8, price)).toFixed(4)),
+      distance_pct: Number(((Math.abs(price - trade.open_rate) / trade.open_rate) * 100).toFixed(2)),
+      filled: false,
+    };
+  };
+  const plan: PlannedDcaLevel[] = [mk(1, lvls.l1, 1.0, DCA_L1_ATR)];
+  if (lvls.l2 > 0) plan.push(mk(2, lvls.l2, 1.5, DCA_L2_ATR));
+  const oldL1 = trade.planned_dca_levels?.[0]?.price;
+  trade.planned_dca_levels = plan;
+  trade.next_dca_price = plan[0].price;
+  sqliteDb.upsertTrade(trade);
+  broadcastTradeLifecycleEvent('trade:updated', trade);
+  appendLog(
+    'freqtrade.bot.dca',
+    'INFO',
+    `⚓ [${trade.pair}] #${trade.trade_id} ${trade.is_short ? 'SHORT' : 'LONG'}: уровни усреднения по волатильности — L1 ${oldL1 ?? '—'} → ${plan[0].price}${plan[1] ? `, L2 → ${plan[1].price}` : ''} (ATR 4H ${lvls.atr}).`,
+    { userId: resolveTradeUserId(trade) }
+  );
+  return true;
+}
+
+/** Разовый пересчёт открытых позиций по схеме «по волатильности»: L1/L2 = 4/8 ATR, тейк основной 2 ATR, страховка до L1. */
 async function recalculateOpenTradeTakeProfits(): Promise<void> {
   if (sqliteDb.isMigrationApplied(TP_RECALC_MIGRATION)) return;
   await initializeBotTrades();
   await linkOppositeLegsIntoCampaigns();
   const candidates = tradesStore.filter((t) => t.is_open);
+  let dcaChanged = 0;
+  // Сначала уровни усреднения основных ног: цель страховки берётся из L1 основной
+  for (const trade of candidates) {
+    try {
+      if (await rebuildAtrDcaPlan(trade)) dcaChanged++;
+    } catch {
+      // монета без истории/сети — пропускаем
+    }
+  }
   let changed = 0;
   for (const trade of candidates) {
     try {
@@ -4188,11 +4252,11 @@ async function recalculateOpenTradeTakeProfits(): Promise<void> {
       // монета без истории/сети — пропускаем
     }
   }
-  sqliteDb.markMigrationApplied(TP_RECALC_MIGRATION, `open ${candidates.length}, changed ${changed}`);
+  sqliteDb.markMigrationApplied(TP_RECALC_MIGRATION, `open ${candidates.length}, dca ${dcaChanged}, tp ${changed}`);
   appendLog(
     'freqtrade.bot.tp',
     'INFO',
-    `🎯 Тейки открытых позиций пересчитаны по схеме «основная — до следующего уровня, страховка — близкий тейк, дошла основная — закрываем обе»: изменено ${changed} из ${candidates.length}.`,
+    `🎯 Открытые позиции пересчитаны по схеме «по волатильности» (тейк основной 2 ATR, L1/L2 = 4/8 ATR, страховка до L1): уровни усреднения — ${dcaChanged}, тейки — ${changed} из ${candidates.length}.`,
     { publicMarket: false }
   );
 }
@@ -6147,7 +6211,7 @@ async function createScalpBotPosition(
     // Там бот на подтверждённом развороте закрывает страховку и усредняет основную; близкого тейка у страховки нет.
     const insuranceL1 =
       customOpts?.campaignRole === 'insurance'
-        ? findStrongestDcaLevel(candles4h, candles1d, entryRate, !isShort, 2.6, 95.0, customOpts?.candles1w).price
+        ? computeAtrDcaLevels(entryRate, !isShort, closedCandlesAtr(candles4h)).l1
         : 0;
     const insuranceL1Valid =
       insuranceL1 > 0 &&
@@ -6211,15 +6275,9 @@ async function createScalpBotPosition(
     // Для основной позиции (primary / standalone) рассчитываем до 2 глобальных уровней усреднения (L1 и L2) на сильных зонах П/С 4H/1D
     const plannedDcaLevels: NonNullable<FreqtradeTrade['planned_dca_levels']> = [];
     if (botConfig.dca_enabled && resolvedCampaignRole !== 'insurance') {
-      const dcaLvl1 = findStrongestDcaLevel(
-        candles4h,
-        candles1d,
-        entryRate,
-        isShort,
-        2.6,
-        95.0,
-        customOpts?.candles1w
-      );
+      // L1/L2 по волатильности: DCA_L1_ATR и DCA_L2_ATR ATR(4H) от входа против сделки
+      const atrDca1 = computeAtrDcaLevels(entryRate, isShort, closedCandlesAtr(candles4h));
+      const dcaLvl1 = { price: atrDca1.l1, second_price: atrDca1.l2 };
       const l1Price = manualDcaSupLvl && !isShort
         ? roundPrice(manualDcaSupLvl.price)
         : manualDcaResLvl && isShort
@@ -6231,7 +6289,7 @@ async function createScalpBotPosition(
         const l1Amount = Number(((l1Stake * leverage) / Math.max(1e-8, l1Price)).toFixed(4));
         plannedDcaLevels.push({
           step: 1,
-          label: `L1 Усреднение #1 (${dcaLvl1.source || '4H/1D S/R'} · сила ${dcaLvl1.strength_score || 16}★)`,
+          label: `L1 Усреднение #1 (${DCA_L1_ATR} ATR 4H от входа)`,
           price: l1Price,
           stake_amount: l1Stake,
           amount: l1Amount,
@@ -6246,7 +6304,7 @@ async function createScalpBotPosition(
           const l2Amount = Number(((l2Stake * leverage) / Math.max(1e-8, l2Price)).toFixed(4));
           plannedDcaLevels.push({
             step: 2,
-            label: `L2 Экстренная разгрузка #2 (${dcaLvl1.source || '1D/1W S/R'})`,
+            label: `L2 Усреднение #2 (${DCA_L2_ATR} ATR 4H от входа)`,
             price: l2Price,
             stake_amount: l2Stake,
             amount: l2Amount,
