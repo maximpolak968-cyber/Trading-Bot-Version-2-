@@ -290,6 +290,13 @@ export class SqliteBotDatabase {
         created_at TEXT NOT NULL
       );
 
+      -- Разовые миграции данных (чтобы выполнялись ровно один раз)
+      CREATE TABLE IF NOT EXISTS app_migrations (
+        name TEXT PRIMARY KEY,
+        applied_at INTEGER NOT NULL,
+        note TEXT
+      );
+
       -- Журнал сигналов разворота, на которые смотрел бот, и их фактический исход
       CREATE TABLE IF NOT EXISTS reversal_journal (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -769,6 +776,24 @@ export class SqliteBotDatabase {
         params.reason,
         JSON.stringify(params.indicators || {})
       );
+    } catch {
+      // ignore
+    }
+  }
+
+  public isMigrationApplied(name: string): boolean {
+    try {
+      return Boolean(this.db.prepare(`SELECT 1 FROM app_migrations WHERE name = ?`).get(name));
+    } catch {
+      return false;
+    }
+  }
+
+  public markMigrationApplied(name: string, note = ''): void {
+    try {
+      this.db
+        .prepare(`INSERT OR REPLACE INTO app_migrations (name, applied_at, note) VALUES (?, ?, ?)`)
+        .run(name, Date.now(), note);
     } catch {
       // ignore
     }
