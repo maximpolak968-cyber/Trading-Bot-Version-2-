@@ -3823,6 +3823,132 @@ async function syncRealExchangeBalancesIfNeeded(force = false): Promise<void> {
   }
 }
 
+// ============================================================================
+// ПРАВИЛА РАЗВОРОТА И ЖУРНАЛ СИГНАЛОВ
+// По истории 30 монет: свечные модели на 1H и развороты против дневного тренда не лучше случайного входа;
+// преимущество было только у разворота ПО дневному тренду у сильного уровня 4H. Поэтому решения,
+// которые ставят на разворот (усреднение, вход по отбою), принимаются по закрытым свечам 4H и только
+// по дневному тренду. Каждый замеченный сигнал пишется в журнал, а через 48 свечей 4H фиксируется его
+// исход (разворот: +2 ATR раньше −1 ATR; пробой: наоборот) — так бот копит собственную статистику.
+// ============================================================================
+
+const reversalContextCache = new Map<
+  string,
+  { ts: number; closed4h: RawCandle[]; dailyDirection: 'UP' | 'DOWN' | 'RANGE' }
+>();
+
+async function getReversalContext(
+  pair: string
+): Promise<{ closed4h: RawCandle[]; dailyDirection: 'UP' | 'DOWN' | 'RANGE' }> {
+  const cached = reversalContextCache.get(pair);
+  if (cached && Date.now() - cached.ts < 5 * 60_000) return cached;
+  const [{ candles: c4h }, { candles: c1d }] = await Promise.all([
+    fetchRealCandles(pair, '4h', 300),
+    fetchRealCandles(pair, '1d', 300),
+  ]);
+  const ctx = {
+    ts: Date.now(),
+    closed4h: c4h.slice(0, -1),
+    dailyDirection: assessTimeframeTrend(c1d, '1D').direction,
+  };
+  reversalContextCache.set(pair, ctx);
+  return ctx;
+}
+
+function atrOfLastCandle(candles: RawCandle[], period = 14): number {
+  if (candles.length < period + 2) return 0;
+  let atr = 0;
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i];
+    const tr = Math.max(c.high - c.low, Math.abs(c.high - candles[i - 1].close), Math.abs(c.low - candles[i - 1].close));
+    atr = i <= period ? (atr * (i - 1) + tr) / i : (atr * (period - 1) + tr) / period;
+  }
+  return atr;
+}
+
+function journalReversalSignal(params: {
+  pair: string;
+  candles4h: RawCandle[];
+  side: 'support' | 'resistance';
+  level: number;
+  purpose: 'entry' | 'dca' | 'tp_exit';
+  dailyDirection: 'UP' | 'DOWN' | 'RANGE';
+  withTrend: boolean;
+  acted: boolean;
+}): void {
+  const last = params.candles4h[params.candles4h.length - 1];
+  const atr = atrOfLastCandle(params.candles4h);
+  if (!last || !(atr > 0)) return;
+  sqliteDb.recordReversalSignal({
+    pair: params.pair,
+    timeframe: '4h',
+    candle_ts: last.timestamp,
+    side: params.side,
+    level: params.level,
+    price: last.close,
+    atr,
+    purpose: params.purpose,
+    daily_trend: params.dailyDirection,
+    with_trend: params.withTrend,
+    acted: params.acted,
+  });
+}
+
+const REVERSAL_JOURNAL_HORIZON = 48;
+let reversalJournalResolving = false;
+
+/** Проставляет исход сигналам журнала, для которых уже прошли свечи 4H после сигнала. */
+async function resolvePendingReversalSignals(): Promise<void> {
+  if (reversalJournalResolving) return;
+  reversalJournalResolving = true;
+  try {
+    const pending = sqliteDb.listPendingReversalSignals(300);
+    const byPair = new Map<string, any[]>();
+    for (const row of pending) {
+      if (!byPair.has(row.pair)) byPair.set(row.pair, []);
+      byPair.get(row.pair)!.push(row);
+    }
+    for (const [pair, rows] of byPair) {
+      const { candles } = await fetchRealCandles(pair, '4h', 300);
+      const closed = candles.slice(0, -1);
+      for (const row of rows) {
+        const idx = closed.findIndex((c) => c.timestamp === Number(row.candle_ts));
+        if (idx < 0) {
+          // Свеча сигнала ушла за пределы загруженной истории — исход уже не восстановить
+          if (Date.now() - Number(row.candle_ts) > 60 * 86_400_000) {
+            sqliteDb.resolveReversalSignal(row.id, 'unclear', null);
+          }
+          continue;
+        }
+        const isSupport = row.side === 'support';
+        const tp = isSupport ? row.price + 2 * row.atr : row.price - 2 * row.atr;
+        const sl = isSupport ? row.price - row.atr : row.price + row.atr;
+        let outcome: string | null = null;
+        let bars: number | null = null;
+        for (let j = idx + 1; j < closed.length && j <= idx + REVERSAL_JOURNAL_HORIZON; j++) {
+          const x = closed[j];
+          if (isSupport ? x.low <= sl : x.high >= sl) {
+            outcome = 'breakout';
+            bars = j - idx;
+            break;
+          }
+          if (isSupport ? x.high >= tp : x.low <= tp) {
+            outcome = 'reversal';
+            bars = j - idx;
+            break;
+          }
+        }
+        if (!outcome && closed.length - 1 - idx >= REVERSAL_JOURNAL_HORIZON) outcome = 'unclear';
+        if (outcome) sqliteDb.resolveReversalSignal(row.id, outcome, bars);
+      }
+    }
+  } catch {
+    // не критично: попробуем в следующий раз
+  } finally {
+    reversalJournalResolving = false;
+  }
+}
+
 /**
  * Core ScalpBot processing loop:
  * 1. Updates ALL active enabled accounts' open trades (Target TP, SL, 4H Hedge Leg, Zero-Loss Guard, Smart Level DCA).
@@ -4188,8 +4314,9 @@ async function runScalpBotCycle(waitForActive = false) {
         if (nearOrBeyondPrimaryTp) {
           // Проверяем 3-фазный разворот от уровня L1 против основного тренда (если мы в шорте, L1 — поддержка, ждём отскок вверх true; если в лонге, L1 — сопротивление, ждём отбой вниз false)
           const isBounceFromSupportAtTp = trade.is_short;
+          // Здесь разворот нужен только для фиксации прибыли у цели, поэтому смотрим младший ТФ, но только закрытые свечи
           const levelReversalAtTp = detectThreePhaseLevelReversal(
-            candles1h,
+            candles1h.slice(0, -1),
             trade.take_profit_abs,
             isBounceFromSupportAtTp,
             0.75
@@ -4284,30 +4411,9 @@ async function runScalpBotCycle(waitForActive = false) {
                 openSibling.campaign_banked_profit = Number(
                   ((openSibling.campaign_banked_profit || 0) + harvested).toFixed(4)
                 );
-                openSibling.campaign_role = 'primary';
-                openSibling.next_dca_price = currentPrice;
-                const nextStep = (openSibling.dca_count || 0) + 1;
-                if (!Array.isArray(openSibling.planned_dca_levels)) {
-                  openSibling.planned_dca_levels = [];
-                }
-                const existingStepLvl = openSibling.planned_dca_levels.find(
-                  (l) => !l.filled && l.step === nextStep
-                );
-                if (existingStepLvl) {
-                  existingStepLvl.price = currentPrice;
-                } else {
-                  openSibling.planned_dca_levels.unshift({
-                    step: nextStep,
-                    label: `L${nextStep} Отыгрыш отката (Сценарий 1Б)`,
-                    price: currentPrice,
-                    stake_amount: openSibling.stake_amount,
-                    amount: openSibling.amount,
-                    distance_pct: 0,
-                    filled: false,
-                  });
-                }
-                // Защитный стоп за макушку разворотной тени (даже если выбьет — цикл в плюсе/безубытке за счёт P_bank!)
-                openSibling.stop_loss_abs = roundPrice(levelReversalAtTp.rehedgeStopPrice);
+                // Страховочная нога (против дневного тренда) больше НЕ превращается в основную и НЕ усредняется:
+                // это была бы ставка на разворот против тренда, а на истории такие развороты не лучше случайных.
+                // Она остаётся страховкой со своим тейком; прибыль основной ноги уже лежит в банке P_bank.
                 recalculateTradeMetrics(openSibling, false);
                 sqliteDb.upsertTrade(openSibling);
               });
@@ -4319,7 +4425,7 @@ async function runScalpBotCycle(waitForActive = false) {
               appendLog(
                 'freqtrade.bot.hedge',
                 'INFO',
-                `🔄 [Сценарий 1Б: Отыгрыш отката] Основная нога #${trade.trade_id} [${trade.pair}] зафиксирована на уровне ${trade.take_profit_abs}$ в банк P_bank (+${openSibling.campaign_banked_profit}$). Вторая нога переведена в основную для усреднения на развороте со стопом за тенью ${openSibling.stop_loss_abs}$!`,
+                `🔄 [Сценарий 1Б: Отыгрыш отката] Основная нога #${trade.trade_id} [${trade.pair}] зафиксирована на уровне ${trade.take_profit_abs}$ в банк P_bank (+${openSibling.campaign_banked_profit}$). Страховочная нога остаётся страховкой (без усреднения против тренда).$!`,
                 { userId: tradeUserId }
               );
               continue;
@@ -4859,8 +4965,15 @@ async function runScalpBotCycle(waitForActive = false) {
             // Если цена на новостном сквизе пробила первый уровень L1 без торможения и ушла глубже (ко второму уровню L2 или экстремуму паники),
             // проверяем 3-фазный разворот как на L1, так и на дальнем уровне L2 (где паника остановилась)!
             const isBounceFromSupport = !trade.is_short;
+            // Правила разворота по данным истории 30 монет: усредняемся только если разворот идёт ПО дневному
+            // тренду (основная нога совпадает с ним) и подтверждён ЗАКРЫТЫМИ свечами 4H. Развороты против
+            // дневного тренда и 1H-свечные модели на истории преимущества не давали — на них не ставим.
+            const reversalCtx = await getReversalContext(trade.pair);
+            const dcaWithDailyTrend = trade.is_short
+              ? reversalCtx.dailyDirection === 'DOWN'
+              : reversalCtx.dailyDirection === 'UP';
             let reversalCheck = detectThreePhaseLevelReversal(
-              candles1h,
+              reversalCtx.closed4h,
               targetDcaLevelPrice,
               isBounceFromSupport,
               0.75
@@ -4883,7 +4996,7 @@ async function runScalpBotCycle(waitForActive = false) {
               }
               for (const deepLvlPrice of deeperLevels) {
                 const deepRev = detectThreePhaseLevelReversal(
-                  candles1h,
+                  reversalCtx.closed4h,
                   deepLvlPrice,
                   isBounceFromSupport,
                   0.85
@@ -4900,6 +5013,30 @@ async function runScalpBotCycle(waitForActive = false) {
             }
 
             if (reversalCheck.confirmed) {
+              journalReversalSignal({
+                pair: trade.pair,
+                candles4h: reversalCtx.closed4h,
+                side: isBounceFromSupport ? 'support' : 'resistance',
+                level: targetDcaLevelPrice,
+                purpose: 'dca',
+                dailyDirection: reversalCtx.dailyDirection,
+                withTrend: dcaWithDailyTrend,
+                acted: dcaWithDailyTrend,
+              });
+            }
+            if (reversalCheck.confirmed && !dcaWithDailyTrend) {
+              const skipKey = trade.trade_id;
+              if (Date.now() - (dcaRiskSkipLogTs.get(skipKey) || 0) > 30 * 60_000) {
+                dcaRiskSkipLogTs.set(skipKey, Date.now());
+                appendLog(
+                  'freqtrade.bot.dca',
+                  'INFO',
+                  `⏸️ [${trade.pair}] #${trade.trade_id}: разворот у уровня ${targetDcaLevelPrice}$ есть, но он ПРОТИВ дневного тренда (${reversalCtx.dailyDirection === 'RANGE' ? 'дневной флэт' : 'дневной тренд ' + (reversalCtx.dailyDirection === 'UP' ? 'вверх' : 'вниз')}) — усреднение пропущено: на истории такие развороты не лучше случайных.`,
+                  { userId: tradeUserId }
+                );
+              }
+            }
+            if (reversalCheck.confirmed && dcaWithDailyTrend) {
               const { compoundedBalance } = getCompoundedAccountBalance(tradeAcc.id);
               const accOpenTrades = tradesStore.filter(
                 (t) => t.is_open && tradeMatchesAccount(t, tradeAcc, tradeAccScopeId)
@@ -5229,6 +5366,19 @@ async function runScalpBotCycle(waitForActive = false) {
       const customRes = manualResLvl?.price || mtf.key_4h_resistance;
 
       const hedgeEval = evaluateGlobalHedgeStrategy(c1h, c4h, c1d, mtf, btcGuard.isSafe, c1w);
+      if (hedgeEval.level_bounce) {
+        // Отбой от сильного уровня по дневному тренду (закрытые 4H) — в журнал сигналов разворота
+        journalReversalSignal({
+          pair,
+          candles4h: c4h.slice(0, -1),
+          side: hedgeEval.level_bounce.side,
+          level: hedgeEval.level_bounce.level,
+          purpose: 'entry',
+          dailyDirection: mtf.market_regime?.d1.direction || 'RANGE',
+          withTrend: true,
+          acted: hedgeEval.should_open_hedge,
+        });
+      }
       const effectiveTrend = mtf.market_trend || 'NEUTRAL';
 
       sqliteDb.recordSignal({
@@ -5949,8 +6099,32 @@ async function startServer() {
     }
   }, 8_000);
 
+  // Исходы сигналов разворота: раз в 10 минут проверяем, что стало с ценой после сигнала
+  setInterval(() => {
+    resolvePendingReversalSignals().catch(() => {});
+  }, 10 * 60_000);
+  setTimeout(() => {
+    resolvePendingReversalSignals().catch(() => {});
+  }, 60_000);
+
   app.get('/api/v1/ping', (_req, res) => {
     res.json({ status: 'pong' });
+  });
+
+  // Журнал сигналов разворота бота: что он видел, на что действовал и чем это закончилось
+  app.get('/api/v1/reversal_journal', (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    const pair = req.query.pair ? String(req.query.pair).toUpperCase() : undefined;
+    const journal = sqliteDb.getReversalJournal(pair, 30);
+    const all = pair ? sqliteDb.getReversalJournal(undefined, 0) : journal;
+    res.json({
+      pair: pair || null,
+      horizon_bars: REVERSAL_JOURNAL_HORIZON,
+      groups: journal.groups,
+      all_groups: all.groups,
+      recent: journal.rows,
+    });
   });
 
   interface ResolvedAuth {
