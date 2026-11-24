@@ -45,6 +45,8 @@ export interface WsAccountLiveState {
   usedMarginUsdt: number;
   canTrade: boolean;
   dualSidePosition?: boolean;
+  /** Какие активы входят в баланс кошелька по REST (Binance: в режиме одного актива только USDT). */
+  walletAssets?: string[];
   positions: ExchangePositionItem[];
   closedPnl: ExchangeClosedPnlItem[];
   wsConnected: boolean;
@@ -1637,9 +1639,10 @@ export async function ensureBinancePrivateUserStream(
         if (msg.e === 'ACCOUNT_UPDATE' && msg.a) {
           // 1. Update USDT + USDC wallet balance
           if (Array.isArray(msg.a.B)) {
-            const stableBals = msg.a.B.filter(
-              (b: any) => b.a === 'USDT' || b.a === 'USDC'
-            );
+            // Считаем те же активы, что и REST (/fapi/v2/account totalWalletBalance): в режиме одного актива
+            // это только USDT. Иначе USDC на счёте прибавлялся к балансу, и баланс «прыгал» между значениями.
+            const walletAssets = state.walletAssets && state.walletAssets.length > 0 ? state.walletAssets : ['USDT'];
+            const stableBals = msg.a.B.filter((b: any) => walletAssets.includes(b.a));
             if (stableBals.length > 0) {
               const totalWb = stableBals.reduce((sum: number, b: any) => sum + Number(b.wb || 0), 0);
               if (totalWb >= 0) {

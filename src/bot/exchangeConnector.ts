@@ -2602,6 +2602,13 @@ export async function testExchangeConnection(
             Number(json.totalWalletBalance || 0) > 0
               ? Number(json.totalWalletBalance)
               : stableAssets.reduce((s: number, a: any) => s + Number(a.walletBalance || 0), 0);
+          // Режим одного актива: totalWalletBalance = только USDT. Мультиактивный режим: сумма всех активов.
+          const usdtWalletOnly = Number(stableAssets.find((a: any) => a.asset === 'USDT')?.walletBalance || 0);
+          const binanceWalletAssets =
+            Number(json.totalWalletBalance || 0) > 0 &&
+            Math.abs(Number(json.totalWalletBalance) - usdtWalletOnly) < 0.01
+              ? ['USDT']
+              : ['USDT', 'USDC'];
           const unrealizedPnl =
             stableAssets.length > 0
               ? stableAssets.reduce((s: number, a: any) => s + Number(a.unrealizedProfit || 0), 0)
@@ -2735,6 +2742,7 @@ export async function testExchangeConnection(
             usedMarginUsdt: Number(usedMargin.toFixed(2)),
             canTrade,
             dualSidePosition: dualSide,
+            walletAssets: binanceWalletAssets,
             positions: hasCompletePositionsArray ? parsedPositions : existingWsState?.positions || [],
             closedPnl: existingWsState?.closedPnl || [],
             wsConnected: isPrivateWsStreamOpen('binance', cleanKey),
