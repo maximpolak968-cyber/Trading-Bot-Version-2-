@@ -88,7 +88,20 @@ interface CandleChartProps {
   onClearAllDrawings?: () => Promise<void>;
   onQuickOrderFromChart?: (payload: QuickOrderFromChartPayload) => Promise<void>;
   loading?: boolean;
+  /** Метки «Разбора разворотов»: прошлые подходы к уровням и их исход */
+  reversalMarkers?: ReversalChartMarker[];
 }
+
+export interface ReversalChartMarker {
+  timestamp: number;
+  side: 'support' | 'resistance';
+  level: number;
+  outcome: 'reversal' | 'breakout' | 'unclear' | 'pending';
+  /** Строки для подсказки при наведении: что было в момент подхода и чем закончилось */
+  details?: string[];
+}
+
+const EMPTY_REVERSAL_MARKERS: ReversalChartMarker[] = [];
 
 interface DraggableLevelTarget {
   key: string;
@@ -493,6 +506,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
   onClearAllDrawings,
   onQuickOrderFromChart,
   loading = false,
+  reversalMarkers = EMPTY_REVERSAL_MARKERS,
 }) => {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -758,6 +772,14 @@ export const CandleChart: React.FC<CandleChartProps> = ({
       totalSlots,
     };
   }, [processedCandles, zoomStartPct, zoomEndPct]);
+
+  // Метка «Разбора разворотов» под курсором (та же свеча) — для подсказки с деталями
+  const hoveredReversalMarker = useMemo(() => {
+    if (hoverIndex === null || reversalMarkers.length === 0) return null;
+    const candle = visibleSlice.items[hoverIndex];
+    if (!candle) return null;
+    return reversalMarkers.find((m) => m.timestamp === candle.timestamp) || null;
+  }, [hoverIndex, reversalMarkers, visibleSlice]);
 
   const hasSubOscillator = Boolean(plotConfig.showRsi || plotConfig.showMacd);
 
@@ -2182,6 +2204,59 @@ export const CandleChart: React.FC<CandleChartProps> = ({
       ctx.restore();
     }
 
+    // Метки «Разбора разворотов»: ▲ под свечой — подход к поддержке, ▼ над свечой — к сопротивлению.
+    // Зелёный — разворот, красный — пробой, серый — неясно, жёлтый контур — ещё идёт.
+    if (reversalMarkers.length > 0 && items.length > 0) {
+      const firstTs = items[0].timestamp;
+      const lastTs = items[items.length - 1].timestamp;
+      const colorFor = (o: ReversalChartMarker['outcome']) =>
+        o === 'reversal' ? '#26a69a' : o === 'breakout' ? '#ef5350' : o === 'pending' ? '#fbc02d' : '#78909c';
+      ctx.save();
+      for (const m of reversalMarkers) {
+        if (m.timestamp < firstTs || m.timestamp > lastTs) continue;
+        const slot = timestampToSlot(m.timestamp);
+        const candle = items[Math.round(slot)];
+        if (!candle) continue;
+        const x = idxToX(slot);
+        const color = colorFor(m.outcome);
+        // Короткая пунктирная линия уровня, к которому подошла цена
+        const ly = priceToY(m.level);
+        ctx.strokeStyle = color;
+        ctx.globalAlpha = 0.55;
+        ctx.setLineDash([3, 3]);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x - stepX * 6, ly);
+        ctx.lineTo(x + stepX * 2, ly);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+        const size = Math.max(4, Math.min(7, stepX * 0.6));
+        const isSup = m.side === 'support';
+        const y = isSup ? priceToY(candle.low) + size + 4 : priceToY(candle.high) - size - 4;
+        ctx.beginPath();
+        if (isSup) {
+          ctx.moveTo(x, y - size);
+          ctx.lineTo(x - size, y + size);
+          ctx.lineTo(x + size, y + size);
+        } else {
+          ctx.moveTo(x, y + size);
+          ctx.lineTo(x - size, y - size);
+          ctx.lineTo(x + size, y - size);
+        }
+        ctx.closePath();
+        if (m.outcome === 'pending') {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+        } else {
+          ctx.fillStyle = color;
+          ctx.fill();
+        }
+      }
+      ctx.restore();
+    }
+
     if (
       mousePos &&
       mousePos.x >= plotLeft &&
@@ -2257,6 +2332,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
     nowTick,
     resolvePointAtCursor,
     onQuickOrderFromChart,
+    reversalMarkers,
   ]);
 
   // Mini sparkline SVG path for bottom DataZoom slider
@@ -3637,6 +3713,16 @@ export const CandleChart: React.FC<CandleChartProps> = ({
               >
                 ✕
               </button>
+            </div>
+          )}
+
+          {hoveredReversalMarker && hoveredReversalMarker.details && (
+            <div className="absolute left-14 top-10 z-30 w-[300px] rounded border border-[#2a2e39] bg-[#1e222d]/95 p-2 text-[11px] leading-snug text-[#d1d4dc] shadow-lg pointer-events-none">
+              {hoveredReversalMarker.details.map((line, idx) => (
+                <div key={idx} className={idx === 0 ? 'mb-1 font-semibold' : 'text-[#9aa4b2]'}>
+                  {line}
+                </div>
+              ))}
             </div>
           )}
 
