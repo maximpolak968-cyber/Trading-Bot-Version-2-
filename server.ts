@@ -1745,6 +1745,8 @@ interface FreqtradeTrade {
   breakeven_price?: number;
   min_profitable_tp?: number;
   exchange_unrealized_pnl?: number;
+  /** Ожидаемый чистый итог на тейке, $ (объём × (TP − вход) − комиссии + банк кампании) */
+  take_profit_usdt?: number;
   exchange_mark_price?: number;
   exchange_synced_at?: number;
   exchange_realized_pnl?: number;
@@ -1929,6 +1931,9 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     }
   }
   const exchangeFeeRate = getExchangeTakerFeeRate(trade.exchange || 'bybit');
+  // Маржа по цене входа — как биржа считает ROE: PnL / (объём × цена входа / плечо).
+  // stake_amount приходит с биржи по mark-цене и плавает вместе с ценой, поэтому для процентов не годится.
+  const entryMargin = Math.max(1e-8, (totalAmount * openRate) / Math.max(1, lev));
 
   // Суммируем комиссию на открытие по всем реально исполненным ордерам (Начальный вход + все шаги DCA) по реальной ставке Taker биржи
   let openFeeSum = 0;
@@ -1963,9 +1968,7 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     const exactNet = Number(trade.exchange_realized_pnl.toFixed(4));
     trade.net_profit = exactNet;
     trade.gross_profit = Number((exactNet + trade.fee_total).toFixed(4));
-    trade.net_profit_percent = Number(
-      ((exactNet / Math.max(1e-8, trade.stake_amount)) * 100).toFixed(2)
-    );
+    trade.net_profit_percent = Number(((exactNet / entryMargin) * 100).toFixed(2));
     trade.profit_ratio = Number((trade.net_profit_percent / 100).toFixed(4));
     trade.profit_pct = trade.net_profit_percent;
     trade.profit_abs = Number(exactNet.toFixed(4));
@@ -1978,12 +1981,8 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     const netAfterFees = Number((rawUnrealized - trade.fee_total).toFixed(4));
     trade.gross_profit = rawUnrealized;
     trade.net_profit = netAfterFees;
-    trade.net_profit_percent = Number(
-      ((netAfterFees / Math.max(1e-8, trade.stake_amount)) * 100).toFixed(2)
-    );
-    const exchangeRoiPct = Number(
-      ((rawUnrealized / Math.max(1e-8, trade.stake_amount)) * 100).toFixed(2)
-    );
+    trade.net_profit_percent = Number(((netAfterFees / entryMargin) * 100).toFixed(2));
+    const exchangeRoiPct = Number(((rawUnrealized / entryMargin) * 100).toFixed(2));
     trade.profit_ratio = Number((exchangeRoiPct / 100).toFixed(4));
     trade.profit_pct = exchangeRoiPct;
     trade.profit_abs = Number(rawUnrealized.toFixed(4));
@@ -1992,9 +1991,7 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     const netProfit = grossProfit - trade.fee_total;
     trade.gross_profit = Number(grossProfit.toFixed(4));
     trade.net_profit = Number(netProfit.toFixed(4));
-    trade.net_profit_percent = Number(
-      ((netProfit / Math.max(1e-8, trade.stake_amount)) * 100).toFixed(2)
-    );
+    trade.net_profit_percent = Number(((netProfit / entryMargin) * 100).toFixed(2));
     trade.profit_ratio = Number((trade.net_profit_percent / 100).toFixed(4));
     trade.profit_pct = trade.net_profit_percent;
     trade.profit_abs = Number(netProfit.toFixed(4));
@@ -2073,15 +2070,14 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
     }
   }
 
-  // Чистый ожидаемый профит на уровне TP (за вычетом всех комиссий 0.06% + накопленный банк кампании)
-  const tpExitFee = trade.take_profit_abs * totalAmount * TAKER_FEE_RATE;
+  // Чистый ожидаемый профит на уровне TP: объём × (TP − вход) минус комиссии по ставке биржи, плюс банк кампании
+  const tpExitFee = trade.take_profit_abs * totalAmount * exchangeFeeRate;
   const tpGross =
     (trade.is_short ? openRate - trade.take_profit_abs : trade.take_profit_abs - openRate) *
     totalAmount;
   const tpNet = tpGross - (trade.fee_open + tpExitFee) + bankedProfitUsdt;
-  trade.take_profit_pct = Number(
-    ((tpNet / Math.max(1e-8, trade.stake_amount)) * 100).toFixed(2)
-  );
+  trade.take_profit_pct = Number(((tpNet / entryMargin) * 100).toFixed(2));
+  trade.take_profit_usdt = Number(tpNet.toFixed(4));
 
   if (!trade.sl_manual_override && !(trade.stop_loss_abs > 0)) {
     trade.stop_loss_abs = 0;
