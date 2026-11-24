@@ -2163,7 +2163,8 @@ export class SqliteBotDatabase {
     const token = `inv_${crypto.randomBytes(18).toString('hex')}`;
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
     const cleanLabel = String(label || 'Гостевой доступ').trim() || 'Гостевой доступ';
-    const cleanRole: 'client' | 'owner' = role === 'owner' ? 'owner' : 'client';
+    void role;
+    const cleanRole: 'client' | 'owner' = 'client';
 
     this.db
       .prepare(
@@ -2182,6 +2183,16 @@ export class SqliteBotDatabase {
       last_used_at: null,
       created_at: now,
     };
+  }
+
+  /** Ссылка существует и не отозвана (для кабинета invite:<id>). */
+  public isInviteActive(id: string): boolean {
+    try {
+      const row = this.db.prepare(`SELECT enabled FROM invite_links WHERE id = ?`).get(String(id)) as any;
+      return Boolean(row && row.enabled);
+    } catch {
+      return false;
+    }
   }
 
   public deleteInviteLink(id: string) {
@@ -2213,7 +2224,8 @@ export class SqliteBotDatabase {
         id: String(row.id),
         label: String(row.label),
         token: String(row.token),
-        role: row.role === 'owner' ? 'owner' : 'client',
+        // Ссылки дают только личный кабинет: полный доступ владельца по ссылке отключён
+        role: 'client',
       };
     } catch {
       return null;
