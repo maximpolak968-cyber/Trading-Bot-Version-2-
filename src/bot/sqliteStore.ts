@@ -2055,7 +2055,8 @@ export class SqliteBotDatabase {
       return {
         owner_login: envLogin || String(row.owner_login || 'admin'),
         password_changed: hasEnvSecrets || Boolean(row.password_changed),
-        require_login: Boolean(row.require_login),
+        // Закрытый сайт: вход обязателен всегда (только по паролю владельца или пригласительной ссылке)
+        require_login: true,
         has_env_secrets: hasEnvSecrets,
       };
     } catch {
@@ -2247,8 +2248,8 @@ export class SqliteBotDatabase {
         nextChanged = 1;
       }
 
-      const nextRequire =
-        params.requireLogin !== undefined ? (params.requireLogin ? 1 : 0) : Number(row.require_login);
+      // Отключить обязательный вход нельзя: без него любой посетитель получал права владельца
+      const nextRequire = 1;
       const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
       this.db

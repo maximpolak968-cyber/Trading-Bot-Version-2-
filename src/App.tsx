@@ -190,7 +190,7 @@ export default function App() {
       try {
         const res = await fetch(
           `/api/v1/pair_candles?pair=${encodeURIComponent(pairArg)}&timeframe=${encodeURIComponent(tfArg)}&strategy=${encodeURIComponent(stratArg)}&limit=1000`,
-          { signal: controller.signal }
+          { signal: controller.signal, headers: authToken ? { Authorization: `Bearer ${authToken}` } : {} }
         );
         if (res.ok && !controller.signal.aborted) {
           const data: PairCandlesResponse = await res.json();
@@ -209,7 +209,7 @@ export default function App() {
         }
       }
     },
-    [selectedPair, timeframe, strategy]
+    [selectedPair, timeframe, strategy, authToken]
   );
 
   const lastLevelMutationTsRef = useRef<number>(0);
@@ -452,7 +452,8 @@ export default function App() {
       const tfAtStart = timeframe;
       try {
         const res = await fetch(
-          `/api/v1/pair_candles?pair=${encodeURIComponent(pairAtStart)}&timeframe=${encodeURIComponent(tfAtStart)}&strategy=${encodeURIComponent(strategy)}&limit=1000`
+          `/api/v1/pair_candles?pair=${encodeURIComponent(pairAtStart)}&timeframe=${encodeURIComponent(tfAtStart)}&strategy=${encodeURIComponent(strategy)}&limit=1000`,
+          { headers: authToken ? { Authorization: `Bearer ${authToken}` } : {} }
         );
         if (res.ok) {
           const data: PairCandlesResponse = await res.json();
@@ -467,7 +468,7 @@ export default function App() {
       }
     }, 4000);
     return () => clearInterval(timer);
-  }, [isTestnetChart, autoRefresh, dynamicUpdate, selectedPair, timeframe, strategy]);
+  }, [isTestnetChart, autoRefresh, dynamicUpdate, selectedPair, timeframe, strategy, authToken]);
 
   const fetchCandlesRef = useRef(fetchCandles);
   useEffect(() => {

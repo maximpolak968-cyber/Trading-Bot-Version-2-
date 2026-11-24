@@ -7288,6 +7288,7 @@ async function startServer() {
   });
 
   app.get('/api/v1/mtf_analysis', async (req, res) => {
+    if (!requireAuth(req, res)) return;
     const pair = String(req.query.pair || 'ETH/USDT:USDT').toUpperCase();
     const [{ candles: c1w }, { candles: c1d }, { candles: c4h }, { candles: c1h }] =
       await Promise.all([
@@ -7352,6 +7353,7 @@ async function startServer() {
   });
 
   app.get('/api/v1/volatile_scan', async (req, res) => {
+    if (!requireAuth(req, res)) return;
     const minVol = Number(req.query.min_volume) || 50_000_000;
     const limit = Math.min(25, Math.max(1, Number(req.query.limit) || 10));
     const pairs = await fetchTopVolatileFuturesPairs(minVol);
@@ -7474,6 +7476,7 @@ async function startServer() {
   });
 
   app.get('/api/signals', (req, res) => {
+    if (!requireAuth(req, res)) return;
     const limit = Math.min(200, Math.max(10, Number(req.query.limit) || 50));
     res.json(sqliteDb.getRecentSignals(limit));
   });
@@ -7754,7 +7757,8 @@ async function startServer() {
     res.json(Array.from(map.values()));
   });
 
-  app.get('/api/v1/whitelist', async (_req, res) => {
+  app.get('/api/v1/whitelist', async (req, res) => {
+    if (!requireAuth(req, res)) return;
     const allMarketPairs = await fetchAllMarketPairs();
     const activeWhitelist = allMarketPairs.filter((p) => !blacklist.includes(p));
     const pairMetrics = activeWhitelist.map((pair) => {
@@ -7831,6 +7835,7 @@ async function startServer() {
   });
 
   app.get('/api/v1/pair_candles', async (req, res) => {
+    if (!requireAuth(req, res)) return;
     await initializeBotTrades();
     const pair = String(req.query.pair || 'ETH/USDT:USDT').toUpperCase();
     const timeframe = String(req.query.timeframe || botConfig.timeframe);
@@ -9596,7 +9601,8 @@ async function startServer() {
     res.json({ result_msg: `Deleted trade #${id}`, deleted_ids: [id] });
   });
 
-  app.get('/api/v1/ws_status', (_req, res) => {
+  app.get('/api/v1/ws_status', (req, res) => {
+    if (!requireAuth(req, res)) return;
     res.json({
       status: 'ok',
       ui_ws_clients: getConnectedUiClientsCount(),

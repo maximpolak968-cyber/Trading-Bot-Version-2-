@@ -141,6 +141,8 @@ const bybitSymbolMetaByHost = new Map<
 const bybitHostCache = new Map<string, string>();
 const bybitLeverageCache = new Map<string, number>();
 const bybitHedgeModeCache = new Map<string, boolean>();
+/** Bybit включает Hedge Mode по монете (symbol) или сразу для всех USDT-контрактов (coin). Ключи: apiKey (coin) и apiKey:SYMBOL. */
+const bybitHedgeConfirmed = new Set<string>();
 
 const okxDemoCache = new Map<string, boolean>();
 const bitgetDemoCache = new Map<string, boolean>();
@@ -1027,19 +1029,22 @@ export async function ensureExchangeHedgeMode(
   }
 
   if (creds.exchange === 'bybit') {
-    if (bybitHedgeModeCache.get(cleanKey) === true) {
+    // Режим на Bybit задаётся по монете, поэтому «хедж включён» на весь ключ не доверяем: проверяем монету
+    if (bybitHedgeConfirmed.has(cleanKey) || bybitHedgeConfirmed.has(`${cleanKey}:${symbol}`)) {
       return { enabled: true, message: 'Bybit Hedge Mode (mode=3) уже активен' };
     }
     const candidateHosts = getBybitCandidateHosts(cleanKey, creds.isTestnet);
     for (const baseUrl of candidateHosts) {
+      // Сначала сразу для всех USDT-контрактов (coin=USDT), если нельзя (есть позиции) — для этой монеты
+      for (const scope of ['coin', 'symbol'] as const) {
       try {
         const timestamp = await getBybitTimestamp(baseUrl, false);
         const recvWindow = '10000';
-        const bodyStr = JSON.stringify({
-          category: 'linear',
-          symbol,
-          mode: 3, // 3 = Both Sides (Hedge Mode)
-        });
+        const bodyStr = JSON.stringify(
+          scope === 'coin'
+            ? { category: 'linear', coin: 'USDT', mode: 3 }
+            : { category: 'linear', symbol, mode: 3 } // 3 = Both Sides (Hedge Mode)
+        );
         const sig = signBybitV5(timestamp, cleanKey, recvWindow, bodyStr, cleanSecret);
         const res = await makeHttpsRequest(`${baseUrl}/v5/position/switch-mode`, {
           method: 'POST',
@@ -1056,21 +1061,23 @@ export async function ensureExchangeHedgeMode(
         if (res.statusCode === 200) {
           const json = JSON.parse(res.data);
           if (json.retCode === 10003 || json.retCode === 10004 || json.retCode === 33004) {
-            continue;
+            break; // ключ другой среды — следующий хост
           }
           // 0 = switched to Hedge Mode, 110025 = Position mode is not modified (already mode 3)
           if (json.retCode === 0 || json.retCode === 110025) {
             bybitHedgeModeCache.set(cleanKey, true);
-            return { enabled: true, message: 'Bybit Hedge Mode (mode=3) активен' };
+            bybitHedgeConfirmed.add(scope === 'coin' ? cleanKey : `${cleanKey}:${symbol}`);
+            return { enabled: true, message: `Bybit Hedge Mode (mode=3) активен (${scope === 'coin' ? 'все USDT-контракты' : symbol})` };
           }
         }
       } catch {
         // ignore
       }
+      }
     }
     return {
-      enabled: bybitHedgeModeCache.get(cleanKey) ?? false,
-      message: 'Bybit One-Way Mode',
+      enabled: false,
+      message: 'Bybit One-Way Mode (Hedge Mode не включился: закройте позиции и ордера по монете)',
     };
   }
 
@@ -1622,6 +1629,9 @@ export async function executeExchangeFuturesOrder(
   // ==========================================================================
   if (creds.exchange === 'bybit') {
     const candidateHosts = getBybitCandidateHosts(cleanKey, creds.isTestnet);
+    // Свой ID ордера, один на все попытки (WS → REST, повторы). Если ответ WS не пришёл вовремя, а ордер на бирже
+    // уже исполнился, повторная отправка через REST получит 110072 «дубль orderLinkId» вместо второй позиции.
+    const bybitOrderLinkId = `fqb${Date.now().toString(36)}${crypto.randomBytes(6).toString('hex')}`;
     let lastErrorMsg = 'Ошибка отправки ордера Bybit V5';
     let lastErrorCode: string | number | undefined;
 
@@ -1653,6 +1663,7 @@ export async function executeExchangeFuturesOrder(
             orderType: 'Market',
             qty: qtyOverride,
             positionIdx,
+            orderLinkId: bybitOrderLinkId,
           };
           if (isClose) {
             bodyObj.reduceOnly = true;
@@ -1717,16 +1728,36 @@ export async function executeExchangeFuturesOrder(
               .toLowerCase()
               .includes('position idx')
           ) {
+            let retryAllowed = true;
             if (activePosIdx === 0) {
+              // Монета уже в Hedge Mode — отправляем с positionIdx ноги
               activePosIdx = params.isShort ? 2 : 1;
               bybitHedgeModeCache.set(cleanKey, true);
-            } else {
+              bybitHedgeConfirmed.add(`${cleanKey}:${symbol}`);
+            } else if (isClose) {
+              // Закрытие на монете в One-Way: positionIdx 0 + reduceOnly безопасен
               activePosIdx = 0;
-              bybitHedgeModeCache.set(cleanKey, false);
+            } else {
+              // Открытие ноги на монете в One-Way: такой ордер в обратную сторону закрыл бы вторую ногу.
+              // Пробуем включить Hedge Mode для монеты; не вышло — ордер не отправляем.
+              bybitHedgeConfirmed.delete(cleanKey);
+              const sw = await ensureExchangeHedgeMode(
+                { ...creds, apiKey: cleanKey, apiSecret: cleanSecret },
+                params.pair
+              ).catch(() => ({ enabled: false, message: 'switch-mode error' }));
+              if (!sw.enabled) {
+                retryAllowed = false;
+                json = {
+                  retCode: 10001,
+                  retMsg: `Монета ${symbol} в режиме One-Way, Hedge Mode не включился (${sw.message}). Ордер не отправлен, чтобы не закрыть вторую ногу.`,
+                };
+              }
             }
-            const retryRes = await sendBybitOrder(activePosIdx, false);
-            if (retryRes.statusCode === 200) {
-              json = JSON.parse(retryRes.data);
+            if (retryAllowed) {
+              const retryRes = await sendBybitOrder(activePosIdx, false);
+              if (retryRes.statusCode === 200) {
+                json = JSON.parse(retryRes.data);
+              }
             }
           }
 
@@ -1760,15 +1791,14 @@ export async function executeExchangeFuturesOrder(
           }
 
           // Если при закрытии (CLOSE) позиция на бирже уже была закрыта вручную (110017 / current position is zero)
+          // Только «позиция уже нулевая» (110017). Прочие ошибки reduce-only (например, объём больше позиции)
+          // не означают закрытия — иначе сделка пометилась бы закрытой, а остаток висел бы на бирже.
           if (
             isClose &&
             (json.retCode === 110017 ||
               String(json.retMsg || '')
                 .toLowerCase()
-                .includes('current position is zero') ||
-              String(json.retMsg || '')
-                .toLowerCase()
-                .includes('reduce-only'))
+                .includes('current position is zero'))
           ) {
             bybitHostCache.set(cleanKey, baseUrl);
             const netLabel = baseUrl.includes('testnet')
@@ -1789,6 +1819,12 @@ export async function executeExchangeFuturesOrder(
             };
           }
 
+          // 110072 — ордер с этим orderLinkId уже создан (первая попытка через WS прошла, хотя ответ не дошёл):
+          // это успех, а не повод открывать вторую позицию. Детали исполнения ищем по orderLinkId ниже.
+          if (json.retCode === 110072) {
+            json = { retCode: 0, retMsg: 'OK (повтор: ордер уже создан первой попыткой)', result: { orderLinkId: bybitOrderLinkId } };
+          }
+
           if (json.retCode === 0) {
             bybitHostCache.set(cleanKey, baseUrl);
             const netLabel = baseUrl.includes('testnet')
@@ -1796,7 +1832,7 @@ export async function executeExchangeFuturesOrder(
               : baseUrl.includes('demo')
               ? 'Bybit Demo'
               : 'Bybit Mainnet';
-            const orderId = String(json.result?.orderId || `bybit-${Date.now()}`);
+            const orderId = String(json.result?.orderId || json.result?.orderLinkId || `bybit-${Date.now()}`);
 
             let actualAvgPrice = params.referencePrice;
             let actualExecQty = Number(formattedQtyStr);
@@ -1825,13 +1861,15 @@ export async function executeExchangeFuturesOrder(
               if (wsFill.tradeTime > 0) {
                 actualExchangeTime = wsFill.tradeTime;
               }
-            } else if (json.result?.orderId) {
+            } else if (json.result?.orderId || json.result?.orderLinkId) {
               // 2. Fallback на REST API, если приватный WS не успел доставить событие
               try {
                 await new Promise((r) => setTimeout(r, 180));
                 const qTs = await getBybitTimestamp(baseUrl, false);
                 const recvWindow = '10000';
-                const qStr = `category=linear&symbol=${symbol}&orderId=${encodeURIComponent(orderId)}`;
+                const qStr = json.result?.orderId
+                  ? `category=linear&symbol=${symbol}&orderId=${encodeURIComponent(orderId)}`
+                  : `category=linear&symbol=${symbol}&orderLinkId=${encodeURIComponent(bybitOrderLinkId)}`;
                 const qSig = signBybitV5(qTs, cleanKey, recvWindow, qStr, cleanSecret);
                 const ordRes = await makeHttpsRequest(`${baseUrl}/v5/order/realtime?${qStr}`, {
                   method: 'GET',
