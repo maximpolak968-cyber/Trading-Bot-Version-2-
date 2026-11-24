@@ -103,6 +103,16 @@ export interface ReversalChartMarker {
 
 const EMPTY_REVERSAL_MARKERS: ReversalChartMarker[] = [];
 
+/** Заголовок авторизации из сохранённого токена: сервер отдаёт свечи только вошедшим пользователям. */
+function authHeadersFromStorage(): Record<string, string> {
+  try {
+    const token = localStorage.getItem('scalpbot_auth_token') || '';
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  } catch {
+    return {};
+  }
+}
+
 interface DraggableLevelTarget {
   key: string;
   kind: 'tp' | 'sl' | 'dca' | 'bot_level';
@@ -712,7 +722,8 @@ export const CandleChart: React.FC<CandleChartProps> = ({
       const res = await fetch(
         `/api/v1/pair_candles?pair=${encodeURIComponent(pair)}&timeframe=${encodeURIComponent(
           timeframe
-        )}&strategy=${encodeURIComponent(strategy)}&limit=1000&endTime=${earliestTs - 1}`
+        )}&strategy=${encodeURIComponent(strategy)}&limit=1000&endTime=${earliestTs - 1}`,
+        { headers: authHeadersFromStorage() }
       );
       if (res.ok) {
         const df: PairCandlesResponse = await res.json();

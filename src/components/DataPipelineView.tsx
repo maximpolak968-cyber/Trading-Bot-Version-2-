@@ -63,7 +63,8 @@ export const DataPipelineView: React.FC<DataPipelineViewProps> = ({
         epId === 'pair_candles'
           ? `/api/v1/pair_candles?pair=${encodeURIComponent(selectedPair)}&timeframe=${timeframe}&strategy=${strategy}&limit=8`
           : `/api/v1/${epId}`;
-      const res = await fetch(url);
+      const token = localStorage.getItem('scalpbot_auth_token') || '';
+      const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
       const data = await res.json();
       setJsonPreview(JSON.stringify(data, null, 2));
     } catch (err: any) {
