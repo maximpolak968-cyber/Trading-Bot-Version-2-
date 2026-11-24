@@ -1068,6 +1068,121 @@ async function fetchTopVolatileFuturesPairs(minVolumeUsdt = 50_000_000): Promise
   return volatilePairsCache.pairs.length > 0 ? volatilePairsCache.pairs : [...PINNED_PAIRS];
 }
 
+// ============================================================================
+// СВЕЧИ ДЛЯ ГРАФИКА: ТОТ ЖЕ РЫНОК, ЧТО И У ТОРГОВОГО АККАУНТА
+// Если бот торгует на Binance Futures Testnet, график показывает свечи самой тестовой биржи
+// (у неё свои цены и особенно тени свечей), а не основной Binance — иначе график не совпадает с биржей.
+// Анализ стратегии по-прежнему идёт по свечам основного рынка (у Testnet искусственный объём и тонкий стакан).
+// ============================================================================
+
+type ChartNetwork = 'mainnet' | 'binance_testnet';
+
+function getChartNetwork(): ChartNetwork {
+  const enabled = exchangeAccountsStore.filter((a) => a.enabled);
+  const primary = enabled.find((a) => a.is_owner) || enabled[0];
+  return primary && primary.exchange === 'binance' && primary.is_testnet ? 'binance_testnet' : 'mainnet';
+}
+
+const BINANCE_TESTNET_FAPI = 'https://testnet.binancefuture.com';
+const testnetCandleCache = new Map<string, { candles: RawCandle[]; historyTs: number; tailTs: number }>();
+
+function parseBinanceKlines(raw: any): RawCandle[] {
+  return Array.isArray(raw)
+    ? raw
+        .map((k: any[]) => ({
+          timestamp: Number(k[0]),
+          open: parseFloat(k[1]),
+          high: parseFloat(k[2]),
+          low: parseFloat(k[3]),
+          close: parseFloat(k[4]),
+          volume: parseFloat(k[5]),
+        }))
+        .filter((c) => Number.isFinite(c.timestamp) && c.close > 0)
+    : [];
+}
+
+async function fetchBinanceTestnetCandles(
+  pair: string,
+  interval: string,
+  limit: number,
+  endTime?: number
+): Promise<{ candles: RawCandle[]; source: string }> {
+  const symbol = pairToBinanceSymbol(pair);
+  const source = `Binance Testnet (${interval})`;
+  const url = (lim: number, end?: number) =>
+    `${BINANCE_TESTNET_FAPI}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${lim}${end ? `&endTime=${end}` : ''}`;
+
+  // Старая история (прокрутка графика влево) — отдельный запрос, кэшируем на 10 минут
+  if (endTime) {
+    const key = `${symbol}_${interval}_${limit}_${endTime}`;
+    const hit = testnetCandleCache.get(key);
+    if (hit && Date.now() - hit.historyTs < 600_000) return { candles: hit.candles, source };
+    try {
+      const res = await fetchWithTimeout(url(limit, endTime), 6000);
+      if (res.ok) {
+        const candles = parseBinanceKlines(await res.json());
+        testnetCandleCache.set(key, { candles, historyTs: Date.now(), tailTs: Date.now() });
+        return { candles, source };
+      }
+    } catch {
+      // ignore
+    }
+    return { candles: hit?.candles || [], source: hit ? `${source} (Cached)` : 'Offline' };
+  }
+
+  // Последние свечи: полную историю обновляем раз в 5 минут, а хвост (3 последние свечи) — не чаще раза в 3 секунды
+  const key = `${symbol}_${interval}_latest`;
+  const entry = testnetCandleCache.get(key);
+  const now = Date.now();
+  try {
+    if (!entry || entry.candles.length < limit || now - entry.historyTs > 300_000) {
+      const res = await fetchWithTimeout(url(1000), 6000);
+      if (res.ok) {
+        const candles = parseBinanceKlines(await res.json());
+        if (candles.length > 5) {
+          testnetCandleCache.set(key, { candles, historyTs: now, tailTs: now });
+          return { candles: candles.slice(-limit), source };
+        }
+      }
+    } else if (now - entry.tailTs > 3_000) {
+      const res = await fetchWithTimeout(url(3), 4000);
+      if (res.ok) {
+        const tail = parseBinanceKlines(await res.json());
+        const merged = entry.candles.slice();
+        for (const c of tail) {
+          const last = merged[merged.length - 1];
+          if (last && c.timestamp === last.timestamp) merged[merged.length - 1] = c;
+          else if (!last || c.timestamp > last.timestamp) merged.push(c);
+        }
+        entry.candles = merged.slice(-1000);
+        entry.tailTs = now;
+      }
+    }
+  } catch {
+    // сеть недоступна — отдаём то, что есть в кэше
+  }
+  const cur = testnetCandleCache.get(key);
+  return cur ? { candles: cur.candles.slice(-limit), source } : { candles: [], source: 'Offline' };
+}
+
+/** Свечи для графика сайта — с рынка, на котором реально торгует аккаунт. */
+async function fetchChartCandles(
+  pair: string,
+  timeframe: string,
+  limit = 1000,
+  endTime?: number
+): Promise<{ candles: RawCandle[]; source: string }> {
+  if (getChartNetwork() === 'binance_testnet') {
+    const tf = String(timeframe || '1h').trim().toLowerCase();
+    const interval = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '1w'].includes(tf)
+      ? tf
+      : '1h';
+    const res = await fetchBinanceTestnetCandles(pair, interval, Math.min(1000, Math.max(50, limit)), endTime);
+    if (res.candles.length > 0) return res;
+  }
+  return fetchRealCandles(pair, timeframe, limit, endTime);
+}
+
 async function fetchRealCandles(
   pair: string,
   timeframe: string,
@@ -1343,15 +1458,38 @@ async function fetchRealCandles(
       ]
     : allProviders;
 
-  for (const provider of orderedProviders) {
+  const tryProvider = async (provider: KlineProvider, timeoutMs: number) => {
+    const res = await fetchWithTimeout(provider.url, timeoutMs);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const candles = provider
+      .parse(await res.json())
+      .filter((c) => Number.isFinite(c.timestamp) && Number.isFinite(c.close) && c.close > 0);
+    if (candles.length <= 5) throw new Error('empty');
+    return { provider, candles };
+  };
+
+  // Сначала основной источник (биржа аккаунта); если он не ответил за 3.5 с — опрашиваем остальные
+  // ПАРАЛЛЕЛЬНО и берём первый успешный ответ (раньше они перебирались по очереди по 5.5 с каждый).
+  let winner: { provider: KlineProvider; candles: RawCandle[] } | null = null;
+  if (orderedProviders.length > 0) {
     try {
-      const res = await fetchWithTimeout(provider.url, 5500);
-      if (res.ok) {
-        const raw = await res.json();
-        const candles = provider
-          .parse(raw)
-          .filter((c) => Number.isFinite(c.timestamp) && Number.isFinite(c.close) && c.close > 0);
-        if (candles.length > 5) {
+      winner = await tryProvider(orderedProviders[0], 3500);
+    } catch {
+      winner = null;
+    }
+  }
+  if (!winner && orderedProviders.length > 1) {
+    try {
+      winner = await Promise.any(orderedProviders.slice(1).map((p) => tryProvider(p, 5000)));
+    } catch {
+      winner = null;
+    }
+  }
+
+  if (winner) {
+    const { provider, candles } = winner;
+    {
+      {
           if (!endTimeMs) {
             const latest = candles[candles.length - 1];
             const existingTicker = tickerCache.get(pair);
@@ -1386,10 +1524,7 @@ async function fetchRealCandles(
             source: provider.name,
           });
           return { candles, source: provider.name };
-        }
       }
-    } catch {
-      // try next exchange provider
     }
   }
 
@@ -7380,7 +7515,7 @@ async function startServer() {
     const limit = Math.min(1000, Math.max(60, Number(req.query.limit) || 1000));
     const endTime = req.query.endTime ? Number(req.query.endTime) : undefined;
 
-    const { candles, source } = await fetchRealCandles(pair, timeframe, limit, endTime);
+    const { candles, source } = await fetchChartCandles(pair, timeframe, limit, endTime);
 
     // Update current rate for open trades on this pair using live WS Futures Mark Price first
     if (!endTime && candles.length > 0) {
