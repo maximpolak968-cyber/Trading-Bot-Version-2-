@@ -30,6 +30,7 @@ import {
   calculateWaveTrend,
 } from './src/bot/scalpBotEngine.ts';
 import { SqliteBotDatabase } from './src/bot/sqliteStore.ts';
+import { analyzeReversalHistory } from './src/bot/reversalHistory.ts';
 import {
   testExchangeConnection,
   executeExchangeFuturesOrder,
@@ -6698,6 +6699,23 @@ async function startServer() {
       res.json({ pair, ...assessMarketRegime(d1, h4), updated_at: Date.now() });
     } catch (err: any) {
       res.status(500).json({ error: `Не удалось определить тренд: ${err?.message || err}` });
+    }
+  });
+
+  // Разбор истории монеты: все подходы к уровням на графике — чем закончились (разворот/пробой) и что было перед этим
+  app.get('/api/v1/reversal_history', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    const pair = String(req.query.pair || 'BTC/USDT:USDT').toUpperCase();
+    const timeframe = String(req.query.timeframe || '4h');
+    try {
+      const [{ candles }, { candles: c1d }] = await Promise.all([
+        fetchRealCandles(pair, timeframe, 1000),
+        fetchRealCandles(pair, '1d', 1000),
+      ]);
+      res.json({ pair, ...analyzeReversalHistory(candles, c1d, timeframe) });
+    } catch (err: any) {
+      res.status(500).json({ error: `Не удалось разобрать историю: ${err?.message || err}` });
     }
   });
 

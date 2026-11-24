@@ -36,7 +36,8 @@ import {
   ChartDrawingObject,
   fmtComma,
 } from '../types/frequi';
-import { CandleChart, TradeLevelUpdatePayload, QuickOrderFromChartPayload } from './CandleChart';
+import { CandleChart, TradeLevelUpdatePayload, QuickOrderFromChartPayload, ReversalChartMarker } from './CandleChart';
+import ReversalHistoryPanel from './ReversalHistoryPanel';
 import TrendRegimeBadge from './TrendRegimeBadge';
 import { ProfitPill } from './ProfitPill';
 
@@ -171,6 +172,7 @@ export const TradeView: React.FC<TradeViewProps> = ({
   isOwner = true,
 }) => {
   // Collapsible right drawer state (TradingView-style right panel)
+  const [reversalMarkers, setReversalMarkers] = useState<ReversalChartMarker[]>([]);
   const [isRightPanelOpen, setIsRightPanelOpen] = useState<boolean>(true);
   const [internalRightTab, setInternalRightTab] = useState<RightPanelSection>('open');
   const activeRightTab = externalTab ?? internalRightTab;
@@ -325,7 +327,9 @@ export const TradeView: React.FC<TradeViewProps> = ({
       <div className="flex-1 flex flex-col min-w-0 min-h-0 h-full overflow-hidden bg-[#131722]">
         <div className="relative flex-1 min-h-0 h-full w-full overflow-hidden">
           <TrendRegimeBadge pair={selectedPair} authToken={authToken} />
+          <ReversalHistoryPanel pair={selectedPair} timeframe={timeframe} authToken={authToken} onMarkers={setReversalMarkers} />
           <CandleChart
+            reversalMarkers={reversalMarkers}
             pair={selectedPair}
             availablePairs={availablePairs}
             pairMetrics={whitelist?.pair_metrics}
