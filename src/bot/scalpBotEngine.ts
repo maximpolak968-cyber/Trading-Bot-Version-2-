@@ -1781,6 +1781,57 @@ export function computePrimaryLegTarget(params: {
   };
 }
 
+// ============================================================================
+// ФИЛЬТР МОНЕТ ДЛЯ НОВЫХ ВХОДОВ
+// По модели ~9 700 хедж-кампаний (30 монет): в боковике (ADX(4H) < 20) средний итог −0.13%, на монетах с мелкими
+// свечами (ATR(4H) < 2%) — −0.33%; у монет с силой тренда ADX ≥ 20, направленным движением последних 5 дней
+// (ER ≥ 0.10) и ATR ≥ 2% — +1.47% против +0.60% по всем. Верхняя граница ATR 8% — из соображений риска:
+// экстремальные монеты (ATR 15–35% за 4 часа) при плече 25x за одну свечу проходят больше всей маржи позиции.
+// ============================================================================
+
+export const COIN_FILTER_MIN_ADX = 20;
+export const COIN_FILTER_MIN_ER30 = 0.1;
+export const COIN_FILTER_MIN_ATR_PCT = 2;
+export const COIN_FILTER_MAX_ATR_PCT = 8;
+
+export interface CoinQuality {
+  ok: boolean;
+  adx: number;
+  /** Направленность движения за 30 свечей 4H (≈5 дней): |итоговое смещение| / сумма всех ходов (0 — пила, 1 — прямая). */
+  er30: number;
+  atr_pct: number;
+  reason: string;
+}
+
+/** Подходит ли монета для нового входа: не боковик, движение направленное, свечи не мелкие и не экстремальные. */
+export function assessCoinQuality(candles4h: OhlcvCandle[]): CoinQuality {
+  const closed = candles4h.slice(0, -1);
+  if (closed.length < 60) {
+    return { ok: false, adx: 0, er30: 0, atr_pct: 0, reason: `мало истории 4H (${closed.length} свечей)` };
+  }
+  const last = closed.length - 1;
+  const adx = wilderAdxSeries(closed, 14)[last]?.adx || 0;
+  let path = 0;
+  for (let i = last - 29; i <= last; i++) path += Math.abs(closed[i].close - closed[i - 1].close);
+  const er30 = path > 0 ? Math.abs(closed[last].close - closed[last - 30].close) / path : 0;
+  const atrSeries = wilderAtrSeries(closed, 14);
+  const atrPct = closed[last].close > 0 ? (atrSeries[last] / closed[last].close) * 100 : 0;
+  const problems: string[] = [];
+  if (adx < COIN_FILTER_MIN_ADX) problems.push(`боковик/вялый рынок: ADX(4H) ${adx.toFixed(0)} < ${COIN_FILTER_MIN_ADX}`);
+  if (er30 < COIN_FILTER_MIN_ER30) problems.push(`нет направленного движения 5 дней: ER ${er30.toFixed(2)} < ${COIN_FILTER_MIN_ER30}`);
+  if (atrPct < COIN_FILTER_MIN_ATR_PCT) problems.push(`мелкие свечи: ATR(4H) ${atrPct.toFixed(2)}% < ${COIN_FILTER_MIN_ATR_PCT}%`);
+  if (atrPct > COIN_FILTER_MAX_ATR_PCT) problems.push(`слишком волатильна: ATR(4H) ${atrPct.toFixed(1)}% > ${COIN_FILTER_MAX_ATR_PCT}%`);
+  return {
+    ok: problems.length === 0,
+    adx: Number(adx.toFixed(1)),
+    er30: Number(er30.toFixed(3)),
+    atr_pct: Number(atrPct.toFixed(2)),
+    reason: problems.length === 0
+      ? `монета подходит: ADX ${adx.toFixed(0)}, ER ${er30.toFixed(2)}, ATR ${atrPct.toFixed(2)}%`
+      : problems.join('; '),
+  };
+}
+
 function trendStateToLegacyLabel(
   s: TimeframeTrendState
 ): 'BULLISH' | 'BEARISH' | 'MILD_BULLISH' | 'MILD_BEARISH' | 'NEUTRAL' {
@@ -2993,6 +3044,8 @@ export interface GlobalHedgeEvaluation {
   strategy_name: 'GlobalHedgeStrategy';
   /** Подтверждённый отбой от уровня по тренду (закрытые свечи 4H) — для журнала сигналов разворота */
   level_bounce?: { side: 'support' | 'resistance'; level: number };
+  /** Результат фильтра монет (ADX, направленность, ATR) */
+  coin_quality?: CoinQuality;
   should_enter_hedge: boolean;
   should_open_hedge: boolean;
   channel_width_pct: number;
@@ -3122,8 +3175,12 @@ export function evaluateGlobalHedgeStrategy(
     !isPumpExhaustion(candles1h) &&
     !isNewsHelicopterVolatility(candles1h);
 
+  // Фильтр монет: не боковик, направленное движение, свечи не мелкие и не экстремальные
+  const coinQuality = assessCoinQuality(candles4h);
+
   const shouldEnter =
     regimeAllowsEntry &&
+    coinQuality.ok &&
     channelWidthPct >= 3.0 &&
     (inMidRangeCorridor || confirmedLevelBounceEntry) &&
     obstacleCheckOk &&
@@ -3169,6 +3226,8 @@ export function evaluateGlobalHedgeStrategy(
   if (!shouldEnter) {
     if (!regimeAllowsEntry) {
       rejectDetail = regime ? regime.summary : 'режим рынка не определён';
+    } else if (!coinQuality.ok) {
+      rejectDetail = `фильтр монет: ${coinQuality.reason}`;
     } else if (channelWidthPct < 3.0) {
       rejectDetail = `узкий коридор ${channelWidthPct.toFixed(1)}% (< 3.0%)`;
     } else if (!inMidRangeCorridor && !confirmedLevelBounceEntry) {
@@ -3202,6 +3261,7 @@ export function evaluateGlobalHedgeStrategy(
     short_stake_multiplier: primarySide === 'short' ? primaryStakeMult : insuranceStakeMult,
     air_to_support_pct: Number(airToSupPct.toFixed(2)),
     air_to_resistance_pct: Number(airToResPct.toFixed(2)),
+    coin_quality: coinQuality,
     level_bounce: confirmedLevelBounceEntry
       ? primarySide === 'long'
         ? { side: 'support', level: globalSup }
