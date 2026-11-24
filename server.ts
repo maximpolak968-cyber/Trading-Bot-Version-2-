@@ -499,7 +499,7 @@ function evaluateFastWsTpExit(wsTick: LiveWsTicker): void {
     const execPrice = execInfo.executionPrice;
 
     // Мгновенный триггер основного цикла при пересечении отложенного ордера перестраховки (Сценарий 4) или анти-распил стопа (Сценарий 1Б)
-    if (t.rehedge_stop_price && t.rehedge_stop_price > 0) {
+    if (HEDGE_REHEDGE_SCENARIO_ENABLED && t.rehedge_stop_price && t.rehedge_stop_price > 0) {
       const triggeredRehedge = t.is_short
         ? mark >= t.rehedge_stop_price || execPrice >= t.rehedge_stop_price
         : mark <= t.rehedge_stop_price || execPrice <= t.rehedge_stop_price;
@@ -508,7 +508,7 @@ function evaluateFastWsTpExit(wsTick: LiveWsTicker): void {
         continue;
       }
     }
-    if (t.whipsaw_stop_price && t.whipsaw_stop_price > 0) {
+    if (HEDGE_REHEDGE_SCENARIO_ENABLED && t.whipsaw_stop_price && t.whipsaw_stop_price > 0) {
       const triggeredWhipsaw = t.is_short
         ? mark >= t.whipsaw_stop_price || execPrice >= t.whipsaw_stop_price
         : mark <= t.whipsaw_stop_price || execPrice <= t.whipsaw_stop_price;
@@ -2225,6 +2225,12 @@ const botLogs: Array<{
 const cooldownPairs = new Map<string, number>();
 const dcaRiskSkipLogTs = new Map<number, number>();
 let ownerManuallyStoppedBot = false;
+/**
+ * «Сценарий 4: повторный лок» отключён: после усреднения бот ставил Re-Hedge Stop за тенью разворотной свечи,
+ * при пробое открывал новую страховку и закрывал её по стопу «от распила» (whipsaw) — это стоп-лосс, а модель
+ * хедж-кампаний показала, что повторное хеджирование на пробое ухудшает итог (0.60% → 0.23%).
+ */
+const HEDGE_REHEDGE_SCENARIO_ENABLED = false;
 const stoppedUsers = new Set<string>();
 
 /** Кабинет личной ссылки: один на ссылку (invite:<id>). */
@@ -2881,6 +2887,17 @@ async function initializeBotTrades() {
   }
 
   tradesStore = cleanTrades;
+  // Сценарий 4 отключён: стопов повторного лока (Re-Hedge / Whipsaw) у позиций быть не должно — снимаем при загрузке
+  if (!HEDGE_REHEDGE_SCENARIO_ENABLED) {
+    for (const t of tradesStore) {
+      if (t.rehedge_stop_price || t.rehedge_stop_qty || t.whipsaw_stop_price) {
+        t.rehedge_stop_price = undefined;
+        t.rehedge_stop_qty = undefined;
+        t.whipsaw_stop_price = undefined;
+        sqliteDb.upsertTrade(t);
+      }
+    }
+  }
   for (const t of tradesStore) {
     if (t.is_open && t.pair) {
       subscribePairKlineStream(t.pair, t.timeframe || '1h');
@@ -4521,8 +4538,25 @@ async function runScalpBotCycle(waitForActive = false) {
         }
       }
 
+      // Сценарий 4 отключён: снимаем оставшиеся Re-Hedge / Whipsaw стопы с открытых позиций
+      if (!HEDGE_REHEDGE_SCENARIO_ENABLED && (trade.rehedge_stop_price || trade.whipsaw_stop_price)) {
+        const oldRehedge = trade.rehedge_stop_price;
+        const oldWhipsaw = trade.whipsaw_stop_price;
+        trade.rehedge_stop_price = undefined;
+        trade.rehedge_stop_qty = undefined;
+        trade.whipsaw_stop_price = undefined;
+        sqliteDb.upsertTrade(trade);
+        broadcastTradeLifecycleEvent('trade:updated', trade);
+        appendLog(
+          'freqtrade.bot.hedge',
+          'INFO',
+          `🧹 [${trade.pair}] #${trade.trade_id}: сняты стопы повторного лока${oldRehedge ? ` (Re-Hedge ${oldRehedge}$)` : ''}${oldWhipsaw ? ` (Whipsaw ${oldWhipsaw}$)` : ''} — сценарий 4 отключён, стопов у позиций нет.`,
+          { userId: tradeUserId }
+        );
+      }
       // СЦЕНАРИЙ 4 (Пункт 4.3): Защита от «распила» (Whipsaw Stop) на повторно открытой страховочной позиции
       if (
+        HEDGE_REHEDGE_SCENARIO_ENABLED &&
         trade.campaign_role === 'insurance' &&
         trade.whipsaw_stop_price &&
         trade.whipsaw_stop_price > 0
@@ -4590,6 +4624,7 @@ async function runScalpBotCycle(waitForActive = false) {
       // СЦЕНАРИЙ 4 (Пункт 4.1): Срабатывание защитного стоп-ордера повторного хеджирования (Re-Hedge Stop за тенью разворотной свечи)
       // Работает как для двухсторонней кампании, так и для одностороннего скальпинга после DCA #1 на L1!
       if (
+        HEDGE_REHEDGE_SCENARIO_ENABLED &&
         trade.rehedge_stop_price &&
         trade.rehedge_stop_price > 0 &&
         !openSibling
@@ -5620,9 +5655,11 @@ async function runScalpBotCycle(waitForActive = false) {
                       trade.trade_state = 'DCA_ACTIVE';
 
                       // ШАГ 3 (Пункт 3.3): Ставим обязательный защитный стоп-ордер повторного хеджирования (Re-Hedge Stop) за тенью разворотной свечи!
-                      trade.rehedge_stop_price = roundPrice(reversalCheck.rehedgeStopPrice);
-                      trade.rehedge_stop_qty = Number((trade.amount * 0.5).toFixed(4));
-                      trade.whipsaw_stop_price = roundPrice(reversalCheck.whipsawStopPrice);
+                      if (HEDGE_REHEDGE_SCENARIO_ENABLED) {
+                        trade.rehedge_stop_price = roundPrice(reversalCheck.rehedgeStopPrice);
+                        trade.rehedge_stop_qty = Number((trade.amount * 0.5).toFixed(4));
+                        trade.whipsaw_stop_price = roundPrice(reversalCheck.whipsawStopPrice);
+                      }
 
                       if (!Array.isArray(trade.orders)) trade.orders = [];
                       trade.orders.push({
@@ -5667,14 +5704,14 @@ async function runScalpBotCycle(waitForActive = false) {
                         fee: Number((fillPrice * fillQty * TAKER_FEE_RATE).toFixed(4)),
                         realized_pnl: 0,
                         action_type: 'DCA_REVERSAL_ENTRY',
-                        notes: `DCA #${newStep} @ ${fillPrice}$ (${reversalCheck.reason}) | Новая средняя: ${trade.open_rate}$ | Выход P_exit: ${trade.min_profitable_tp}$ | Re-Hedge Stop: ${trade.rehedge_stop_price}$`,
+                        notes: `DCA #${newStep} @ ${fillPrice}$ (${reversalCheck.reason}) | Новая средняя: ${trade.open_rate}$ | Выход P_exit: ${trade.min_profitable_tp}$${trade.rehedge_stop_price ? ` | Re-Hedge Stop: ${trade.rehedge_stop_price}$` : ''}`,
                       });
                     });
 
                     appendLog(
                       'freqtrade.bot.dca',
                       'INFO',
-                      `🔄 [Сценарий 3: Разворотное усреднение #${newStep}] [${trade.pair}] #${trade.trade_id} @ ${fillPrice}$ (${reversalCheck.reason}) | Новая средняя: ${trade.open_rate}$ | Точка схлопывания корзины P_exit: ${trade.min_profitable_tp}$ (P_bank=${trade.campaign_banked_profit || 0}$) | Защитный Re-Hedge Stop за тенью: ${trade.rehedge_stop_price}$`,
+                      `🔄 [Сценарий 3: Разворотное усреднение #${newStep}] [${trade.pair}] #${trade.trade_id} @ ${fillPrice}$ (${reversalCheck.reason}) | Новая средняя: ${trade.open_rate}$ | Точка схлопывания корзины P_exit: ${trade.min_profitable_tp}$ (P_bank=${trade.campaign_banked_profit || 0}$)${trade.rehedge_stop_price ? ` | Защитный Re-Hedge Stop за тенью: ${trade.rehedge_stop_price}$` : ''}`,
                       { userId: tradeUserId }
                     );
                     broadcastTradeLifecycleEvent('trade:updated', trade);
