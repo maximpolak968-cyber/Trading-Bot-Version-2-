@@ -1602,6 +1602,92 @@ export function assessMarketRegime(d1: TimeframeTrendState, h4: TimeframeTrendSt
   };
 }
 
+// ============================================================================
+// ТЕЙК-ПРОФИТ: 1.25 ATR(4H) ИЛИ БЛИЖАЙШИЙ УРОВЕНЬ − 0.35 ATR (что ближе), НЕ БЛИЖЕ 0.8%
+//
+// По истории ~35 монет (≈3 100 входов по дневному тренду, 10 дней вперёд, без стопа):
+//  • чем дальше тейк, тем реже он берётся и тем глубже просадка до него: 1 ATR — взят в 82–84%,
+//    тейк у дальнего уровня (~4.2%, прежняя логика бота) — в 68%, а почти половина таких сделок
+//    по дороге проходила просадку больше 4% (при плече 25x это вся маржа позиции);
+//  • сам уровень «волшебства» не даёт — решает расстояние, измеренное в ATR монеты;
+//  • цена до уровня часто не доходит: до точки за 0.5 ATR перед уровнем — в 87% случаев, до уровня — в 77–79%.
+// Поэтому тейк ставится на расстоянии, соразмерном волатильности монеты, и не дальше точки чуть перед уровнем.
+// ============================================================================
+
+export const TP_ATR_MULTIPLE = 1.25;
+export const TP_LEVEL_OFFSET_ATR = 0.35;
+export const TP_MIN_DISTANCE_PCT = 0.8;
+
+/** ATR(14) по закрытым свечам (последняя свеча считается незакрытой и отбрасывается). */
+export function closedCandlesAtr(candles: OhlcvCandle[], period = 14): number {
+  const closed = candles.slice(0, -1);
+  if (closed.length < period + 2) return 0;
+  const series = wilderAtrSeries(closed, period);
+  return series[series.length - 1] || 0;
+}
+
+export interface TakeProfitTarget {
+  price: number;
+  source: 'ATR' | 'LEVEL' | 'FLOOR';
+  atr: number;
+  distance_pct: number;
+  distance_atr: number;
+  reason: string;
+}
+
+/**
+ * Тейк-профит по правилу «1.25 ATR(4H) или ближайший уровень − 0.35 ATR (что ближе), не ближе 0.8%».
+ * @param levels цены уровней по ходу сделки (для лонга — выше входа, для шорта — ниже); лишние отбрасываются.
+ */
+export function computeTakeProfitTarget(params: {
+  entry: number;
+  isShort: boolean;
+  atr: number;
+  levels?: Array<number | undefined | null>;
+  minDistancePct?: number;
+}): TakeProfitTarget {
+  const { entry, isShort } = params;
+  const sgn = isShort ? -1 : 1;
+  const minPct = params.minDistancePct ?? TP_MIN_DISTANCE_PCT;
+  const atr = params.atr > 0 ? params.atr : entry * 0.02; // нет истории — считаем ATR ≈ 2% цены
+  const floorPrice = entry * (1 + (sgn * minPct) / 100);
+  const atrPrice = entry + sgn * TP_ATR_MULTIPLE * atr;
+
+  // Ближайший уровень по ходу сделки, хотя бы на 0.5 ATR от входа (иначе это не цель, а шум)
+  const ahead = (params.levels || [])
+    .filter((p): p is number => typeof p === 'number' && Number.isFinite(p) && p > 0)
+    .filter((p) => (isShort ? p <= entry - 0.5 * atr : p >= entry + 0.5 * atr))
+    .sort((a, b) => (isShort ? b - a : a - b));
+  const levelPrice = ahead.length > 0 ? ahead[0] - sgn * TP_LEVEL_OFFSET_ATR * atr : undefined;
+
+  let price = atrPrice;
+  let source: TakeProfitTarget['source'] = 'ATR';
+  if (levelPrice !== undefined && (isShort ? levelPrice > atrPrice : levelPrice < atrPrice)) {
+    price = levelPrice;
+    source = 'LEVEL';
+  }
+  if (isShort ? price > floorPrice : price < floorPrice) {
+    price = floorPrice;
+    source = 'FLOOR';
+  }
+  const distancePct = (Math.abs(price - entry) / entry) * 100;
+  const distanceAtr = Math.abs(price - entry) / atr;
+  const reason =
+    source === 'ATR'
+      ? `${TP_ATR_MULTIPLE} ATR(4H) от входа (${distancePct.toFixed(2)}%)`
+      : source === 'LEVEL'
+      ? `за ${TP_LEVEL_OFFSET_ATR} ATR до уровня ${Number(ahead[0].toPrecision(7))} (${distancePct.toFixed(2)}%, ${distanceAtr.toFixed(2)} ATR)`
+      : `минимальная дистанция ${minPct}% (покрывает комиссии)`;
+  return {
+    price: Number(price.toPrecision(7)),
+    source,
+    atr: Number(atr.toPrecision(6)),
+    distance_pct: Number(distancePct.toFixed(2)),
+    distance_atr: Number(distanceAtr.toFixed(2)),
+    reason,
+  };
+}
+
 function trendStateToLegacyLabel(
   s: TimeframeTrendState
 ): 'BULLISH' | 'BEARISH' | 'MILD_BULLISH' | 'MILD_BEARISH' | 'NEUTRAL' {
@@ -2951,21 +3037,21 @@ export function evaluateGlobalHedgeStrategy(
     safeRsiZone &&
     noExtremeImpulse;
 
-  // Цели TP для хеджа по сильным уровням канала 4H/1D (уровни $L_1$ по тренду и против тренда)
-  const minSafeLongHedgeTp = currentPrice * 1.012;
-  const minSafeShortHedgeTp = currentPrice * 0.988;
-  const htfLongTarget = mtf.chart_targets_long?.find(
-    (c) => (c.horizon === '4H' || c.horizon === '1D' || c.horizon === '1W') && c.price >= minSafeLongHedgeTp
-  )?.price;
-  const htfShortTarget = mtf.chart_targets_short?.find(
-    (c) => (c.horizon === '4H' || c.horizon === '1D' || c.horizon === '1W') && c.price <= minSafeShortHedgeTp
-  )?.price;
-  const rawLongTarget = globalRes > currentPrice ? globalRes * 0.997 : mtf.recommended_tp_long;
-  const rawShortTarget = globalSup > 0 && globalSup < currentPrice ? globalSup * 1.003 : mtf.recommended_tp_short;
-  const chosenLongHedgeTp = htfLongTarget && htfLongTarget < rawLongTarget ? htfLongTarget : rawLongTarget;
-  const chosenShortHedgeTp = htfShortTarget && htfShortTarget > rawShortTarget ? htfShortTarget : rawShortTarget;
-  const longTpPrice = Number(Math.max(minSafeLongHedgeTp, chosenLongHedgeTp).toPrecision(7));
-  const shortTpPrice = Number(Math.min(minSafeShortHedgeTp, chosenShortHedgeTp).toPrecision(7));
+  // Тейки обеих ног: 1.25 ATR(4H) или ближайший уровень по ходу − 0.35 ATR (что ближе), не ближе 0.8%.
+  // Уровни-кандидаты: ключевые уровни канала 4H и цели графика 1H/4H/1D/1W.
+  const atr4h = closedCandlesAtr(candles4h);
+  const longTpPrice = computeTakeProfitTarget({
+    entry: currentPrice,
+    isShort: false,
+    atr: atr4h,
+    levels: [globalRes, mtf.key_4h_resistance, ...(mtf.chart_targets_long || []).map((c) => c.level_price || c.price)],
+  }).price;
+  const shortTpPrice = computeTakeProfitTarget({
+    entry: currentPrice,
+    isShort: true,
+    atr: atr4h,
+    levels: [globalSup, mtf.key_4h_support, ...(mtf.chart_targets_short || []).map((c) => c.level_price || c.price)],
+  }).price;
 
   const longDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, false, 3.0, 95.0, candles1w);
   const shortDca = findStrongestDcaLevel(candles4h, candles1d, currentPrice, true, 3.0, 95.0, candles1w);

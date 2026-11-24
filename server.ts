@@ -9,6 +9,9 @@ import { fileURLToPath } from 'url';
 import {
   DEFAULT_SCALPBOT_CONFIG,
   analyzeMultiTimeframe,
+  computeTakeProfitTarget,
+  closedCandlesAtr,
+  TP_MIN_DISTANCE_PCT,
   assessTimeframeTrend,
   assessMarketRegime,
   findStrongestDcaLevel,
@@ -2056,7 +2059,7 @@ function recalculateTradeMetrics(trade: FreqtradeTrade, resetLevels = false) {
         : Math.max(defaultTp, trade.min_profitable_tp);
     } else if (isTpBelowMinProfitable) {
       const structuralFloorTp = roundPrice(
-        trade.is_short ? openRate * (1 - 0.016) : openRate * (1 + 0.016)
+        trade.is_short ? openRate * (1 - TP_MIN_DISTANCE_PCT / 100) : openRate * (1 + TP_MIN_DISTANCE_PCT / 100)
       );
       trade.take_profit_abs = trade.is_short
         ? Math.min(structuralFloorTp, trade.min_profitable_tp)
@@ -2876,7 +2879,7 @@ async function initializeBotTrades() {
         const nextUnfilled = t.planned_dca_levels.find((l) => !l.filled);
         t.next_dca_price = nextUnfilled ? nextUnfilled.price : undefined;
       }
-      const needsMtfRefresh = !t.tp_manual_override && tpDistRatio < 0.014;
+      const needsMtfRefresh = !t.tp_manual_override && tpDistRatio < TP_MIN_DISTANCE_PCT / 100;
       if (needsMtfRefresh) {
         const acc =
           t.account_id && t.account_id !== 'master'
@@ -3220,18 +3223,19 @@ async function enrichImportedPositionMtfLevelsAsync(
       liveTrade.resistance_level = manualRes ? roundPrice(manualRes.price) : roundPrice(mtf.key_4h_resistance);
 
       const posTpTooClose =
-        posTp > 0 && Math.abs(posTp - entryRate) / Math.max(1e-8, entryRate) < 0.014;
+        posTp > 0 && Math.abs(posTp - entryRate) / Math.max(1e-8, entryRate) < TP_MIN_DISTANCE_PCT / 100;
       const shouldUpdateAutoTp = !liveTrade.tp_manual_override && (!(posTp > 0) || posTpTooClose);
       if (shouldUpdateAutoTp) {
-        const recommendedTp = liveTrade.is_short ? mtf.recommended_tp_short : mtf.recommended_tp_long;
-        const minStructuralTp = liveTrade.is_short
-          ? entryRate * (1 - 0.015)
-          : entryRate * (1 + 0.015);
-        liveTrade.take_profit_abs = roundPrice(
-          liveTrade.is_short
-            ? Math.min(recommendedTp, minStructuralTp)
-            : Math.max(recommendedTp, minStructuralTp)
-        );
+        // Тот же тейк, что и для новых позиций: 1.25 ATR(4H) или ближайший уровень − 0.35 ATR, не ближе 0.8%
+        const importedTp = computeTakeProfitTarget({
+          entry: entryRate,
+          isShort: liveTrade.is_short,
+          atr: closedCandlesAtr(c4h),
+          levels: liveTrade.is_short
+            ? [manualSup?.price, mtf.key_4h_support, ...(mtf.chart_targets_short || []).map((c) => c.level_price || c.price)]
+            : [manualRes?.price, mtf.key_4h_resistance, ...(mtf.chart_targets_long || []).map((c) => c.level_price || c.price)],
+        });
+        liveTrade.take_profit_abs = roundPrice(importedTp.price);
       }
 
       if (liveTrade.campaign_role === 'insurance') {
@@ -3274,7 +3278,7 @@ async function enrichImportedPositionMtfLevelsAsync(
       recalculateTradeMetrics(liveTrade, false);
       if (!liveTrade.tp_manual_override && liveTrade.min_profitable_tp) {
         const minStructuralFloor = roundPrice(
-          liveTrade.is_short ? entryRate * (1 - 0.015) : entryRate * (1 + 0.015)
+          liveTrade.is_short ? entryRate * (1 - TP_MIN_DISTANCE_PCT / 100) : entryRate * (1 + TP_MIN_DISTANCE_PCT / 100)
         );
         const targetFloor = liveTrade.is_short
           ? Math.min(liveTrade.min_profitable_tp, minStructuralFloor)
@@ -3410,7 +3414,7 @@ async function syncPositionsAndHistoryFromExchanges(
             existingOpen.open_rate > 0 &&
             Math.abs(existingOpen.take_profit_abs - existingOpen.open_rate) /
               existingOpen.open_rate <
-              0.014;
+              TP_MIN_DISTANCE_PCT / 100;
           if (hasTooCloseAutoTp || forceReanalyzeOpen) {
             void enrichImportedPositionMtfLevelsAsync(existingOpen.trade_id, acc, pos, creds);
           }
@@ -5880,77 +5884,28 @@ async function createScalpBotPosition(
       customOpts?.campaignId || customOpts?.strategyName === 'GlobalHedgeStrategy'
     );
 
-    // Графиковый выбор Take Profit: ориентируемся на структуру 1H/4H или 1D/1W без жёстких процентных тисков [0.8%..3.5%] и заглушки 1.2%
-    let rawTp = hasCustomTp
-      ? Number(customOpts!.customTp)
-      : isShort
-      ? mtf.recommended_tp_short
-      : mtf.recommended_tp_long;
-    let tpHorizon = hasCustomTp
-      ? 'MANUAL'
-      : isShort
-      ? mtf.tp_horizon_short || '4H'
-      : mtf.tp_horizon_long || '4H';
-    let tpReason = hasCustomTp
-      ? 'Пользовательский целевой уровень TP'
-      : isShort
-      ? mtf.tp_reason_short || 'Структурная зона графика'
-      : mtf.tp_reason_long || 'Структурная зона графика';
-
-    if (!hasCustomTp) {
-      if (!isShort) {
-        const minSafeLong = Math.max(
-          entryRate * (1 + MIN_NET_PROFIT_PRICE_BUFFER),
-          entryRate * 1.015
-        );
-        if (manualResLvl && manualResLvl.price * 0.9985 >= minSafeLong) {
-          rawTp = manualResLvl.price * 0.9985;
-          tpHorizon = 'MANUAL';
-          tpReason = `Ручной уровень сопротивления (${roundPrice(manualResLvl.price)}$)`;
-        } else if (!(rawTp >= minSafeLong)) {
-          const nextSafeTarget = (mtf.chart_targets_long || []).find((c) => c.price >= minSafeLong);
-          if (nextSafeTarget) {
-            rawTp = nextSafeTarget.price;
-            tpHorizon = nextSafeTarget.horizon;
-            tpReason = nextSafeTarget.label;
-          } else if (effectiveRes * 0.9985 >= minSafeLong) {
-            rawTp = effectiveRes * 0.9985;
-            tpHorizon = '4H';
-            tpReason = `4H ключевое сопротивление (${effectiveRes}$)`;
-          } else {
-            rawTp = Math.max(minSafeLong, entryRate * 1.022);
-            tpHorizon = 'SAFE_FLOOR';
-            tpReason = 'Структурная цель прибыли выше входов и комиссий';
-          }
-        }
-      } else {
-        const minSafeShort = Math.min(
-          entryRate * (1 - MIN_NET_PROFIT_PRICE_BUFFER),
-          entryRate * 0.985
-        );
-        if (manualSupLvl && manualSupLvl.price * 1.0015 <= minSafeShort) {
-          rawTp = manualSupLvl.price * 1.0015;
-          tpHorizon = 'MANUAL';
-          tpReason = `Ручной уровень поддержки (${roundPrice(manualSupLvl.price)}$)`;
-        } else if (!(rawTp <= minSafeShort)) {
-          const nextSafeTarget = (mtf.chart_targets_short || []).find((c) => c.price <= minSafeShort);
-          if (nextSafeTarget) {
-            rawTp = nextSafeTarget.price;
-            tpHorizon = nextSafeTarget.horizon;
-            tpReason = nextSafeTarget.label;
-          } else if (effectiveSup * 1.0015 <= minSafeShort) {
-            rawTp = effectiveSup * 1.0015;
-            tpHorizon = '4H';
-            tpReason = `4H ключевая поддержка (${effectiveSup}$)`;
-          } else {
-            rawTp = Math.min(minSafeShort, entryRate * 0.978);
-            tpHorizon = 'SAFE_FLOOR';
-            tpReason = 'Структурная цель прибыли выше входов и комиссий';
-          }
-        }
-      }
+    // Тейк-профит: если не задан явно (хедж передаёт свой), — 1.25 ATR(4H) от фактической цены входа или ближайший
+    // уровень по ходу − 0.35 ATR (что ближе), не ближе 0.8%. Ручной уровень пользователя учитывается как цель.
+    let rawTp: number;
+    let tpHorizon: string;
+    let tpReason: string;
+    if (hasCustomTp) {
+      rawTp = Number(customOpts!.customTp);
+      tpHorizon = 'MANUAL';
+      tpReason = 'Целевой уровень TP кампании';
+    } else {
+      const tpTarget = computeTakeProfitTarget({
+        entry: entryRate,
+        isShort,
+        atr: closedCandlesAtr(candles4h),
+        levels: isShort
+          ? [manualSupLvl?.price, effectiveSup, ...(mtf.chart_targets_short || []).map((c) => c.level_price || c.price)]
+          : [manualResLvl?.price, effectiveRes, ...(mtf.chart_targets_long || []).map((c) => c.level_price || c.price)],
+      });
+      rawTp = tpTarget.price;
+      tpHorizon = tpTarget.source;
+      tpReason = tpTarget.reason;
     }
-
     const targetTp = roundPrice(rawTp);
     const computedTpPct = Number(
       ((Math.abs(targetTp - entryRate) / Math.max(1e-8, entryRate)) * 100).toFixed(2)
