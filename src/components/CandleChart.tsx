@@ -1561,8 +1561,10 @@ export const CandleChart: React.FC<CandleChartProps> = ({
           const rawRatio = isShort
             ? (t.open_rate - activeTpPrice) / t.open_rate
             : (activeTpPrice - t.open_rate) / t.open_rate;
-          const tpPct = (rawRatio * 100 * (t.leverage || 1)).toFixed(2);
-          const tpUsd = (t.stake_amount * rawRatio * (t.leverage || 1)).toFixed(2);
+          // Как биржа: PnL = объём × (TP − вход), ROE = PnL / (объём × вход / плечо) = ход цены × плечо.
+          // Раньше $ считался от stake_amount — маржи по mark-цене, которая плавает с ценой и после усреднений.
+          const tpPct = (rawRatio * 100 * (t.leverage || 1)).toFixed(1);
+          const tpUsd = ((t.amount || 0) * t.open_rate * rawRatio).toFixed(2);
           const tpBadgeX =
             pairOpenTrades.length > 1 && tradeIdx > 0
               ? Math.max(plotLeft + 210, plotRight - 135 - tradeIdx * 135)
@@ -1576,11 +1578,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
             plotBottom,
             rightPriceAxisWidth,
             priceText: formatAxisPrice(activeTpPrice),
-            badgeText: isActive
-              ? `↕ TP (${Number(tpUsd) >= 0 ? '+' : ''}${tpUsd}$ | ${tpPct}%)`
-              : pairOpenTrades.length > 1
-              ? `↕ TP ${sideEng[0]} (${Number(tpPct) >= 0 ? '+' : ''}${tpPct}%)`
-              : `↕ TP (${Number(tpPct) >= 0 ? '+' : ''}${tpPct}%)`,
+            badgeText: `↕ TP${pairOpenTrades.length > 1 ? ` ${sideEng[0]}` : ''} ${Number(tpUsd) >= 0 ? '+' : ''}${tpUsd}$ (${Number(tpPct) >= 0 ? '+' : ''}${tpPct}%)`,
             lineColor: '#10b981',
             badgeBg: 'rgba(6, 46, 34, 0.95)',
             badgeBorder: '#10b981',
