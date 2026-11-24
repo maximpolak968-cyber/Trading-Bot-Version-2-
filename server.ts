@@ -4033,6 +4033,72 @@ function journalReversalSignal(params: {
   });
 }
 
+// ============================================================================
+// РАЗОВЫЙ ПЕРЕСЧЁТ ТЕЙКОВ УЖЕ ОТКРЫТЫХ ПОЗИЦИЙ ПО НОВОМУ ПРАВИЛУ (1.25 ATR или уровень − 0.35 ATR)
+// Не трогает: ручные тейки, позиции после усреднения или с банком кампании (у них тейк = безубыток корзины).
+// Тейк не опускается ниже точки безубытка с запасом (recalculateTradeMetrics), защита от минуса сохраняется.
+// Ордер тейк-профита на бирже обновляет обычный цикл синхронизации.
+// ============================================================================
+const TP_RECALC_MIGRATION = 'tp_atr_rule_open_positions_v1';
+
+async function recalculateOpenTradeTakeProfits(): Promise<void> {
+  if (sqliteDb.isMigrationApplied(TP_RECALC_MIGRATION)) return;
+  await initializeBotTrades();
+  const candidates = tradesStore.filter(
+    (t) =>
+      t.is_open &&
+      !t.tp_manual_override &&
+      (t.dca_count || 0) === 0 &&
+      !((t.campaign_banked_profit || 0) > 0) &&
+      t.open_rate > 0
+  );
+  let changed = 0;
+  for (const trade of candidates) {
+    try {
+      const [{ candles: c1h }, { candles: c4h }, { candles: c1d }, { candles: c1w }] = await Promise.all([
+        fetchRealCandles(trade.pair, '1h', 500),
+        fetchRealCandles(trade.pair, '4h', 1000),
+        fetchRealCandles(trade.pair, '1d', 1000),
+        fetchRealCandles(trade.pair, '1w', 300),
+      ]);
+      if (c4h.length < 30) continue;
+      const mtf = analyzeMultiTimeframe(trade.pair, c1h, c4h, c1d, undefined, c1w);
+      const target = computeTakeProfitTarget({
+        entry: trade.open_rate,
+        isShort: trade.is_short,
+        atr: closedCandlesAtr(c4h),
+        levels: trade.is_short
+          ? [mtf.key_4h_support, ...(mtf.chart_targets_short || []).map((c) => c.level_price || c.price)]
+          : [mtf.key_4h_resistance, ...(mtf.chart_targets_long || []).map((c) => c.level_price || c.price)],
+      });
+      const oldTp = trade.take_profit_abs;
+      trade.take_profit_abs = roundPrice(target.price);
+      recalculateTradeMetrics(trade, false); // поднимет тейк до безубытка с запасом, если правило дало меньше
+      if (Math.abs((trade.take_profit_abs || 0) - (oldTp || 0)) / Math.max(1e-8, oldTp || 1) > 0.001) {
+        changed++;
+        trade.plan_notes = `${String(trade.plan_notes || '').trim()} | TP пересчитан по правилу ATR: ${oldTp} → ${trade.take_profit_abs} (${target.reason})`.trim();
+        sqliteDb.upsertTrade(trade);
+        broadcastTradeLifecycleEvent('trade:updated', trade);
+        appendLog(
+          'freqtrade.bot.tp',
+          'INFO',
+          `🎯 [${trade.pair}] #${trade.trade_id} ${trade.is_short ? 'SHORT' : 'LONG'}: тейк пересчитан ${oldTp} → ${trade.take_profit_abs} (${target.reason})`,
+          { userId: resolveTradeUserId(trade) }
+        );
+      }
+    } catch {
+      // монета без истории/сети — пропускаем, остальные пересчитываем
+    }
+  }
+  sqliteDb.markMigrationApplied(TP_RECALC_MIGRATION, `кандидатов ${candidates.length}, изменено ${changed}`);
+  appendLog(
+    'freqtrade.bot.tp',
+    'INFO',
+    `🎯 Тейки открытых позиций пересчитаны по правилу «1.25 ATR или уровень − 0.35 ATR»: изменено ${changed} из ${candidates.length} (ручные тейки и позиции после усреднения не трогались).`,
+    { publicMarket: false }
+  );
+}
+
 const REVERSAL_JOURNAL_HORIZON = 48;
 let reversalJournalResolving = false;
 
@@ -6196,6 +6262,10 @@ async function startServer() {
   setTimeout(() => {
     resolvePendingReversalSignals().catch(() => {});
   }, 60_000);
+  // Разовый пересчёт тейков открытых позиций по новому правилу — через 90 с после старта, когда синхронизация с биржей уже прошла
+  setTimeout(() => {
+    recalculateOpenTradeTakeProfits().catch((err) => console.error('TP recalc error:', err));
+  }, 90_000);
 
   app.get('/api/v1/ping', (_req, res) => {
     res.json({ status: 'pong' });
@@ -9564,7 +9634,9 @@ async function startServer() {
             }
             existing.exchange_unrealized_pnl = Number(pos.unrealized_pnl || 0);
             existing.exchange_synced_at = Date.now();
-            if (pos.take_profit && pos.take_profit > 0 && !existing.tp_manual_override) {
+            // Тейк с биржи берём, только если своего у сделки нет: иначе старый ордер на бирже
+            // откатывал бы пересчитанный ботом тейк до того, как цикл синхронизации обновит ордер
+            if (pos.take_profit && pos.take_profit > 0 && !existing.tp_manual_override && !(existing.take_profit_abs > 0)) {
               existing.take_profit_abs = roundPrice(pos.take_profit);
             }
             recalculateTradeMetrics(existing, false);
