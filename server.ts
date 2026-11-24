@@ -44,6 +44,7 @@ import {
   testExchangeConnection,
   executeExchangeFuturesOrder,
   placeOrUpdateExchangeTakeProfitOrder,
+  cancelExchangeTakeProfitOrders,
   isSimulatedTestApiKey,
   getExchangeTakerFeeRate,
   fetchExchangeOpenPositions,
@@ -2950,6 +2951,7 @@ async function initializeBotTrades() {
 
 let lastExchangeBalanceSyncTs = 0;
 const accInitialPosSynced = new Set<string>();
+const lastExchangeTpCancelByTrade = new Map<number, number>();
 const lastExchangeTpEnsureByTrade = new Map<number, { tp: number; ts: number }>();
 const missingFromExchangeCountByTrade = new Map<number, { count: number; firstMissingAt: number }>();
 
@@ -3294,8 +3296,16 @@ async function enrichImportedPositionMtfLevelsAsync(
 
       sqliteDb.upsertTrade(liveTrade);
 
+      // Пока открыта вторая нога пары, тейк на бирже не ставим (касание тейка не закрывает одну ногу)
+      const liveHasOpenSibling = Boolean(
+        liveTrade.campaign_id &&
+          tradesStore.some(
+            (s) => s.is_open && s.campaign_id === liveTrade.campaign_id && s.trade_id !== liveTrade.trade_id
+          )
+      );
       if (
         shouldUpdateAutoTp &&
+        !liveHasOpenSibling &&
         liveTrade.campaign_role !== 'insurance' &&
         liveTrade.take_profit_abs &&
         liveTrade.take_profit_abs > 0
@@ -3435,6 +3445,32 @@ async function syncPositionsAndHistoryFromExchanges(
               )
           );
           const exPosTp = Number(pos.take_profit || 0);
+          // Обе ноги пары открыты — тейка на бирже быть не должно. Старый тейк (выставленный до связки ног в пару)
+          // закрыл бы одну ногу и оставил вторую одну. Снимаем его: сразу, если биржа показывает тейк на позиции,
+          // иначе проверяем открытые ордера не чаще раза в 15 минут.
+          if (!isSimulatedTestApiKey(creds.apiKey) && hasActiveLockSibling) {
+            const prevCancel = lastExchangeTpCancelByTrade.get(existingOpen.trade_id) || 0;
+            if (Date.now() - prevCancel > (exPosTp > 0 ? 60_000 : 15 * 60_000)) {
+              lastExchangeTpCancelByTrade.set(existingOpen.trade_id, Date.now());
+              const legForLog = existingOpen;
+              cancelExchangeTakeProfitOrders(creds, { pair: legForLog.pair, isShort: legForLog.is_short })
+                .then((r) => {
+                  console.info(
+                    `[tp-cancel] ${legForLog.pair} #${legForLog.trade_id} ${legForLog.is_short ? 'SHORT' : 'LONG'}: ok=${r.success} cancelled=${r.cancelled}${r.message ? ` (${r.message})` : ''}`
+                  );
+                  if (r.success && r.cancelled > 0) {
+                    pos.take_profit = 0;
+                    appendLog(
+                      'freqtrade.bot.hedge',
+                      'INFO',
+                      `🧹 [${legForLog.pair}] #${legForLog.trade_id} ${legForLog.is_short ? 'SHORT' : 'LONG'}: снят старый тейк-ордер на бирже (${r.cancelled} шт.) — пока открыты обе ноги пары, одна нога по тейку не закрывается.`,
+                      { userId: resolveTradeUserId(legForLog) }
+                    );
+                  }
+                })
+                .catch(() => {});
+            }
+          }
           if (
             !isSimulatedTestApiKey(creds.apiKey) &&
             !hasActiveLockSibling &&
