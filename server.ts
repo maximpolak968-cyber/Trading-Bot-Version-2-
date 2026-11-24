@@ -9,6 +9,8 @@ import { fileURLToPath } from 'url';
 import {
   DEFAULT_SCALPBOT_CONFIG,
   analyzeMultiTimeframe,
+  assessTimeframeTrend,
+  assessMarketRegime,
   findStrongestDcaLevel,
   detectMarketStructure,
   extractStrongTimeframeLevels,
@@ -5339,7 +5341,7 @@ async function openHedgeCampaign(
   if (!canOpenBothSides) {
     const fallbackSide: 'long' | 'short' =
       customOpts?.primarySide ||
-      (mtf.d1_trend === 'BEARISH' || mtf.d1_trend === 'MILD_BEARISH' ? 'short' : 'long');
+      (mtf.market_regime?.primary_side || (mtf.d1_trend === 'BEARISH' || mtf.d1_trend === 'MILD_BEARISH' ? 'short' : 'long'));
     appendLog(
       'freqtrade.bot.hedge',
       'WARNING',
@@ -5369,10 +5371,12 @@ async function openHedgeCampaign(
   }
 
   // Определяем доминирующий тренд старшего ТФ для асимметричного замка 2:1 (Раздел 1 и 2Б Регламента)
-  const dominantBearish =
-    mtf.market_trend === 'BEARISH' ||
-    (mtf.market_trend === 'NEUTRAL' &&
-      (mtf.d1_trend === 'BEARISH' || mtf.d1_trend === 'MILD_BEARISH' || mtf.h4_trend === 'BEARISH'));
+  // Сторона основной ноги — по режиму рынка (дневной тренд, подтверждённый 4H). Если направления нет
+  // (флэт/конфликт — бывает только при ручном входе), берём дневной тренд без перекоса в шорт.
+  const regimeSide = mtf.market_regime?.primary_side;
+  const dominantBearish = regimeSide
+    ? regimeSide === 'short'
+    : mtf.d1_trend === 'BEARISH' || mtf.d1_trend === 'MILD_BEARISH';
   const primarySide: 'long' | 'short' =
     customOpts?.primarySide || (dominantBearish ? 'short' : 'long');
   const longRole: 'primary' | 'insurance' = primarySide === 'long' ? 'primary' : 'insurance';
@@ -6679,6 +6683,24 @@ async function startServer() {
     });
   });
 
+  // Режим рынка по паре: тренд 1D (фон) и 4H (фаза), можно ли входить и в какую сторону — с объяснением
+  app.get('/api/v1/trend', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    const pair = String(req.query.pair || 'BTC/USDT:USDT').toUpperCase();
+    try {
+      const [{ candles: c1d }, { candles: c4h }] = await Promise.all([
+        fetchRealCandles(pair, '1d', 1000),
+        fetchRealCandles(pair, '4h', 1000),
+      ]);
+      const d1 = assessTimeframeTrend(c1d, '1D');
+      const h4 = assessTimeframeTrend(c4h, '4H');
+      res.json({ pair, ...assessMarketRegime(d1, h4), updated_at: Date.now() });
+    } catch (err: any) {
+      res.status(500).json({ error: `Не удалось определить тренд: ${err?.message || err}` });
+    }
+  });
+
   app.get('/api/v1/volatile_scan', async (req, res) => {
     const minVol = Number(req.query.min_volume) || 50_000_000;
     const limit = Math.min(25, Math.max(1, Number(req.query.limit) || 10));
@@ -6718,6 +6740,8 @@ async function startServer() {
           h4_trend: mtf.h4_trend,
           h1_trend: mtf.h1_trend,
           market_trend: mtf.market_trend,
+          market_regime: mtf.market_regime?.regime,
+          market_regime_summary: mtf.market_regime?.summary,
           allow_long: mtf.allow_long,
           allow_short: mtf.allow_short,
           key_4h_support: roundPrice(mtf.key_4h_support),
