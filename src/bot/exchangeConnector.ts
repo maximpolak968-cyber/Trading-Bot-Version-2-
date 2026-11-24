@@ -5288,6 +5288,8 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
         } catch {
           // best-effort cancel before placing updated TP
         }
+        // Условные Algo-тейки этой стороны тоже снимаем, иначе новый тейк ляжет рядом со старым
+        await cancelExchangeTakeProfitOrders(creds, { pair: params.pair, isShort: params.isShort }).catch(() => null);
 
         const wsRpc = getBinanceWsRpcClient(baseUrl);
         const tryWsTpOrder = async (useDual: boolean, stopPriceStr: string) => {
@@ -5433,6 +5435,125 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
     symbol,
     take_profit_price: Number(formattedTp),
   };
+}
+
+/**
+ * Снимает с биржи тейк-ордера одной стороны позиции (Binance: обычные TAKE_PROFIT* и условные Algo-ордера; Bybit: TP позиции).
+ * Нужен, пока у хедж-пары открыты обе ноги: по схеме касание тейка не закрывает одну ногу, а старый тейк, выставленный
+ * до связки ног в пару, закрыл бы её на бирже и оставил вторую ногу одну.
+ */
+export async function cancelExchangeTakeProfitOrders(
+  creds: ExchangeCredentials,
+  params: { pair: string; isShort: boolean }
+): Promise<{ success: boolean; cancelled: number; message?: string }> {
+  const cleanKey = sanitizeCredentialString(creds.apiKey);
+  const cleanSecret = sanitizeCredentialString(creds.apiSecret);
+  const symbol = String(params.pair || '')
+    .toUpperCase()
+    .split(':')[0]
+    .replace(/[^A-Z0-9]/g, '');
+  if (!cleanKey || !cleanSecret || !symbol) return { success: false, cancelled: 0, message: 'no credentials' };
+
+  if (creds.exchange === 'binance') {
+    const side = params.isShort ? 'BUY' : 'SELL';
+    const targetPosSide = params.isShort ? 'SHORT' : 'LONG';
+    const matchesSide = (o: any, dualSide: boolean) => {
+      const ps = String(o.positionSide || '').toUpperCase();
+      if (dualSide && ps && ps !== 'BOTH') return ps === targetPosSide;
+      return String(o.side || '').toUpperCase() === side;
+    };
+    const isTp = (o: any) => String(o.type || o.orderType || '').toUpperCase().includes('TAKE_PROFIT');
+    for (const baseUrl of getBinanceCandidateHosts(cleanKey, creds.isTestnet)) {
+      try {
+        if (isBinanceHostRateLimited(baseUrl).limited) continue;
+        const dualSide = await getBinanceDualSideMode(cleanKey, cleanSecret, false, baseUrl);
+        const signedGet = async (path: string, extra = '') => {
+          const ts = await getBinanceTimestamp(false, baseUrl);
+          const q = `symbol=${encodeURIComponent(symbol)}${extra}&timestamp=${ts}&recvWindow=10000`;
+          return makeHttpsRequest(`${baseUrl}${path}?${q}&signature=${signBinanceFuturesQuery(q, cleanSecret)}`, {
+            method: 'GET',
+            headers: { 'X-MBX-APIKEY': cleanKey },
+            timeoutMs: 5000,
+          });
+        };
+        const signedDelete = async (path: string, idParam: string) => {
+          const ts = await getBinanceTimestamp(false, baseUrl);
+          const q = `symbol=${encodeURIComponent(symbol)}&${idParam}&timestamp=${ts}&recvWindow=10000`;
+          return makeHttpsRequest(`${baseUrl}${path}?${q}&signature=${signBinanceFuturesQuery(q, cleanSecret)}`, {
+            method: 'DELETE',
+            headers: { 'X-MBX-APIKEY': cleanKey },
+            timeoutMs: 5000,
+          });
+        };
+        let cancelled = 0;
+        let reached = false;
+        // 1) Обычные ордера TAKE_PROFIT / TAKE_PROFIT_MARKET
+        const openRes = await signedGet('/fapi/v1/openOrders');
+        if (openRes.statusCode === 200) {
+          reached = true;
+          const list = JSON.parse(openRes.data);
+          for (const o of Array.isArray(list) ? list : []) {
+            if (!isTp(o) || !matchesSide(o, dualSide) || !o.orderId) continue;
+            const d = await signedDelete('/fapi/v1/order', `orderId=${o.orderId}`).catch(() => null);
+            if (d && d.statusCode === 200) cancelled++;
+          }
+        }
+        // 2) Условные Algo-ордера (так бот ставит тейк, когда Binance отвечает -4120)
+        const algoRes = await signedGet('/fapi/v1/openAlgoOrders').catch(() => null);
+        if (algoRes && algoRes.statusCode === 200) {
+          reached = true;
+          const parsed = JSON.parse(algoRes.data);
+          const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.orders) ? parsed.orders : [];
+          for (const o of list) {
+            if (!isTp(o) || !matchesSide(o, dualSide) || !o.algoId) continue;
+            const d = await signedDelete('/fapi/v1/algoOrder', `algoId=${o.algoId}`).catch(() => null);
+            if (d && d.statusCode === 200) cancelled++;
+          }
+        }
+        if (reached) {
+          binanceHostCache.set(cleanKey, baseUrl);
+          return { success: true, cancelled };
+        }
+      } catch {
+        // пробуем следующий хост
+      }
+    }
+    return { success: false, cancelled: 0, message: 'Binance недоступен' };
+  }
+
+  if (creds.exchange === 'bybit') {
+    for (const baseUrl of getBybitCandidateHosts(cleanKey, creds.isTestnet)) {
+      try {
+        const hedge = bybitHedgeModeCache.get(cleanKey) === true;
+        const positionIdx = hedge ? (params.isShort ? 2 : 1) : 0;
+        const timestamp = await getBybitTimestamp(baseUrl, false);
+        const recvWindow = '15000';
+        const bodyStr = JSON.stringify({ category: 'linear', symbol, takeProfit: '0', tpslMode: 'Full', positionIdx });
+        const res = await makeHttpsRequest(`${baseUrl}/v5/position/trading-stop`, {
+          method: 'POST',
+          headers: {
+            'X-BAPI-API-KEY': cleanKey,
+            'X-BAPI-TIMESTAMP': timestamp,
+            'X-BAPI-SIGN': signBybitV5(timestamp, cleanKey, recvWindow, bodyStr, cleanSecret),
+            'X-BAPI-RECV-WINDOW': recvWindow,
+            'Content-Type': 'application/json',
+          },
+          body: bodyStr,
+          timeoutMs: 6000,
+        });
+        if (res.statusCode === 200) {
+          const json = JSON.parse(res.data);
+          // 34040 — «не изменено»: тейка и так нет
+          if (json.retCode === 0 || json.retCode === 34040) return { success: true, cancelled: json.retCode === 0 ? 1 : 0 };
+        }
+      } catch {
+        // пробуем следующий хост
+      }
+    }
+    return { success: false, cancelled: 0, message: 'Bybit недоступен' };
+  }
+
+  return { success: false, cancelled: 0, message: `снятие тейка для ${creds.exchange} не поддерживается` };
 }
 
 export function stopExchangePrivateStream(exchange: SupportedExchange, apiKey: string): void {
