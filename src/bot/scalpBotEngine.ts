@@ -1718,6 +1718,9 @@ export const PRIMARY_TP_MAX_DISTANCE_PCT = 12;
 export const PRIMARY_TP_ATR = 2;
 export const DCA_L1_ATR = 4;
 export const DCA_L2_ATR = 8;
+/** Потолок дистанции L1/L2 от входа (%): в модели фильтр монет (ATR 4H 2–8%) давал L1 ≤ 32%, L2 ≤ 64%. */
+export const DCA_L1_MAX_PCT = 32;
+export const DCA_L2_MAX_PCT = 64;
 
 /** Свинг-уровни 4H по ходу сделки (пивоты, подтверждённые 3 свечами с каждой стороны) по закрытым свечам. */
 export function findSwingLevels(candles: OhlcvCandle[], isShort: boolean, lookback = 180): number[] {
@@ -1793,8 +1796,11 @@ export function computeAtrDcaLevels(
 ): { l1: number; l2: number; atr: number } {
   const a = atr > 0 ? atr : entry * 0.02;
   const sgn = isShort ? 1 : -1; // против сделки
-  const l1 = entry + sgn * DCA_L1_ATR * a;
-  const l2 = entry + sgn * DCA_L2_ATR * a;
+  // Очень волатильные монеты (ATR сверх фильтра монет) — не дальше потолка в % от входа
+  const d1 = Math.min(DCA_L1_ATR * a, (entry * DCA_L1_MAX_PCT) / 100);
+  const d2 = Math.min(DCA_L2_ATR * a, (entry * DCA_L2_MAX_PCT) / 100);
+  const l1 = entry + sgn * d1;
+  const l2 = entry + sgn * d2;
   return {
     l1: l1 > 0 ? Number(l1.toPrecision(7)) : 0,
     l2: l2 > 0 ? Number(l2.toPrecision(7)) : 0,

@@ -4046,7 +4046,7 @@ function journalReversalSignal(params: {
 // Тейк не опускается ниже точки безубытка с запасом (recalculateTradeMetrics), защита от минуса сохраняется.
 // Ордер тейк-профита на бирже обновляет обычный цикл синхронизации.
 // ============================================================================
-const TP_RECALC_MIGRATION = 'atr_levels_scheme_v5';
+const TP_RECALC_MIGRATION = 'atr_levels_scheme_v6_cap';
 /** Старый «Вариант Б» сценария 1 (закрыть только основную ногу у цели) — отключён схемой «закрываем обе ноги вместе». */
 const HEDGE_LEGACY_VARIANT_B_ENABLED = false;
 
