@@ -191,8 +191,12 @@ export const TradeView: React.FC<TradeViewProps> = ({
   const [pairFilter, setPairFilter] = useState('');
   const [isMultiPaneCoinsOpen, setIsMultiPaneCoinsOpen] = useState(false);
 
-  // 1) "Открытые": все активные открытые сделки (усреднения отключены)
-  const newOpenTrades = useMemo(() => openTrades, [openTrades]);
+  // Automatic classification into the trade sections:
+  // 1) "Открытые": active trades without DCA averaging (dca_count === 0)
+  const newOpenTrades = useMemo(
+    () => openTrades.filter((t) => (t.dca_count || 0) === 0),
+    [openTrades]
+  );
 
   // 2) "Скальпинг": active trades opened by the 1H Scalping engine (not 2-Way Hedge campaigns)
   const scalpTrades = useMemo(
@@ -200,6 +204,12 @@ export const TradeView: React.FC<TradeViewProps> = ({
       openTrades.filter(
         (t) => !t.campaign_id && !String(t.enter_tag || '').toLowerCase().includes('hedge')
       ),
+    [openTrades]
+  );
+
+  // 3) "Усреднённые": active trades where the bot has executed 1+ DCA averaging steps (dca_count > 0)
+  const averagedTrades = useMemo(
+    () => openTrades.filter((t) => (t.dca_count || 0) > 0),
     [openTrades]
   );
 
@@ -394,8 +404,8 @@ export const TradeView: React.FC<TradeViewProps> = ({
                       onClick={() => onBotCommand('stopbuy')}
                       title={
                         botConfig?.pause_new_entries
-                          ? 'Новые сделки остановлены (TP текущих активны). Нажмите, чтобы снова разрешить открытие новых сделок'
-                          : 'Остановить открытие новых сделок (бот продолжит вести и закрывать в плюс текущие позиции)'
+                          ? 'Новые сделки остановлены (DCA и TP текущих активны). Нажмите, чтобы снова разрешить открытие новых сделок'
+                          : 'Остановить открытие новых сделок (бот продолжит усреднять DCA и закрывать в плюс текущие позиции)'
                       }
                       className={`px-1.5 h-6 flex items-center gap-1 rounded-[3px] border text-[10px] font-semibold transition-colors ${
                         botConfig?.pause_new_entries
@@ -445,12 +455,12 @@ export const TradeView: React.FC<TradeViewProps> = ({
               </div>
             </div>
 
-            {/* Вкладки разделов: Открытые | Скальпинг | Закрытые | Бот */}
-            <div className="grid grid-cols-4 bg-[#131722] border-b border-[#2a2e39] p-1 gap-1">
+            {/* Вкладки разделов: Открытые | Скальпинг | Усреднённые | Закрытые | Бот */}
+            <div className="grid grid-cols-5 bg-[#131722] border-b border-[#2a2e39] p-1 gap-1">
               <button
                 type="button"
                 onClick={() => setRightTab('open')}
-                title="Открытые сделки"
+                title="Открытые сделки (без усреднения)"
                 className={`py-1.5 px-1 rounded-[3px] text-[11px] font-medium flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
                   activeRightTab === 'open'
                     ? 'bg-[#2962ff] text-white font-semibold'
@@ -477,6 +487,22 @@ export const TradeView: React.FC<TradeViewProps> = ({
                 <span>Скальпинг</span>
                 <span className="px-1 py-0.2 rounded bg-black/30 font-mono text-[10px]">
                   {scalpTrades.length}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setRightTab('averaged')}
+                title="Усреднённые сделки (DCA)"
+                className={`py-1.5 px-1 rounded-[3px] text-[11px] font-medium flex items-center justify-center gap-1 transition-colors whitespace-nowrap ${
+                  activeRightTab === 'averaged'
+                    ? 'bg-[#b45309] text-white font-semibold'
+                    : 'bg-[#1e222d] text-[#9ca3af] hover:text-white hover:bg-[#2a2e39]'
+                }`}
+              >
+                <span>Усредн.</span>
+                <span className="px-1 py-0.2 rounded bg-black/30 font-mono text-[10px]">
+                  {averagedTrades.length}
                 </span>
               </button>
 
@@ -585,7 +611,7 @@ export const TradeView: React.FC<TradeViewProps> = ({
                       {newOpenTrades.length === 0 ? (
                         <tr>
                           <td colSpan={8} className="py-6 text-center text-[#8b949e]">
-                            Нет открытых сделок
+                            Нет открытых сделок без усреднения
                           </td>
                         </tr>
                       ) : (
@@ -675,9 +701,10 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                 {shortDateStr(trade.open_date, trade.open_timestamp)}
                               </td>
 
-                              {/* 8. Act (Close) */}
+                              {/* 8. Act (+DCA / Close) */}
                               <td className="py-1.5 px-1.5 text-right whitespace-nowrap">
                                 <div className="inline-flex items-center gap-1 font-mono">
+
                                   <button
                                     type="button"
                                     onClick={(e) => handleTriggerClose(trade, e)}
@@ -769,6 +796,11 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                   >
                                     {isShort ? 'SHORT' : 'LONG'}
                                   </span>
+                                  {(trade.dca_count || 0) > 0 && (
+                                    <span className="px-1 py-0.2 rounded bg-[#3b2506] text-[#fbbf24] font-mono text-[9.5px]">
+                                      ×{trade.dca_count}
+                                    </span>
+                                  )}
                                 </div>
                                 <div className="text-[9.5px] font-mono text-[#9ca3af] truncate max-w-[105px]">
                                   {trade.enter_tag || '1H_Scalp'}
@@ -823,6 +855,171 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                   >
                                     Close
                                   </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => handleTriggerDelete(trade, e)}
+                                    title="Удалить сделку из базы"
+                                    className="px-1.5 py-0.5 rounded-[3px] bg-[#21252b] hover:bg-[#ef4444] border border-[#383e48] hover:border-[#ef4444] text-[#9ca3af] hover:text-white text-[10px] font-bold transition-colors"
+                                  >
+                                    ×
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* ===============================================================
+                ВКЛАДКА 2: УСРЕДНЁННЫЕ СДЕЛКИ (dca_count > 0)
+            =============================================================== */}
+            {activeRightTab === 'averaged' && (
+              <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+                <div className="flex-1 overflow-auto">
+                  <table className="w-full text-left border-collapse text-[11px]">
+                    <thead className="sticky top-0 bg-[#16181c] z-10 shadow-sm">
+                      <tr className="border-b border-[#2b3036] text-[#9ca3af] font-mono font-semibold">
+                        <th className="py-1.5 px-1.5 whitespace-nowrap" title="Сторона и кратность усреднения">Side</th>
+                        <th className="py-1.5 px-1.5 whitespace-nowrap" title="Торговая пара">Pair</th>
+                        <th className="py-1.5 px-1.5 whitespace-nowrap" title="Общая сумма в долларах ($)">Size $</th>
+                        <th className="py-1.5 px-1.5 whitespace-nowrap" title="Общее количество монет">Qty</th>
+                        <th className="py-1.5 px-1.5 whitespace-nowrap" title="Начальная цена ➔ Средняя цена входа + TP/SL">AVG / TP·SL</th>
+                        <th className="py-1.5 px-1.5 whitespace-nowrap" title="Кредитное плечо">Lev</th>
+                        <th className="py-1.5 px-1.5 whitespace-nowrap" title="Дата последнего усреднения">Date</th>
+                        <th className="py-1.5 px-1.5 text-right whitespace-nowrap" title="Действия (Close = Закрыть)">Act</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#242930] text-[#d1d5db]">
+                      {averagedTrades.length === 0 ? (
+                        <tr>
+                          <td colSpan={8} className="py-6 text-center text-[#8b949e]">
+                            Нет усреднённых сделок
+                          </td>
+                        </tr>
+                      ) : (
+                        averagedTrades.map((trade) => {
+                          const isShort = trade.is_short;
+                          const isSelected = trade.pair === selectedPair;
+                          const dcaCount = trade.dca_count || 1;
+                          return (
+                            <tr
+                              key={trade.trade_id}
+                              onClick={() => onSelectPair(trade.pair)}
+                              className={`cursor-pointer transition-colors ${
+                                isSelected
+                                  ? 'bg-[#78350f]/30 hover:bg-[#78350f]/40'
+                                  : 'hover:bg-[#1e2228]'
+                              }`}
+                            >
+                              {/* 1. Side (LONG/SHORT + DCA ×N) */}
+                              <td className="py-1.5 px-1.5 whitespace-nowrap">
+                                <div className="inline-flex items-center gap-1 font-mono">
+                                  <span
+                                    className={`inline-flex items-center px-1.5 py-0.5 rounded-[3px] text-[10px] font-bold ${
+                                      isShort
+                                        ? 'bg-[#3b1219] text-[#ef4444] border border-[#ef4444]/60'
+                                        : 'bg-[#063928] text-[#10b981] border border-[#10b981]/60'
+                                    }`}
+                                  >
+                                    {isShort ? 'SHORT' : 'LONG'}
+                                  </span>
+                                  <span className="px-1 py-0.5 rounded-[3px] bg-[#3b2506] text-[#fbbf24] border border-[#f59e0b]/50 text-[9.5px] font-bold">
+                                    ×{dcaCount}
+                                  </span>
+                                </div>
+                              </td>
+
+                              {/* 2. Pair */}
+                              <td
+                                className="py-1.5 px-1.5 whitespace-nowrap font-semibold text-white"
+                                title={trade.pair}
+                              >
+                                {shortPairName(trade.pair)}
+                              </td>
+
+                              {/* 3. Size $ (Маржа) + Live PnL */}
+                              <td className="py-1.5 px-1.5 whitespace-nowrap font-mono tabular-nums">
+                                <div className="text-white">{fmtComma(trade.stake_amount, 2)}$</div>
+                                <div
+                                  className={`text-[9.5px] font-semibold ${
+                                    (trade.profit_abs ?? trade.gross_profit ?? 0) >= 0
+                                      ? 'text-[#10b981]'
+                                      : 'text-[#ef4444]'
+                                  }`}
+                                >
+                                  {(trade.profit_abs ?? trade.gross_profit ?? 0) >= 0 ? '+' : ''}
+                                  {fmtComma(trade.profit_abs ?? trade.gross_profit ?? 0, 2)}$
+                                </div>
+                              </td>
+
+                              {/* 4. Qty */}
+                              <td className="py-1.5 px-1.5 whitespace-nowrap font-mono tabular-nums">
+                                {formatSmartNumber(trade.amount)}
+                              </td>
+
+                              {/* 5. Initial ➔ AVG Entry + TP (Green) / SL (Red) */}
+                              <td className="py-1.5 px-1.5 whitespace-nowrap font-mono tabular-nums">
+                                {trade.initial_open_rate &&
+                                Math.abs(trade.initial_open_rate - trade.open_rate) > 1e-8 ? (
+                                  <div className="flex items-center gap-0.5">
+                                    <span className="text-[#94a3b8] line-through text-[10px]">
+                                      {formatSmartNumber(trade.initial_open_rate)}
+                                    </span>
+                                    <span className="text-[#fbbf24] text-[10px]">➔</span>
+                                    <span className="text-white font-semibold">
+                                      {formatSmartNumber(trade.open_rate)}$
+                                    </span>
+                                  </div>
+                                ) : (
+                                  <div className="text-white font-semibold">
+                                    {formatSmartNumber(trade.open_rate)}$
+                                  </div>
+                                )}
+                                <div className="text-[9.5px] flex items-center gap-1.5">
+                                  {trade.take_profit_abs ? (
+                                    <span className="text-[#10b981]">
+                                      TP {formatSmartNumber(trade.take_profit_abs)}
+                                    </span>
+                                  ) : null}
+                                  {trade.stop_loss_abs ? (
+                                    <span className="text-[#ef4444]">
+                                      SL {formatSmartNumber(trade.stop_loss_abs)}
+                                    </span>
+                                  ) : null}
+                                </div>
+                              </td>
+
+                              {/* 6. Lev */}
+                              <td className="py-1.5 px-1.5 whitespace-nowrap font-mono tabular-nums text-[#38bdf8] font-semibold">
+                                {trade.leverage || 1}x
+                              </td>
+
+                              {/* 7. Date */}
+                              <td
+                                className="py-1.5 px-1.5 whitespace-nowrap font-mono text-[10px] text-[#9ca3af]"
+                                title={trade.last_dca_date || trade.open_date}
+                              >
+                                {shortDateStr(trade.last_dca_date || trade.open_date)}
+                              </td>
+
+                              {/* 8. Act (+DCA / Close) */}
+                              <td className="py-1.5 px-1.5 text-right whitespace-nowrap">
+                                <div className="inline-flex items-center gap-1 font-mono">
+
+                                  <button
+                                    type="button"
+                                    onClick={(e) => handleTriggerClose(trade, e)}
+                                    title="Закрыть сделку в плюс (перейдёт в Закрытые)"
+                                    className="px-1.5 py-0.5 rounded-[3px] bg-[#3b1219] hover:bg-[#ef4444] border border-[#ef4444]/70 text-[#fca5a5] hover:text-white text-[10px] font-semibold transition-colors"
+                                  >
+                                    Close
+                                  </button>
+
                                   <button
                                     type="button"
                                     onClick={(e) => handleTriggerDelete(trade, e)}
@@ -1054,6 +1251,11 @@ export const TradeView: React.FC<TradeViewProps> = ({
                             >
                               <div className="flex items-center gap-2">
                                 <span className="text-[13px] font-normal tracking-tight">{p}</span>
+                                {openStat && openStat.dcaCount > 0 && (
+                                  <span className="px-1.5 py-0.5 rounded bg-[#3b2506] text-[#fbbf24] text-[10px] font-mono">
+                                    Усредн. ×{openStat.dcaCount}
+                                  </span>
+                                )}
                               </div>
                               {openStat !== undefined && (
                                 <ProfitPill
@@ -1080,7 +1282,7 @@ export const TradeView: React.FC<TradeViewProps> = ({
                         <span className="uppercase text-emerald-400">
                           {botConfig?.state === 'running'
                             ? botConfig?.pause_new_entries
-                              ? 'Работает (Без новых входов · Только TP)'
+                              ? 'Работает (Без новых входов · Только DCA/TP)'
                               : 'Работает (Анализ 1D➔4H + Входы)'
                             : botConfig?.state === 'paused'
                             ? 'Пауза'
@@ -1309,6 +1511,23 @@ export const TradeView: React.FC<TradeViewProps> = ({
             <Zap className="w-4 h-4 text-[#10b981]" />
             <span className="text-[10px] font-mono font-semibold text-[#10b981]">
               {scalpTrades.length}
+            </span>
+          </button>
+
+          {/* Иконка 2: Усреднённые сделки */}
+          <button
+            type="button"
+            onClick={() => setRightTab('averaged')}
+            title={`Усреднённые сделки (${averagedTrades.length})`}
+            className={`w-9 py-2 rounded-[4px] flex flex-col items-center gap-1 transition-colors ${
+              isRightPanelOpen && activeRightTab === 'averaged'
+                ? 'bg-[#78350f] text-[#fde68a]'
+                : 'text-[#9ca3af] hover:bg-[#22262e] hover:text-white'
+            }`}
+          >
+            <Layers className="w-4 h-4 text-[#f59e0b]" />
+            <span className="text-[10px] font-mono font-semibold text-[#fde68a]">
+              {averagedTrades.length}
             </span>
           </button>
 
