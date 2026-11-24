@@ -2226,6 +2226,19 @@ const cooldownPairs = new Map<string, number>();
 const dcaRiskSkipLogTs = new Map<number, number>();
 let ownerManuallyStoppedBot = false;
 const stoppedUsers = new Set<string>();
+
+/** Кабинет личной ссылки: один на ссылку (invite:<id>). */
+function inviteCabinetUserId(inviteId: string): string {
+  return `invite:${String(inviteId).trim()}`;
+}
+
+/** Кабинет, чья ссылка отозвана: новые сделки на его счетах не открываются (открытые ведутся до закрытия). */
+function isRevokedInviteCabinet(userId?: string): boolean {
+  const u = String(userId || '');
+  if (!u.startsWith('invite:')) return false;
+  const inviteId = u.slice('invite:'.length).split(':')[0];
+  return !sqliteDb.isInviteActive(inviteId);
+}
 const pausedNewEntriesUsers = new Set<string>();
 
 function isUserBotStopped(userId = 'owner'): boolean {
@@ -5740,7 +5753,7 @@ async function runScalpBotCycle(waitForActive = false) {
 
     // 2. Scan for new entries for any enabled account whose user has NOT stopped or paused new entries
     const entryEnabledAccounts = activeAccounts.filter(
-      (acc) => !isUserNewEntriesPaused(acc.user_id || 'owner')
+      (acc) => !isUserNewEntriesPaused(acc.user_id || 'owner') && !isRevokedInviteCabinet(acc.user_id)
     );
     if (entryEnabledAccounts.length === 0) {
       return;
@@ -6650,7 +6663,8 @@ async function startServer() {
         if (verified.userId && verified.userId !== 'owner') {
           return {
             authenticated: true,
-            userId: verified.userId,
+            // старые токены вида invite:<id>:<случайно> ведут в общий кабинет ссылки
+            userId: verified.inviteId ? inviteCabinetUserId(verified.inviteId) : verified.userId,
             role: 'client',
             login: verified.login,
             inviteId: verified.inviteId,
@@ -6660,7 +6674,7 @@ async function startServer() {
         if (verified.inviteId) {
           return {
             authenticated: true,
-            userId: `invite:${verified.inviteId}`,
+            userId: inviteCabinetUserId(verified.inviteId),
             role: 'client',
             login: verified.login,
             inviteId: verified.inviteId,
@@ -6716,20 +6730,11 @@ async function startServer() {
     consumed: { id: string; role: 'owner' | 'client'; label: string },
     existingBearerToken?: string
   ): string {
+    void existingBearerToken;
     if (consumed.role === 'owner') return 'owner';
-    if (existingBearerToken) {
-      const verified = sqliteDb.verifyAuthToken(existingBearerToken);
-      if (
-        verified.valid &&
-        verified.role === 'client' &&
-        verified.inviteId === consumed.id &&
-        verified.userId &&
-        verified.userId.startsWith(`invite:${consumed.id}`)
-      ) {
-        return verified.userId;
-      }
-    }
-    return `invite:${consumed.id}:${crypto.randomBytes(6).toString('hex')}`;
+    // Личная ссылка = один человек = один кабинет: с любого устройства и после очистки браузера
+    // по той же ссылке человек попадает в свой кабинет со своими счетами
+    return inviteCabinetUserId(consumed.id);
   }
 
   function resolveRequestAuth(req: express.Request): ResolvedAuth {
@@ -7047,7 +7052,12 @@ async function startServer() {
     if (verified.valid) {
       let clientCode: string | undefined;
       let accountId = verified.accountId;
-      let userId = verified.role === 'owner' ? 'owner' : verified.userId || 'client:unknown';
+      let userId =
+        verified.role === 'owner'
+          ? 'owner'
+          : verified.inviteId
+          ? inviteCabinetUserId(verified.inviteId)
+          : verified.userId || 'client:unknown';
       if (verified.role === 'client') {
         if (!verified.userId && verified.inviteId) {
           userId = `invite:${verified.inviteId}`;
@@ -7195,27 +7205,34 @@ async function startServer() {
     });
   });
 
+  /** Ссылки + какие биржевые счета подключил человек в своём кабинете */
+  const listInvitesWithAccounts = () =>
+    sqliteDb.listInviteLinks().map((inv) => ({
+      ...inv,
+      accounts: exchangeAccountsStore
+        .filter((a) => (a.user_id || 'owner') === inviteCabinetUserId(inv.id))
+        .map((a) => ({ name: a.name, exchange: a.exchange, is_testnet: Boolean(a.is_testnet), enabled: a.enabled })),
+    }));
+
   app.get('/api/v1/auth/invites', (req, res) => {
     const auth = requireOwner(req, res);
     if (!auth) return;
-    res.json({ invites: sqliteDb.listInviteLinks() });
+    res.json({ invites: listInvitesWithAccounts() });
   });
 
   app.post('/api/v1/auth/invites', (req, res) => {
     const auth = requireOwner(req, res);
     if (!auth) return;
-    const { label = 'Гостевой доступ', role = 'client' } = req.body || {};
-    const invite = sqliteDb.createInviteLink(
-      String(label),
-      role === 'owner' ? 'owner' : 'client'
-    );
+    const { label = 'Гостевой доступ' } = req.body || {};
+    // Ссылка всегда даёт только личный кабинет (свои API-ключи), полный доступ по ссылке не выдаётся
+    const invite = sqliteDb.createInviteLink(String(label), 'client');
     appendLog(
       'freqtrade.auth',
       'INFO',
       `Создана ссылка доступа для "${invite.label}" (роль: ${invite.role})`,
       { userId: 'owner' }
     );
-    res.json({ invite, invites: sqliteDb.listInviteLinks() });
+    res.json({ invite, invites: listInvitesWithAccounts() });
   });
 
   app.delete('/api/v1/auth/invites/:id', (req, res) => {
@@ -7223,10 +7240,14 @@ async function startServer() {
     if (!auth) return;
     const id = String(req.params.id);
     sqliteDb.deleteInviteLink(id);
-    appendLog('freqtrade.auth', 'WARNING', `Отозвана и удалена ссылка доступа #${id}`, {
-      userId: 'owner',
-    });
-    res.json({ removed_id: id, invites: sqliteDb.listInviteLinks() });
+    const cabinetAccs = exchangeAccountsStore.filter((a) => (a.user_id || 'owner') === inviteCabinetUserId(id));
+    appendLog(
+      'freqtrade.auth',
+      'WARNING',
+      `Отозвана ссылка доступа #${id}: вход закрыт${cabinetAccs.length ? `, новые сделки на ${cabinetAccs.length} счёт(ах) этого кабинета больше не открываются (открытые бот доведёт до закрытия)` : ''}`,
+      { userId: 'owner' }
+    );
+    res.json({ removed_id: id, invites: listInvitesWithAccounts() });
   });
 
   app.patch('/api/v1/auth/settings', (req, res) => {

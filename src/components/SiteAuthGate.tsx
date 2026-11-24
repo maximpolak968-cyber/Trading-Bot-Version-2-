@@ -40,6 +40,8 @@ export interface InviteLinkItem {
   uses_count: number;
   last_used_at: string | null;
   created_at: string;
+  /** Биржевые счета, подключённые в кабинете этой ссылки */
+  accounts?: Array<{ name: string; exchange: string; is_testnet: boolean; enabled: boolean }>;
 }
 
 interface SiteLoginScreenProps {
@@ -257,7 +259,6 @@ export const SiteSettingsModal: React.FC<SiteSettingsModalProps> = ({
 }) => {
   const [invites, setInvites] = useState<InviteLinkItem[]>([]);
   const [inviteLabel, setInviteLabel] = useState('');
-  const [inviteRole, setInviteRole] = useState<'client' | 'owner'>('client');
   const [creatingInvite, setCreatingInvite] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
@@ -314,7 +315,6 @@ export const SiteSettingsModal: React.FC<SiteSettingsModalProps> = ({
         },
         body: JSON.stringify({
           label: inviteLabel.trim(),
-          role: inviteRole,
         }),
       });
       if (res.ok) {
@@ -328,6 +328,18 @@ export const SiteSettingsModal: React.FC<SiteSettingsModalProps> = ({
   };
 
   const handleDeleteInvite = async (id: string) => {
+    const inv = invites.find((i) => i.id === id);
+    const accCount = inv?.accounts?.length || 0;
+    const ok = window.confirm(
+      `Отозвать ссылку «${inv?.label || id}»?
+
+Человек больше не сможет войти.` +
+        (accCount
+          ? `
+На его счетах (${accCount}) бот перестанет открывать новые сделки, а уже открытые доведёт до закрытия.`
+          : '')
+    );
+    if (!ok) return;
     const res = await fetch(`/api/v1/auth/invites/${encodeURIComponent(id)}`, {
       method: 'DELETE',
       headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -415,8 +427,9 @@ export const SiteSettingsModal: React.FC<SiteSettingsModalProps> = ({
               </div>
 
               <p className="text-[11px] text-[#9ca3af]">
-                Без такой ссылки любой посторонний человек при открытии сайта видит{' '}
-                <strong className="text-white">абсолютно пустой чёрный экран</strong>. Создайте персональную ссылку для нужного человека — при переходе по ней сайт откроется автоматически:
+                Без ссылки посторонний видит только экран входа. <strong className="text-white">Одна ссылка — один человек:</strong>{' '}
+                по ней он всегда попадает в свой кабинет (с любого устройства), подключает свои API-ключи, и бот торгует на его счёте
+                отдельно от ваших сделок. Не пересылайте одну ссылку нескольким людям — у них будет общий кабинет.
               </p>
 
               <form onSubmit={handleCreateInvite} className="flex flex-col sm:flex-row gap-2">
@@ -428,14 +441,6 @@ export const SiteSettingsModal: React.FC<SiteSettingsModalProps> = ({
                   required
                   className="flex-1 px-3 py-1.5 rounded bg-[#181b20] border border-[#2d333f] text-white focus:outline-none focus:border-[#00b4d8]"
                 />
-                <select
-                  value={inviteRole}
-                  onChange={(e) => setInviteRole(e.target.value as 'client' | 'owner')}
-                  className="px-2.5 py-1.5 rounded bg-[#181b20] border border-[#2d333f] text-white"
-                >
-                  <option value="client">Изолированный кабинет (свои API-ключи)</option>
-                  <option value="owner">Полный доступ (владелец)</option>
-                </select>
                 <button
                   type="submit"
                   disabled={creatingInvite}
@@ -461,11 +466,18 @@ export const SiteSettingsModal: React.FC<SiteSettingsModalProps> = ({
                           <div className="flex items-center gap-2">
                             <span className="font-semibold text-white truncate">{inv.label}</span>
                             <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-[#00b4d8]/15 text-[#38bdf8]">
-                              {inv.role === 'owner' ? 'Полный' : 'Кабинет'}
+                              Кабинет
                             </span>
                             <span className="text-[10px] text-[#9ca3af]">
                               Входов: {inv.uses_count}
                             </span>
+                          </div>
+                          <div className="text-[10px] text-[#9ca3af] mt-0.5">
+                            {inv.accounts && inv.accounts.length > 0
+                              ? `Счета: ${inv.accounts
+                                  .map((a) => `${a.name} (${a.exchange.toUpperCase()}${a.is_testnet ? ' testnet' : ''}${a.enabled ? '' : ', пауза'})`)
+                                  .join(', ')}`
+                              : 'Биржа ещё не подключена'}
                           </div>
                           <div className="text-[10px] font-mono text-[#6b7280] truncate mt-0.5">
                             {fullLink}
