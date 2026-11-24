@@ -102,6 +102,7 @@ export interface ReversalChartMarker {
 }
 
 const EMPTY_REVERSAL_MARKERS: ReversalChartMarker[] = [];
+const EMPTY_BOT_LEVELS: BotChartLevel[] = [];
 
 /** Заголовок авторизации из сохранённого токена: сервер отдаёт свечи только вошедшим пользователям. */
 function authHeadersFromStorage(): Record<string, string> {
@@ -500,7 +501,7 @@ export const CandleChart: React.FC<CandleChartProps> = ({
   exchangeSource,
   candles,
   trades,
-  botLevels = [],
+  botLevels: botLevelsAll = EMPTY_BOT_LEVELS,
   drawings = [],
   plotConfig,
   onChangePlotConfig,
@@ -518,6 +519,9 @@ export const CandleChart: React.FC<CandleChartProps> = ({
   loading = false,
   reversalMarkers = EMPTY_REVERSAL_MARKERS,
 }) => {
+  // На графике — только уровни, поставленные пользователем (+LVL / перетащенные). Автоматические справочные уровни
+  // бота (1D GLOBAL, 4H RES/SUP) не рисуем: тейки и усреднения считаются по ATR, а эти линии засоряли график.
+  const botLevels = useMemo(() => botLevelsAll.filter((l) => l.manual_override), [botLevelsAll]);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
