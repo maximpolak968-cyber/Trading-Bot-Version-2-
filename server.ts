@@ -4042,7 +4042,7 @@ function journalReversalSignal(params: {
 // Тейк не опускается ниже точки безубытка с запасом (recalculateTradeMetrics), защита от минуса сохраняется.
 // Ордер тейк-профита на бирже обновляет обычный цикл синхронизации.
 // ============================================================================
-const TP_RECALC_MIGRATION = 'tp_hedge_pairs_exit_both_v3';
+const TP_RECALC_MIGRATION = 'tp_levels_dca_scheme_v4';
 /** Старый «Вариант Б» сценария 1 (закрыть только основную ногу у цели) — отключён схемой «закрываем обе ноги вместе». */
 const HEDGE_LEGACY_VARIANT_B_ENABLED = false;
 
@@ -4057,6 +4057,29 @@ async function computeLegTakeProfit(trade: FreqtradeTrade): Promise<ReturnType<t
   if (c4h.length < 30) return null;
   const mtf = analyzeMultiTimeframe(trade.pair, c1h, c4h, c1d, undefined, c1w);
   const isPrimary = trade.campaign_role === 'primary';
+  // Страховка: цель — уровень усреднения L1 основной ноги (там бот закроет её на подтверждённом развороте)
+  if (trade.campaign_role === 'insurance') {
+    const primaryLeg = tradesStore.find(
+      (s) => s.is_open && s.campaign_id === trade.campaign_id && s.trade_id !== trade.trade_id && s.campaign_role === 'primary'
+    );
+    const plannedL1 = primaryLeg?.planned_dca_levels?.find((l) => !l.filled && l.price > 0)?.price;
+    const l1 = plannedL1 || findStrongestDcaLevel(c4h, c1d, trade.open_rate, !trade.is_short, 2.6, 95.0, c1w).price;
+    const okSide = trade.is_short
+      ? l1 > 0 && l1 <= trade.open_rate * (1 - TP_MIN_DISTANCE_PCT / 100)
+      : l1 > 0 && l1 >= trade.open_rate * (1 + TP_MIN_DISTANCE_PCT / 100);
+    if (okSide) {
+      const atr = closedCandlesAtr(c4h) || trade.open_rate * 0.02;
+      const dist = Math.abs(l1 - trade.open_rate);
+      return {
+        price: Number(l1.toPrecision(7)),
+        source: 'LEVEL',
+        atr: Number(atr.toPrecision(6)),
+        distance_pct: Number(((dist / trade.open_rate) * 100).toFixed(2)),
+        distance_atr: Number((dist / atr).toFixed(2)),
+        reason: `страховка: уровень усреднения основной ноги L1 (${roundPrice(l1)}$)`,
+      };
+    }
+  }
   const baseLevels = trade.is_short
     ? [mtf.key_4h_support, ...(mtf.chart_targets_short || []).map((c) => c.level_price || c.price)]
     : [mtf.key_4h_resistance, ...(mtf.chart_targets_long || []).map((c) => c.level_price || c.price)];
@@ -4826,11 +4849,9 @@ async function runScalpBotCycle(waitForActive = false) {
 
       // 1A. Target TP check (только когда НЕТ активной второй ноги замка — то есть после закрытия страховки при разгрузке основной ноги на отскоке, либо для одиночной сделки).
       // Пока открыты ОБЕ ноги замка (Boolean(openSibling)), касание уровня НЕ закрывает ногу вслепую — работа идёт строго по Сценариям 1А, 1Б, 2, 3, 4 и 5!
-      // Исключение: страховка (против тренда) может забрать свой БЛИЗКИЙ тейк на откате, пока основная нога идёт
-      // к своему уровню — по модели хеджа это добавляет прибыль и не оставляет страховку висеть против тренда.
-      const insuranceTakesOwnTp =
-        Boolean(openSibling) && trade.campaign_role === 'insurance' && openSibling?.campaign_role === 'primary';
-      if (trade.take_profit_abs > 0 && (!openSibling || insuranceTakesOwnTp)) {
+      // Пока открыты обе ноги, ни одна не закрывается по касанию тейка: страховка закрывается у уровня L1 только
+      // на подтверждённом развороте (сценарий 3), а основная — вместе со страховкой у своей цели (сценарий 1).
+      if (trade.take_profit_abs > 0 && !openSibling) {
         const isTpHit = trade.is_short
           ? currentPrice <= trade.take_profit_abs || closeExecPrice <= trade.take_profit_abs
           : currentPrice >= trade.take_profit_abs || closeExecPrice >= trade.take_profit_abs;
@@ -5551,6 +5572,68 @@ async function runScalpBotCycle(waitForActive = false) {
                   });
                 }
               }
+              // Схема «уровень → закрыть страховку → усреднить, если позволяет маржа»: разворот у уровня L1
+              // подтверждён — страховку (она здесь в плюсе) закрываем в любом случае, даже если усреднение
+              // запрещено лимитами маржи. Прибыль уходит в банк основной ноги (тейк основной → безубыток пары).
+              if (
+                openSibling &&
+                openSibling.is_open &&
+                openSibling.campaign_role === 'insurance' &&
+                (openSibling.net_profit ?? openSibling.profit_abs ?? 0) > 0
+              ) {
+                const insLockKey2 = getPosLockKey(
+                  openSibling.account_id || tradeAccScopeId,
+                  openSibling.pair,
+                  openSibling.is_short
+                );
+                await withPositionLock(insLockKey2, async () => {
+                  if (!openSibling.is_open) return;
+                  const insExec2 = getTradeExecutionQuote(openSibling, true);
+                  const insClosePrice2 =
+                    insExec2 && insExec2.executionPrice > 0 ? roundPrice(insExec2.executionPrice) : currentPrice;
+                  const insCloseRes2 = await dispatchOrderToExchangeAccount(tradeAcc, {
+                    pair: openSibling.pair,
+                    action: 'CLOSE',
+                    isShort: openSibling.is_short,
+                    quantity: openSibling.amount,
+                    referencePrice: insClosePrice2,
+                    leverage: openSibling.leverage || 25,
+                  });
+                  if (tradeAcc && !isSimulatedTestApiKey(tradeAcc.api_key_raw) && !insCloseRes2?.success) return;
+                  const actualInsClose2 =
+                    insCloseRes2?.success && insCloseRes2.price > 0 ? roundPrice(insCloseRes2.price) : insClosePrice2;
+                  const now2 = Date.now();
+                  const nowStr2 = new Date(now2).toISOString().replace('T', ' ').slice(0, 19);
+                  sqliteDb.runInTransaction(() => {
+                    openSibling.is_open = false;
+                    openSibling.close_rate = actualInsClose2;
+                    openSibling.current_rate = actualInsClose2;
+                    openSibling.close_date = nowStr2;
+                    openSibling.close_timestamp = now2;
+                    openSibling.exit_reason = 'hedge_insurance_at_level_reversal';
+                    openSibling.trade_state = 'CLOSED';
+                    openSibling.planned_dca_levels = [];
+                    recalculateTradeMetrics(openSibling, false);
+                    sqliteDb.upsertTrade(openSibling);
+                    trade.campaign_banked_profit = Number(
+                      (
+                        (trade.campaign_banked_profit || 0) +
+                        Math.max(0, Number((openSibling.net_profit ?? openSibling.profit_abs ?? 0).toFixed(4)))
+                      ).toFixed(4)
+                    );
+                    recalculateTradeMetrics(trade, false);
+                    sqliteDb.upsertTrade(trade);
+                  });
+                  broadcastTradeLifecycleEvent('trade:closed', openSibling);
+                  broadcastTradeLifecycleEvent('trade:updated', trade);
+                  appendLog(
+                    'freqtrade.bot.hedge',
+                    'INFO',
+                    `💰 [Уровень L1: разворот] Страховка #${openSibling.trade_id} [${openSibling.pair}] закрыта в плюс у уровня ${targetDcaLevelPrice}$ (${reversalCheck.reason}). Банк основной ноги: ${trade.campaign_banked_profit}$.${dcaPermission.allowed ? '' : ` Усреднение не выполнено: ${dcaPermission.reason}.`}`,
+                    { userId: tradeUserId }
+                  );
+                });
+              }
             }
           }
         }
@@ -6060,7 +6143,22 @@ async function createScalpBotPosition(
     let rawTp: number;
     let tpHorizon: string;
     let tpReason: string;
-    if (hasCustomTp) {
+    // Страховка (против тренда) — цель у того же сильного уровня, где основная нога будет усредняться (L1).
+    // Там бот на подтверждённом развороте закрывает страховку и усредняет основную; близкого тейка у страховки нет.
+    const insuranceL1 =
+      customOpts?.campaignRole === 'insurance'
+        ? findStrongestDcaLevel(candles4h, candles1d, entryRate, !isShort, 2.6, 95.0, customOpts?.candles1w).price
+        : 0;
+    const insuranceL1Valid =
+      insuranceL1 > 0 &&
+      (isShort
+        ? insuranceL1 <= entryRate * (1 - TP_MIN_DISTANCE_PCT / 100)
+        : insuranceL1 >= entryRate * (1 + TP_MIN_DISTANCE_PCT / 100));
+    if (insuranceL1Valid) {
+      rawTp = insuranceL1;
+      tpHorizon = 'LEVEL';
+      tpReason = `страховка: уровень усреднения основной ноги L1 (${roundPrice(insuranceL1)}$)`;
+    } else if (hasCustomTp) {
       rawTp = Number(customOpts!.customTp);
       tpHorizon = 'MANUAL';
       tpReason = 'Целевой уровень TP кампании';
@@ -6193,7 +6291,8 @@ async function createScalpBotPosition(
           : undefined,
       take_profit_abs: targetTp,
       take_profit_pct: computedTpPct,
-      tp_manual_override: hasCustomTp,
+      // Цель кампании хеджа — не ручной тейк пользователя: её можно пересчитывать по правилам бота
+      tp_manual_override: hasCustomTp && !customOpts?.campaignId,
       tp_horizon: tpHorizon,
       tp_reason: tpReason,
       stop_loss_abs: hasCustomSl ? roundPrice(Number(customOpts!.customSl)) : 0,
