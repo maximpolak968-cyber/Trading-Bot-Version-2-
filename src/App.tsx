@@ -1726,6 +1726,7 @@ export default function App() {
         {activeRoute === 'trade' && (
           <TradeView
             selectedPair={selectedPair}
+            authToken={authToken}
             onSelectPair={setSelectedPair}
             timeframe={timeframe}
             onSelectTimeframe={setTimeframe}

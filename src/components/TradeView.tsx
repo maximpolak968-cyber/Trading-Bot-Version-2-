@@ -37,12 +37,15 @@ import {
   fmtComma,
 } from '../types/frequi';
 import { CandleChart, TradeLevelUpdatePayload, QuickOrderFromChartPayload } from './CandleChart';
+import TrendRegimeBadge from './TrendRegimeBadge';
 import { ProfitPill } from './ProfitPill';
 
 export type RightPanelSection = 'open' | 'scalp' | 'averaged' | 'closed' | 'bot';
 
 interface TradeViewProps {
   selectedPair: string;
+  /** Токен для запроса режима рынка (значок тренда над графиком) */
+  authToken?: string;
   onSelectPair: (pair: string) => void;
   timeframe: string;
   onSelectTimeframe?: (tf: string) => void;
@@ -125,6 +128,7 @@ function shortDateStr(dateStr?: string, timestamp?: number): string {
 
 export const TradeView: React.FC<TradeViewProps> = ({
   selectedPair,
+  authToken,
   onSelectPair,
   timeframe,
   onSelectTimeframe,
@@ -319,7 +323,8 @@ export const TradeView: React.FC<TradeViewProps> = ({
           ЛЕВАЯ / ЦЕНТРАЛЬНАЯ ОБЛАСТЬ: TRADINGVIEW ГРАФИК С ПЕРЕТАСКИВАЕМЫМИ УРОВНЯМИ
       ===================================================================== */}
       <div className="flex-1 flex flex-col min-w-0 min-h-0 h-full overflow-hidden bg-[#131722]">
-        <div className="flex-1 min-h-0 h-full w-full overflow-hidden">
+        <div className="relative flex-1 min-h-0 h-full w-full overflow-hidden">
+          <TrendRegimeBadge pair={selectedPair} authToken={authToken} />
           <CandleChart
             pair={selectedPair}
             availablePairs={availablePairs}
