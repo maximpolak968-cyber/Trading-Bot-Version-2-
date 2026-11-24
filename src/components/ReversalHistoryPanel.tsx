@@ -74,6 +74,66 @@ export function describeReversalEvent(e: ReversalEvent, horizon: number): string
   ];
 }
 
+interface JournalGroup {
+  purpose: string;
+  with_trend: number;
+  total: number;
+  resolved: number;
+  reversals: number;
+  breakouts: number;
+}
+interface JournalRow {
+  id: number;
+  pair: string;
+  candle_ts: number;
+  side: 'support' | 'resistance';
+  level: number;
+  purpose: string;
+  daily_trend: string;
+  with_trend: number;
+  acted: number;
+  outcome: ReversalEvent['outcome'];
+  bars_to_outcome: number | null;
+}
+interface JournalResponse {
+  horizon_bars: number;
+  groups: JournalGroup[];
+  all_groups: JournalGroup[];
+  recent: JournalRow[];
+}
+
+const PURPOSE_RU: Record<string, string> = { entry: 'Вход по отбою', dca: 'Усреднение', tp_exit: 'Выход у цели' };
+
+function JournalGroupsTable({ title, groups }: { title: string; groups: JournalGroup[] }) {
+  if (groups.length === 0) return <div className="text-[#787b86]">{title}: сигналов пока нет.</div>;
+  return (
+    <table className="mb-1 w-full">
+      <thead>
+        <tr className="text-[#787b86]">
+          <th className="text-left font-normal">{title}</th>
+          <th className="text-right font-normal">сигн.</th>
+          <th className="text-right font-normal">с итогом</th>
+          <th className="text-right font-normal">разворот</th>
+        </tr>
+      </thead>
+      <tbody>
+        {groups.map((g) => (
+          <tr key={g.purpose + g.with_trend}>
+            <td>
+              {PURPOSE_RU[g.purpose] || g.purpose} · {g.with_trend ? 'по тренду' : 'против тренда'}
+            </td>
+            <td className="text-right text-[#9aa4b2]">{g.total}</td>
+            <td className="text-right text-[#9aa4b2]">{g.resolved}</td>
+            <td className="text-right font-semibold">
+              {g.resolved > 0 ? `${((100 * g.reversals) / g.resolved).toFixed(0)}%` : '—'}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 /** Кнопка и панель «Разбор разворотов»: метки на графике + статистика монеты. */
 export default function ReversalHistoryPanel({
   pair,
@@ -91,6 +151,26 @@ export default function ReversalHistoryPanel({
   const [data, setData] = useState<ReversalHistoryResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [journal, setJournal] = useState<JournalResponse | null>(null);
+
+  useEffect(() => {
+    if (!enabled) {
+      setJournal(null);
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/v1/reversal_journal?pair=${encodeURIComponent(pair)}`, {
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((json) => {
+        if (!cancelled) setJournal(json);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled, pair, authToken]);
 
   useEffect(() => {
     if (!enabled) {
@@ -233,6 +313,27 @@ export default function ReversalHistoryPanel({
                 </div>
               ))}
               <div className="mt-2 text-[#787b86]">Наведите курсор на метку на графике — там те же детали.</div>
+              <div className="mt-3 border-t border-[#2a2e39] pt-2 font-semibold">Журнал бота: реальные сигналы разворота</div>
+              <div className="mb-1 text-[#787b86]">
+                Каждый разворот, который бот увидел (закрытые свечи 4H), записывается, а через {journal?.horizon_bars ?? 48} свечей
+                проверяется исход. Со временем здесь появится собственная статистика бота на реальном рынке.
+              </div>
+              {journal ? (
+                <>
+                  <JournalGroupsTable title="Эта монета" groups={journal.groups} />
+                  <JournalGroupsTable title="Все монеты" groups={journal.all_groups} />
+                  {journal.recent.slice(0, 5).map((r) => (
+                    <div key={r.id} className="text-[#9aa4b2]">
+                      {fmtDate(r.candle_ts)} · {PURPOSE_RU[r.purpose] || r.purpose} у{' '}
+                      {r.side === 'support' ? 'поддержки' : 'сопротивления'} {r.level}
+                      {r.with_trend ? '' : ' (против тренда)'} · {r.acted ? 'бот действовал' : 'бот пропустил'} →{' '}
+                      {OUTCOME_RU[r.outcome]}
+                    </div>
+                  ))}
+                </>
+              ) : (
+                <div className="text-[#787b86]">Журнал загружается…</div>
+              )}
             </>
           )}
         </div>

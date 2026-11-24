@@ -289,6 +289,27 @@ export class SqliteBotDatabase {
         locked INTEGER DEFAULT 0,
         created_at TEXT NOT NULL
       );
+
+      -- Журнал сигналов разворота, на которые смотрел бот, и их фактический исход
+      CREATE TABLE IF NOT EXISTS reversal_journal (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at INTEGER NOT NULL,
+        pair TEXT NOT NULL,
+        timeframe TEXT NOT NULL DEFAULT '4h',
+        candle_ts INTEGER NOT NULL,
+        side TEXT NOT NULL,
+        level REAL NOT NULL,
+        price REAL NOT NULL,
+        atr REAL NOT NULL,
+        purpose TEXT NOT NULL,
+        daily_trend TEXT NOT NULL,
+        with_trend INTEGER NOT NULL DEFAULT 0,
+        acted INTEGER NOT NULL DEFAULT 0,
+        outcome TEXT NOT NULL DEFAULT 'pending',
+        bars_to_outcome INTEGER,
+        resolved_at INTEGER,
+        UNIQUE(pair, timeframe, candle_ts, side, purpose)
+      );
     `);
 
     try {
@@ -750,6 +771,92 @@ export class SqliteBotDatabase {
       );
     } catch {
       // ignore
+    }
+  }
+
+  // ---------------- Журнал сигналов разворота ----------------
+
+  public recordReversalSignal(params: {
+    pair: string;
+    timeframe: string;
+    candle_ts: number;
+    side: 'support' | 'resistance';
+    level: number;
+    price: number;
+    atr: number;
+    purpose: string;
+    daily_trend: string;
+    with_trend: boolean;
+    acted: boolean;
+  }): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO reversal_journal
+             (created_at, pair, timeframe, candle_ts, side, level, price, atr, purpose, daily_trend, with_trend, acted)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          Date.now(),
+          params.pair,
+          params.timeframe,
+          params.candle_ts,
+          params.side,
+          params.level,
+          params.price,
+          params.atr,
+          params.purpose,
+          params.daily_trend,
+          params.with_trend ? 1 : 0,
+          params.acted ? 1 : 0
+        );
+    } catch {
+      // журнал не критичен для торговли
+    }
+  }
+
+  public listPendingReversalSignals(limit = 200): any[] {
+    try {
+      return this.db
+        .prepare(`SELECT * FROM reversal_journal WHERE outcome = 'pending' ORDER BY candle_ts ASC LIMIT ?`)
+        .all(limit);
+    } catch {
+      return [];
+    }
+  }
+
+  public resolveReversalSignal(id: number, outcome: string, barsToOutcome: number | null): void {
+    try {
+      this.db
+        .prepare(`UPDATE reversal_journal SET outcome = ?, bars_to_outcome = ?, resolved_at = ? WHERE id = ?`)
+        .run(outcome, barsToOutcome, Date.now(), id);
+    } catch {
+      // ignore
+    }
+  }
+
+  public getReversalJournal(pair?: string, limit = 30): { rows: any[]; groups: any[] } {
+    try {
+      const where = pair ? `WHERE pair = ?` : '';
+      const args = pair ? [pair] : [];
+      const rows = this.db
+        .prepare(`SELECT * FROM reversal_journal ${where} ORDER BY candle_ts DESC LIMIT ?`)
+        .all(...args, limit);
+      const groups = this.db
+        .prepare(
+          `SELECT purpose, with_trend,
+                  COUNT(*) AS total,
+                  SUM(CASE WHEN outcome != 'pending' THEN 1 ELSE 0 END) AS resolved,
+                  SUM(CASE WHEN outcome = 'reversal' THEN 1 ELSE 0 END) AS reversals,
+                  SUM(CASE WHEN outcome = 'breakout' THEN 1 ELSE 0 END) AS breakouts
+             FROM reversal_journal ${where}
+             GROUP BY purpose, with_trend
+             ORDER BY purpose, with_trend DESC`
+        )
+        .all(...args);
+      return { rows, groups };
+    } catch {
+      return { rows: [], groups: [] };
     }
   }
 
