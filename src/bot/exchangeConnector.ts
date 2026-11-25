@@ -5265,6 +5265,7 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
   // 2. BINANCE USDⓈ-M FUTURES (WebSocket API ws-fapi order.place TAKE_PROFIT_MARKET + REST & AlgoOrder fallback)
   if (creds.exchange === 'binance') {
     const candidateHosts = getBinanceCandidateHosts(cleanKey, creds.isTestnet);
+    let lastBinanceTpError = '';
     for (const baseUrl of candidateHosts) {
       try {
         formattedTp = await formatTpPriceForHost('binance', tpNum, baseUrl);
@@ -5455,8 +5456,9 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
             message: `Binance TP установлен: ${formattedTp}`,
           };
         }
-      } catch {
-        // ignore
+        lastBinanceTpError = `HTTP ${res.statusCode}: ${String(res.data || '').slice(0, 240)}`;
+      } catch (e: any) {
+        lastBinanceTpError = `исключение: ${e?.message || e}`;
       }
     }
     return {
@@ -5464,6 +5466,7 @@ export async function placeOrUpdateExchangeTakeProfitOrder(
       exchange: 'binance',
       symbol,
       take_profit_price: Number(formattedTp),
+      message: lastBinanceTpError || 'Binance недоступен',
     };
   }
 
