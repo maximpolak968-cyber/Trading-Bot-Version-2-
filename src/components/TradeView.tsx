@@ -199,6 +199,11 @@ export const TradeView: React.FC<TradeViewProps> = ({
   );
 
   // 2) "Скальпинг": active trades opened by the 1H Scalping engine (not 2-Way Hedge campaigns)
+  // Нога хедж-пары при открытой второй ноге: тейк исполняет бот (на бирже его специально нет)
+  const isBotManagedTp = (t: FreqtradeTrade) =>
+    Boolean(t.campaign_id) &&
+    openTrades.some((s) => s.is_open && s.campaign_id === t.campaign_id && s.trade_id !== t.trade_id);
+
   const scalpTrades = useMemo(
     () =>
       openTrades.filter(
@@ -676,9 +681,18 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                 </div>
                                 <div className="text-[9.5px] flex items-center gap-1.5">
                                   {trade.take_profit_abs ? (
-                                    <span className="text-[#10b981]" title="Take-Profit (перетаскивается на графике)">
-                                      TP {formatSmartNumber(trade.take_profit_abs)}
-                                    </span>
+                                    isBotManagedTp(trade) ? (
+                                      <span
+                                        className="text-[#10b981]"
+                                        title="Пока открыты обе ноги пары, тейка на бирже нет: бот закроет обе ноги сам, когда основная дойдёт до цели"
+                                      >
+                                        TP {formatSmartNumber(trade.take_profit_abs)} · бот
+                                      </span>
+                                    ) : (
+                                      <span className="text-[#10b981]" title="Take-Profit (стоит на бирже, перетаскивается на графике)">
+                                        TP {formatSmartNumber(trade.take_profit_abs)}
+                                      </span>
+                                    )
                                   ) : null}
                                   {trade.stop_loss_abs ? (
                                     <span className="text-[#ef4444]" title="Stop-Loss (перетаскивается на графике)">
@@ -982,9 +996,18 @@ export const TradeView: React.FC<TradeViewProps> = ({
                                 )}
                                 <div className="text-[9.5px] flex items-center gap-1.5">
                                   {trade.take_profit_abs ? (
-                                    <span className="text-[#10b981]">
-                                      TP {formatSmartNumber(trade.take_profit_abs)}
-                                    </span>
+                                    isBotManagedTp(trade) ? (
+                                      <span
+                                        className="text-[#10b981]"
+                                        title="Пока открыты обе ноги пары, тейка на бирже нет: бот закроет обе ноги сам, когда основная дойдёт до цели"
+                                      >
+                                        TP {formatSmartNumber(trade.take_profit_abs)} · бот
+                                      </span>
+                                    ) : (
+                                      <span className="text-[#10b981]" title="Take-Profit (стоит на бирже, перетаскивается на графике)">
+                                        TP {formatSmartNumber(trade.take_profit_abs)}
+                                      </span>
+                                    )
                                   ) : null}
                                   {trade.stop_loss_abs ? (
                                     <span className="text-[#ef4444]">

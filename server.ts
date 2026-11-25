@@ -3529,8 +3529,12 @@ async function syncPositionsAndHistoryFromExchanges(
                   if (tpRes.success && tpRes.take_profit_price > 0) {
                     pos.take_profit = tpRes.take_profit_price;
                   }
+                  // Результат установки тейка на бирже — в логи сервера (раньше ошибки молча терялись)
+                  console.info(
+                    `[tp-sync] ${existingOpen.pair} #${existingOpen.trade_id} ${existingOpen.is_short ? 'SHORT' : 'LONG'}: want=${existingOpen.take_profit_abs} ok=${tpRes.success} set=${tpRes.take_profit_price}${tpRes.message ? ` (${tpRes.message})` : ''}`
+                  );
                 })
-                .catch(() => {});
+                .catch((e) => console.info(`[tp-sync] ${existingOpen.pair} #${existingOpen.trade_id}: исключение ${e?.message || e}`));
             }
           }
 
